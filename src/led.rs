@@ -28,12 +28,18 @@ fn set_blink(led: &str, on_ms: u32, off_ms: u32) {
     write_attr(led, "delay_off", &off_ms.to_string());
 }
 
-/// The four documented status-LED patterns, worst-first so callers can just
+/// The five documented status-LED patterns, worst-first so callers can just
 /// pick the single most severe condition currently true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPattern {
     Ok,               // solid green
-    NetworkDown,      // solid amber (green+red both on) -- "our addition" per the doc
+    /// Solid amber (green+red both on) -- "our addition" per the doc, not a
+    /// factory pattern. Originally just "network down"; now the generic
+    /// non-critical warning indicator (some monitored NICs down, a temp/fan
+    /// warning, etc.) -- see `state::recompute_status_led`. Deliberately
+    /// coarse: which specific thing tripped it is on the LCD/syslog, not
+    /// encoded in the LED color.
+    Warning,
     Degraded,         // green solid, red flashing 500/500 -- factory RAID-degraded pattern
     Failed,           // solid red -- factory "malfunction"
     CriticalFlashing, // red flashing 500/500, green off -- socket-driven `critical` level
@@ -46,7 +52,7 @@ pub fn set_status(pattern: StatusPattern) {
             write_attr("red:status", "trigger", "none");
             set_solid("red:status", false);
         }
-        StatusPattern::NetworkDown => {
+        StatusPattern::Warning => {
             set_solid("green:status", true);
             set_solid("red:status", true);
         }

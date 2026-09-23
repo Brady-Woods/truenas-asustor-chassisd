@@ -42,15 +42,37 @@ docker_min_secs = 10
 
 [temperature]
 units = "c"                 # "c" or "f" (display only -- thresholds below are always degrees C)
-# Applies to every currently-connected temp sensor on the box (not just
-# CPU) -- highlights the temperature screen's "!" and, via syslog
+# Fallback for any sensor not matched by [[temperature.thresholds]] below --
+# highlights the temperature screen's "!" and, via syslog
 # (monitor::HealthMonitor), logs a WARNING/CRITICAL on the transition into
-# and back out of each threshold. Tune these for your own hardware's
-# normal operating range -- the defaults are this board's (CPU idles
-# 57-67C under everyday load, so warn_threshold sits comfortably above
-# that rather than firing constantly).
+# and back out of threshold. Mainly hits the ACPI thermal zone and the
+# AQC113 NIC's sensors on this board (see the thresholds below for why
+# those two don't have their own datasheet-sourced entry).
 warn_threshold = 75.0
 critical_threshold = 85.0
+
+# Per-chip overrides, matched by hwmon chip name (`cat
+# /sys/class/hwmon/hwmon*/name`) -- a CPU, an HDD, and an NVMe SSD have
+# very different safe operating ranges, so one global pair is a blunt
+# instrument. These three are sourced from each part's actual datasheet
+# (2026-09-23), not guessed -- see config.rs's default_temp_thresholds()
+# doc comment for the research and sources. Adjust `chip` if your hardware
+# differs (check `lcm-status fan-profile`'s sensor inventory for what's on
+# your box).
+[[temperature.thresholds]]
+chip = "coretemp"           # Intel Celeron N5105: Intel ARK lists TjMax (throttle point) at 105C
+warn_threshold = 85.0
+critical_threshold = 100.0
+
+[[temperature.thresholds]]
+chip = "drivetemp"          # WD Ultrastar DC HC550: datasheet operating range is 5-60C
+warn_threshold = 50.0
+critical_threshold = 60.0
+
+[[temperature.thresholds]]
+chip = "nvme"                # WD Black SN750: datasheet operating (composite) temp is 0-70C
+warn_threshold = 60.0
+critical_threshold = 70.0
 
 [docker]
 ignore = []                # container names to exclude from health checks
@@ -60,6 +82,24 @@ nic_mode = "link"          # "link" (solid while connected) or "activity" (dark,
 # Front LEDs share [sleep]'s schedule for night mode -- one schedule for
 # both the LCD backlight and the LEDs, not two. Red bay LEDs are always
 # left alone by night mode so a real drive failure still shows.
+
+[network]
+# Feeds the status LED (amber/red) from monitored NICs' link state, in
+# addition to pool health/temps/fan health -- see state::recompute_status_led.
+enabled = true
+# Which interfaces to monitor. Empty (default) means "whatever currently
+# has an IP" (auto-adjusts as interfaces are configured/unconfigured in
+# TrueNAS's own Network settings) -- an installed-but-unconfigured card
+# (e.g. an AQC113 with no cable/IP yet) is correctly never treated as
+# "down" this way. Set explicitly (e.g. ["enp2s0", "enp3s0"]) to pin the
+# list instead -- for example, to monitor a NIC before it has an address,
+# or exclude one that does.
+monitored_nics = []
+# Status-LED severity when some (but not all) monitored NICs are down --
+# vs. when *every* one is (a real total outage, normally worse). "warning"
+# or "error" (matches the socket protocol's Warn/Error levels).
+some_down_level = "warning"
+all_down_level = "error"
 
 # One [[fans]] block per physical fan -- replaces lm-sensors' fancontrol
 # package entirely (see src/fan.rs for why, and src/fan_calibrate.rs / the

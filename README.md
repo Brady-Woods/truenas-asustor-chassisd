@@ -309,10 +309,60 @@ condition:
 
 | What | Warning | Critical |
 |---|---|---|
-| Any currently-connected temp sensor (not just CPU -- every SATA/NVMe/NIC/etc. sensor that reads as connected, see "properly identifying unconnected sensors" under Fan control) | `[temperature].warn_threshold` (default 75C) | `[temperature].critical_threshold` (default 85C) |
+| Any currently-connected temp sensor (not just CPU -- every SATA/NVMe/NIC/etc. sensor that reads as connected, see "Disconnected sensors are actually detected, not assumed" under Fan control) | per-chip `[[temperature.thresholds]]` if one matches, else `[temperature].warn_threshold` (default 75C) | same, `critical_threshold` (default 85C) |
 | A configured fan's RPM | below `[[fans]].min_expected_rpm`, if set (spinning, but slower than it should be) | stalled (0 RPM) and still unresponsive after a few restart attempts (`fan.rs`'s `UNRESPONSIVE_AFTER_STALLS`) -- the first restart attempt alone only logs a warning, since a single transient stall that self-heals next tick isn't a fault |
 | ZFS pool health (`zpool list`) | `DEGRADED` | `FAULTED`/`UNAVAIL`/`OFFLINE`/anything else that isn't `ONLINE` |
 | Drive SMART status | -- | a bay's SMART overall-health reports `FAILED` |
+| Monitored NIC links (`[network]`) | some (not all) monitored NICs down | all monitored NICs down |
+
+### Per-chip temperature thresholds
+
+One global warn/critical pair is a blunt instrument -- a CPU, an HDD, and
+an NVMe SSD have very different safe operating ranges. `[[temperature.thresholds]]`
+overrides the global pair per hwmon chip name; this board's defaults are
+sourced from each part's actual datasheet (2026-09-23), not guessed --
+see `config.rs`'s `default_temp_thresholds()` doc comment for the specifics
+and sources:
+
+| Chip | Warn | Critical | Source |
+|---|---|---|---|
+| `coretemp` (Intel Celeron N5105) | 85C | 100C | Intel ARK: TjMax (throttle point) = 105C |
+| `drivetemp` (WD Ultrastar DC HC550) | 50C | 60C | WD datasheet: operating range 5-60C |
+| `nvme` (WD Black SN750) | 60C | 70C | WD datasheet: operating (composite) temp 0-70C |
+
+The AQC113 NIC's board-level PHY/MAC sensors deliberately have no entry
+of their own -- no public datasheet with a numeric junction/case limit
+was found for that chip (Marvell's technical datasheets aren't publicly
+indexed the way Intel's/WD's are), so fabricating a specific-looking
+number would be worse than just falling back to the generic default.
+Worth adding if Marvell's actual datasheet ever turns up.
+
+### Status LED reflects all of the above, not just pool/network
+
+The status LED (`state::recompute_status_led`) folds every check above
+(fan health, temps, SMART) plus pool health and monitored-NIC link state
+into one severity, via the same `Level` (Info/Warn/Error/Critical) the
+socket protocol uses -- so it's a genuine "is anything wrong" indicator,
+not just pool+network the way it started out. Found live that this
+mattered: the LED sat solid amber with every individual health check
+green, because its network check originally looked at *every* physical
+NIC (`physical_nics()`), including an installed-but-never-configured
+AQC113 card with no cable -- indistinguishable from a real outage.
+`[network]`'s `monitored_nics` (empty = auto, whatever currently has an
+IP -- `hal::configured_nics()`) is what fixed that; see that function's
+doc comment for the full story.
+
+Pool `DEGRADED` still gets its own factory-documented blink pattern
+(green solid, red flashing) rather than being folded into the generic
+amber, since that's a real ASUSTOR-recognized signal worth keeping
+distinguishable. Everything else collapses to plain Warn=amber/
+Error=solid red/Critical=flashing red -- which specific thing tripped it
+is on the LCD screens and in syslog, not encoded in the LED color.
+
+The network screen itself also shows every physical NIC now (`hal::network`),
+not just ones with an address -- an interface with a cable but no IP shows
+`"connected, no IP"`, one with no cable shows `"disconnected"`. Before
+this, both looked identical (silently absent from the screen).
 
 Temperature monitoring runs on its own clock (`temperature_min_secs`,
 `HealthMonitor::maybe_check_temps`), deliberately independent of whether

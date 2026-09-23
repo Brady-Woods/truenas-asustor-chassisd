@@ -56,30 +56,48 @@ pub fn configured_nics() -> Vec<String> {
         .collect()
 }
 
-/// One screen per interface `configured_nics()` returns, with its address.
+/// One screen per *every* physical NIC (`physical_nics()`, not just
+/// `configured_nics()`), so a card that's plugged in but never assigned an
+/// address -- or one with no cable at all -- is still visible here rather
+/// than silently absent. Line 1 is the IP if it has one, otherwise
+/// `"connected, no IP"` (link up, nothing configured) or `"disconnected"`
+/// (no carrier) -- distinguishing those two matters: the first says "go
+/// configure this in Network settings", the second says "check the
+/// cable", and before this they looked identical (both just missing from
+/// the screen).
 pub fn network() -> Vec<Screen> {
-    let out = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]);
-    let Some(out) = out else {
-        return vec![Screen {
-            line0: "NETWORK".into(),
-            line1: "no ip info".into(),
-        }];
-    };
-
-    let screens: Vec<Screen> = out
-        .lines()
-        .filter_map(|line| {
+    let mut with_ip = std::collections::HashMap::new();
+    if let Some(out) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) {
+        for line in out.lines() {
             // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
             let mut f = line.split_whitespace();
-            let iface = f.nth(1)?.trim_end_matches(':').to_string();
-            if !std::path::Path::new(&format!("/sys/class/net/{iface}/device")).exists() {
-                return None;
-            }
-            let ip = line
+            let Some(iface) = f.nth(1).map(|s| s.trim_end_matches(':').to_string()) else {
+                continue;
+            };
+            let Some(ip) = line
                 .split_whitespace()
                 .find(|tok| tok.contains('/') && tok.chars().next().unwrap_or(' ').is_ascii_digit())
-                .map(|tok| tok.split('/').next().unwrap_or("").to_string())?;
-            Some(Screen { line0: iface, line1: ip })
+                .map(|tok| tok.split('/').next().unwrap_or("").to_string())
+            else {
+                continue;
+            };
+            with_ip.insert(iface, ip);
+        }
+    }
+
+    let screens: Vec<Screen> = physical_nics()
+        .into_iter()
+        .map(|iface| {
+            let line1 = match with_ip.get(&iface) {
+                Some(ip) => ip.clone(),
+                None => {
+                    let connected = std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
+                        .map(|s| s.trim() == "1")
+                        .unwrap_or(false);
+                    if connected { "connected, no IP".to_string() } else { "disconnected".to_string() }
+                }
+            };
+            Screen { line0: iface, line1 }
         })
         .collect();
 
@@ -432,7 +450,11 @@ pub(crate) fn all_hwmon() -> Vec<(String, String)> {
 /// (`monitor::HealthMonitor`), deliberately not scoped to whatever a fan
 /// curve happens to select: a sensor with nothing driving off it (this
 /// board's AQC113 PHY/MAC temps, say) is still worth alerting on.
-pub(crate) fn all_connected_temps() -> Vec<(String, f32)> {
+/// (chip name, full description for logging, value). Chip name is
+/// returned separately (not just folded into the description) so callers
+/// can match per-chip threshold overrides (`config::TempThresholdOverride`)
+/// without re-parsing the description string.
+pub(crate) fn all_connected_temps() -> Vec<(String, String, f32)> {
     let mut out = Vec::new();
     for (hwmon, chip) in all_hwmon() {
         for input in temp_inputs(&hwmon) {
@@ -443,11 +465,11 @@ pub(crate) fn all_connected_temps() -> Vec<(String, f32)> {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let desc = match label {
+            let desc = match &label {
                 Some(l) => format!("{chip} {input} \"{l}\""),
                 None => format!("{chip} {input}"),
             };
-            out.push((desc, t));
+            out.push((chip.clone(), desc, t));
         }
     }
     out

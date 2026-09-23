@@ -98,6 +98,14 @@ pub struct AppState {
     scroll1: Scroll,
     eject_available: bool,
     monitor: crate::monitor::HealthMonitor,
+    /// Worst current fan health across every configured fan -- pushed in
+    /// each tick from main.rs, which owns the actual `FanController`s (a
+    /// separate top-level value from `AppState`, alongside it in the event
+    /// loop, not inside it). Same "current state, not transition-gated"
+    /// reasoning as `HealthMonitor`'s own LED-facing accessors: this feeds
+    /// `recompute_status_led`, syslog transitions are logged by
+    /// `FanController` itself.
+    fan_health: Level,
 }
 
 /// What the event loop should actually do this tick.
@@ -133,7 +141,14 @@ impl AppState {
             scroll1: Scroll::default(),
             eject_available: false,
             monitor: crate::monitor::HealthMonitor::new(),
+            fan_health: Level::Info,
         }
+    }
+
+    /// Called every tick from main.rs with the worst current level across
+    /// all configured `FanController`s -- see the `fan_health` field doc.
+    pub fn set_fan_health(&mut self, level: Level) {
+        self.fan_health = level;
     }
 
     /// Applies the front LEDs' initial state at daemon startup: NIC mode
@@ -182,6 +197,14 @@ impl AppState {
         self.recompute_status_led();
     }
 
+    /// The single "is anything wrong" indicator: pool health (factory
+    /// patterns, unchanged), plus everything `HealthMonitor`/
+    /// `FanController` track -- temps, fan health, SMART, and monitored
+    /// NIC links -- folded into one severity via `Level`. Found live that
+    /// this was needed: the LED previously only ever reflected pool
+    /// health + a too-broad network check, so it could show amber (or
+    /// miss a real problem) while completely disconnected from what the
+    /// rest of the daemon was actually observing.
     fn recompute_status_led(&self) {
         use led::StatusPattern;
 
@@ -193,23 +216,68 @@ impl AppState {
         }
 
         let healths = hal::pool_healths();
-        let pattern = if healths.iter().any(|(_, h)| h == "DEGRADED") {
-            StatusPattern::Degraded
-        } else if healths
-            .iter()
-            .any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"))
-        {
+        let pool_degraded = healths.iter().any(|(_, h)| h == "DEGRADED");
+        let pool_faulted =
+            healths.iter().any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
+
+        // Worst of: this fan's health (pushed in from main.rs each tick,
+        // since FanControllers live outside AppState), every currently-
+        // connected temp sensor, monitored NIC link state, and whether any
+        // bay is a confirmed SMART failure (Error -- a failed drive is
+        // serious, same tier as a solid-red pool fault, even though it
+        // doesn't necessarily mean the pool itself has degraded yet).
+        let general = [
+            self.fan_health,
+            self.monitor.worst_temp_level(),
+            self.network_health_level(),
+            if self.monitor.any_bay_failed() { Level::Error } else { Level::Info },
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(Level::Info);
+
+        let pattern = if general == Level::Critical {
+            StatusPattern::CriticalFlashing
+        } else if pool_faulted || general == Level::Error {
             StatusPattern::Failed
-        } else if hal::configured_nics().iter().any(|i| led::link_is_down(i)) {
-            // Only NICs actually brought into service (have an address) --
-            // an installed-but-unconfigured card (e.g. AQC113 with no
-            // cable/IP yet) reports link-down forever without being a
-            // fault. See `hal::configured_nics`'s doc comment.
-            StatusPattern::NetworkDown
+        } else if pool_degraded {
+            // Factory-documented RAID-degraded pattern takes this slot
+            // specifically (between Error and Warn) as long as nothing
+            // worse is also true -- kept distinguishable from the generic
+            // Warning amber above.
+            StatusPattern::Degraded
+        } else if general == Level::Warn {
+            StatusPattern::Warning
         } else {
             StatusPattern::Ok
         };
         led::set_status(pattern);
+    }
+
+    /// Network's contribution to the aggregate above -- see
+    /// `config::NetworkConfig`. Monitors either the explicit
+    /// `monitored_nics` list, or (default, empty list) whatever
+    /// `hal::configured_nics()` currently returns, so it auto-adjusts as
+    /// interfaces are configured/unconfigured rather than needing the
+    /// config updated to match.
+    fn network_health_level(&self) -> Level {
+        let net = &self.cfg.network;
+        if !net.enabled {
+            return Level::Info;
+        }
+        let monitored: Vec<String> =
+            if net.monitored_nics.is_empty() { hal::configured_nics() } else { net.monitored_nics.clone() };
+        if monitored.is_empty() {
+            return Level::Info; // nothing configured/in-service to check
+        }
+        let down = monitored.iter().filter(|i| led::link_is_down(i)).count();
+        if down == 0 {
+            Level::Info
+        } else if down == monitored.len() {
+            net.all_down_level.into()
+        } else {
+            net.some_down_level.into()
+        }
     }
 
     pub fn set_eject_available(&mut self, available: bool) {
