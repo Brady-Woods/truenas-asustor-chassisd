@@ -52,3 +52,17 @@ nic_mode = "link"          # "link" (solid while connected) or "activity" (dark,
 # Front LEDs share [sleep]'s schedule for night mode -- one schedule for
 # both the LCD backlight and the LEDs, not two. Red bay LEDs are always
 # left alone by night mode so a real drive failure still shows.
+
+[fan]
+# Drives pwm1 (the it8625's one populated fan header) from CPU package
+# temp -- replaces lm-sensors' fancontrol package entirely (see src/fan.rs
+# for why). Defaults below are this board's hand-tuned curve; only change
+# them if you're retuning the curve itself.
+enabled = true
+update_secs = 1
+min_temp_c = 45.0    # at/below this, the fan is allowed to fully stop
+max_temp_c = 90.0    # at/above this, pwm1 = max_pwm
+min_start_pwm = 60   # PWM needed to get a *stopped* fan spinning again
+min_stop_pwm = 55    # once running, allowed to coast down to here before stopping
+min_pwm = 50         # floor once running (curve value at min_temp_c)
+max_pwm = 255        # ceiling (curve value at max_temp_c), 255 = fully on

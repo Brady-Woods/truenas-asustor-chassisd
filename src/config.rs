@@ -20,6 +20,7 @@ pub struct Config {
     pub temperature: TemperatureConfig,
     pub docker: DockerConfig,
     pub led: LedConfig,
+    pub fan: FanConfig,
 }
 
 impl Default for Config {
@@ -35,6 +36,7 @@ impl Default for Config {
             temperature: TemperatureConfig::default(),
             docker: DockerConfig::default(),
             led: LedConfig::default(),
+            fan: FanConfig::default(),
         }
     }
 }
@@ -246,6 +248,57 @@ pub struct DockerConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         DockerConfig { ignore: Vec::new() }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct FanConfig {
+    pub enabled: bool,
+    /// How often to re-evaluate the curve and (re)write pwm1. lm-sensors'
+    /// fancontrol(8) default INTERVAL is also 1s; carried over unchanged.
+    pub update_secs: u64,
+    /// At or below this CPU temp, the fan is allowed to be fully stopped.
+    pub min_temp_c: f32,
+    /// At or above this CPU temp, pwm1 is pinned to max_pwm.
+    pub max_temp_c: f32,
+    /// PWM needed to reliably get a *stopped* fan spinning again. Below
+    /// this, a stopped fan stays stopped rather than crawl at a PWM too low
+    /// to actually start it turning.
+    pub min_start_pwm: u8,
+    /// Once running, the fan is allowed to coast down to this PWM before
+    /// it's allowed to stop entirely (prevents rapid stop/start cycling
+    /// right at the boundary).
+    pub min_stop_pwm: u8,
+    /// Floor once the fan is running (the curve's PWM at min_temp_c).
+    pub min_pwm: u8,
+    /// Ceiling (the curve's PWM at max_temp_c). 255 = fully on.
+    pub max_pwm: u8,
+    /// How often to resample drive/NVMe temps for the control-temp max
+    /// (separate from `update_secs`, which governs the CPU reading and the
+    /// pwm1 write). Drive temps change on a much slower timescale than CPU
+    /// load, and this reads via /sys/class/hwmon directly (no smartctl),
+    /// but there's no reason to hammer it every second either.
+    pub drive_temp_min_secs: u64,
+}
+
+impl Default for FanConfig {
+    fn default() -> Self {
+        // These match the /etc/fancontrol curve this replaces, hand-tuned
+        // on nas.skycorgi.net's AS6704T (it8625 pwm1, driven by coretemp
+        // package temp -- the chip's own thermal inputs are unconnected on
+        // this board).
+        FanConfig {
+            enabled: true,
+            update_secs: 1,
+            min_temp_c: 45.0,
+            max_temp_c: 90.0,
+            min_start_pwm: 60,
+            min_stop_pwm: 55,
+            min_pwm: 50,
+            max_pwm: 255,
+            drive_temp_min_secs: 30,
+        }
     }
 }
 

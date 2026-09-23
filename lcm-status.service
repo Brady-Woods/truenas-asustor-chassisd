@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/lcm-status /etc/lcm-status.toml
+# @LCM_STATUS_BIN@ is substituted by deploy.sh with the built binary's
+# actual path in this checkout -- not /usr/local/sbin, which is under
+# TrueNAS's read-only /usr on a fresh boot environment (see deploy.sh).
+ExecStart=@LCM_STATUS_BIN@ /etc/lcm-status.toml
 Restart=on-failure
 RestartSec=2
 # Needs root: /dev/ttyS1, the LCD power GPIO/LED, smartctl, and
