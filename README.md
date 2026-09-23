@@ -1,13 +1,17 @@
 # lcm-status
 
-A portable, from-scratch driver and status daemon for the ASUSTOR front-panel
-LCM (LCD module) and front LEDs, for running ASUSTOR NAS hardware (built
-against an AS6704T v2 / LOCKERSTOR 4 Gen2+) under TrueNAS SCALE instead of
-ADM. ADM's own `lcmd` binary won't run on TrueNAS at all -- it's linked
-against ASUSTOR's proprietary `libgeneral.so`/`libnasman.so`/`libnhal.so`/
+Part of [`truenas-asustor-chassisd`](.) -- a portable, from-scratch driver
+and status daemon for the ASUSTOR front-panel LCM (LCD module), front
+LEDs, and fan control, for running ASUSTOR NAS hardware (built against an
+AS6704T v2 / LOCKERSTOR 4 Gen2+) under TrueNAS SCALE instead of ADM. ADM's
+own `lcmd` binary won't run on TrueNAS at all -- it's linked against
+ASUSTOR's proprietary `libgeneral.so`/`libnasman.so`/`libnhal.so`/
 `libndal.so`, none of which exist outside ADM, and it needs glibc symbol
 versions newer than what TrueNAS ships. This project talks to the same
 hardware directly instead of trying to run ADM's binary.
+
+(Fan control isn't really "front-panel" hardware, but lives in this same
+daemon anyway -- see "Fan control" below for why.)
 
 ## Requirements
 
