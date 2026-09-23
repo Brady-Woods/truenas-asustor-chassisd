@@ -41,8 +41,16 @@ temperature_min_secs = 10
 docker_min_secs = 10
 
 [temperature]
-units = "c"               # "c" or "f"
-warn_threshold = 60.0
+units = "c"                 # "c" or "f" (display only -- thresholds below are always degrees C)
+# Applies to every currently-connected temp sensor on the box (not just
+# CPU) -- highlights the temperature screen's "!" and, via syslog
+# (monitor::HealthMonitor), logs a WARNING/CRITICAL on the transition into
+# and back out of each threshold. Tune these for your own hardware's
+# normal operating range -- the defaults are this board's (CPU idles
+# 57-67C under everyday load, so warn_threshold sits comfortably above
+# that rather than firing constantly).
+warn_threshold = 75.0
+critical_threshold = 85.0
 
 [docker]
 ignore = []                # container names to exclude from health checks
@@ -74,6 +82,16 @@ min_start_pwm = 60     # PWM needed to get a *stopped* fan spinning again
 min_stop_pwm = 55      # once running, allowed to coast down to here before stopping (also the ramp's value at min_temp_c -- see src/fan.rs)
 min_pwm = 50           # flat PWM used at/below min_temp_c
 max_pwm = 255          # flat PWM used at/above max_temp_c, 255 = fully on
+# Log a syslog WARNING if this fan is confirmed running but its RPM is
+# below this -- catches "spinning, but slower than it should be" (bearing
+# wear, partial obstruction) before it becomes an outright stall. Omit to
+# disable the check. `lcm-status fan-profile` reports max RPM at pwm=255;
+# ~60-70% of that is a reasonable starting point.
+min_expected_rpm = 500
+# (Separately, an outright stall -- confirmed 0 RPM -- always logs a
+# WARNING on the first restart attempt and escalates to CRITICAL if it's
+# still not spinning after a few consecutive attempts. No config for that;
+# see src/fan.rs's UNRESPONSIVE_AFTER_STALLS.)
 
 # Sensors feeding this fan's control temp -- the MAX across all of them,
 # not just one, so e.g. a hot drive ramps the fan even with the CPU idle.

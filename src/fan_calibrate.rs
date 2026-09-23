@@ -14,7 +14,7 @@
 //! diagnostic pass, not meant to leave anything running off its own
 //! commanded values.
 
-use crate::hal::{read_temp_input, temp_inputs};
+use crate::hal::{all_hwmon, read_temp_input, temp_inputs};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
@@ -148,19 +148,6 @@ fn print_sensor_inventory() {
         println!("  (none found)");
     }
     println!();
-}
-
-fn all_hwmon() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
-        for e in entries.flatten() {
-            let path = e.path().to_string_lossy().to_string();
-            let name = std::fs::read_to_string(format!("{path}/name")).unwrap_or_default().trim().to_string();
-            out.push((path, name));
-        }
-    }
-    out.sort();
-    out
 }
 
 // --- PWM discovery + calibration ------------------------------------------

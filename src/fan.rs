@@ -37,6 +37,13 @@ use crate::config::FanProfile;
 use crate::hal::{glob_hwmon, read_sysfs_raw_f32, resolve_selector};
 use std::time::{Duration, Instant};
 
+/// Consecutive failed restart attempts (each ~1-2s apart, gated by
+/// `kick_until` + `update_secs`) before a stalled fan is logged as
+/// CRITICAL rather than just WARNING -- long enough to not fire on one
+/// transient blip that self-heals next tick, short enough to still be a
+/// prompt alert (a few seconds, not minutes).
+const UNRESPONSIVE_AFTER_STALLS: u32 = 3;
+
 pub struct FanController {
     profile: FanProfile,
     hwmon: Option<String>,
@@ -54,12 +61,33 @@ pub struct FanController {
     /// has its own `update_secs`, so this is owned per-controller rather
     /// than by a single timer in main.rs's loop.
     last_tick: Option<Instant>,
+    /// True once this fan has been confirmed running normally at least
+    /// once -- gates stall logging so the very first kick from a cold
+    /// daemon start (completely normal) isn't logged as a fault the way a
+    /// fan that stops after having run fine would be.
+    ever_ran_normally: bool,
+    /// How many consecutive ticks this fan has been stalled through,
+    /// despite a restart attempt each time -- see `UNRESPONSIVE_AFTER_STALLS`.
+    consecutive_stalls: u32,
+    /// Whether a `min_expected_rpm` warning is currently active, so the
+    /// "back to normal" notice only fires once, on the actual transition.
+    low_rpm_warned: bool,
 }
 
 impl FanController {
     pub fn new(profile: FanProfile) -> Self {
         let sensor_cache = vec![(None, None); profile.sensors.len()];
-        FanController { profile, hwmon: None, last_pwm: None, kick_until: None, sensor_cache, last_tick: None }
+        FanController {
+            profile,
+            hwmon: None,
+            last_pwm: None,
+            kick_until: None,
+            sensor_cache,
+            last_tick: None,
+            ever_ran_normally: false,
+            consecutive_stalls: 0,
+            low_rpm_warned: false,
+        }
     }
 
     /// Call every time main.rs's event loop wakes up (it polls at a fixed
@@ -118,6 +146,23 @@ impl FanController {
         let stalled = current_pwm == 0 || matches!(current_rpm, Some(rpm) if rpm <= 0.0);
 
         if stalled {
+            self.consecutive_stalls += 1;
+            // Not logged at all until this fan has run normally at least
+            // once -- the very first kick from a cold daemon start hits
+            // this same path and isn't a fault.
+            if self.ever_ran_normally {
+                if self.consecutive_stalls == 1 {
+                    crate::syslog::warning(&format!(
+                        "fan '{}' (pwm{}): not spinning, attempting restart",
+                        self.profile.name, self.profile.pwm_index
+                    ));
+                } else if self.consecutive_stalls == UNRESPONSIVE_AFTER_STALLS {
+                    crate::syslog::critical(&format!(
+                        "fan '{}' (pwm{}): unresponsive after {} restart attempts",
+                        self.profile.name, self.profile.pwm_index, self.consecutive_stalls
+                    ));
+                }
+            }
             if self.write_pwm(&hwmon, self.profile.min_start_pwm).is_ok() {
                 self.last_pwm = Some(self.profile.min_start_pwm);
                 self.kick_until = Some(Instant::now() + Duration::from_secs(1));
@@ -125,6 +170,34 @@ impl FanController {
                 self.hwmon = None; // path went stale -- re-resolve next tick
             }
             return;
+        }
+
+        if self.consecutive_stalls > 0 {
+            if self.ever_ran_normally {
+                crate::syslog::notice(&format!(
+                    "fan '{}' (pwm{}): spinning again after {} restart attempt(s)",
+                    self.profile.name, self.profile.pwm_index, self.consecutive_stalls
+                ));
+            }
+            self.consecutive_stalls = 0;
+        }
+        self.ever_ran_normally = true;
+
+        if let (Some(min_rpm), Some(rpm)) = (self.profile.min_expected_rpm, current_rpm) {
+            let low = rpm < min_rpm as f32;
+            if low && !self.low_rpm_warned {
+                self.low_rpm_warned = true;
+                crate::syslog::warning(&format!(
+                    "fan '{}' (pwm{}): {rpm:.0} RPM, below expected minimum ({min_rpm} RPM)",
+                    self.profile.name, self.profile.pwm_index
+                ));
+            } else if !low && self.low_rpm_warned {
+                self.low_rpm_warned = false;
+                crate::syslog::notice(&format!(
+                    "fan '{}' (pwm{}): back to {rpm:.0} RPM, at or above expected minimum ({min_rpm} RPM)",
+                    self.profile.name, self.profile.pwm_index
+                ));
+            }
         }
 
         let target = compute_pwm(control_temp, &self.profile);
@@ -213,6 +286,7 @@ mod tests {
             min_pwm: 50,
             max_pwm: 255,
             sensors: Vec::new(),
+            min_expected_rpm: None,
         }
     }
 

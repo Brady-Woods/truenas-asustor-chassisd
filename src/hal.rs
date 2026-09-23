@@ -372,6 +372,55 @@ pub(crate) fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> 
     out
 }
 
+/// Every hwmon instance on the box as (sysfs path, chip name) -- the base
+/// enumeration `resolve_selector`'s `glob_hwmon` (chip-name-filtered),
+/// `fan_calibrate`'s inventory, and `monitor`'s temperature sweep all
+/// build on. Skips any hwmon with no readable `name` (shouldn't normally
+/// happen, but a directory mid-teardown during a module reload could
+/// transiently look that way).
+pub(crate) fn all_hwmon() -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path().to_string_lossy().to_string();
+            let name = std::fs::read_to_string(format!("{path}/name")).ok()?.trim().to_string();
+            (!name.is_empty()).then_some((path, name))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every temp sensor on the box that currently reads as connected (see
+/// `read_temp_input`), labeled for logging -- e.g. `"coretemp temp1
+/// \"Package id 0\""`. Used for general threshold monitoring
+/// (`monitor::HealthMonitor`), deliberately not scoped to whatever a fan
+/// curve happens to select: a sensor with nothing driving off it (this
+/// board's AQC113 PHY/MAC temps, say) is still worth alerting on.
+pub(crate) fn all_connected_temps() -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    for (hwmon, chip) in all_hwmon() {
+        for input in temp_inputs(&hwmon) {
+            let Some(t) = read_temp_input(&hwmon, &input) else {
+                continue;
+            };
+            let label = std::fs::read_to_string(format!("{hwmon}/{input}_label"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let desc = match label {
+                Some(l) => format!("{chip} {input} \"{l}\""),
+                None => format!("{chip} {input}"),
+            };
+            out.push((desc, t));
+        }
+    }
+    out
+}
+
 pub(crate) fn coretemp_package() -> Option<f32> {
     for hwmon in glob_hwmon("coretemp")? {
         for entry in std::fs::read_dir(&hwmon).ok()?.flatten() {
