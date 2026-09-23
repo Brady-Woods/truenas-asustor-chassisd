@@ -233,17 +233,31 @@ output, a curve, and the sensor(s) that drive it), so it generalizes to
 boards with more than one real fan, not just this one's single `it8625`
 `pwm1`.
 
-Two ways this goes further than upstream fancontrol:
+Three ways this goes further than upstream fancontrol:
 
 - **Multiple sensors per fan.** `sensors` under a `[[fans]]` block is a
-  list, not one fixed sensor -- the control temp is the max across
-  whichever of them currently reads as connected. The default profile uses
-  CPU package temp, every SATA drive (`drivetemp`), and every NVMe
-  controller, so a hot drive ramps the fan even with the CPU idle. Each
-  selector can be resampled on its own schedule (`min_resample_secs`) --
-  CPU temp can change quickly so it's read every tick by default; drive/
-  NVMe temps change slowly and default to every 30s, read straight from
+  list, not one fixed sensor. The default profile uses CPU package temp,
+  every SATA drive (`drivetemp`), and every NVMe controller, so a hot
+  drive ramps the fan even with the CPU idle. Each selector can be
+  resampled on its own schedule (`min_resample_secs`) -- CPU temp can
+  change quickly so it's read every tick by default; drive/NVMe temps
+  change slowly and default to every 30s, read straight from
   `/sys/class/hwmon` with no `smartctl` calls.
+- **Each sensor can have its own curve endpoints.** A selector's own
+  `min_temp_c`/`max_temp_c` (falling back to the fan's, if unset) -- not
+  just its own reading fed through one shared curve. This matters because
+  different components reach their own danger zone at very different
+  temperatures: this board's curve is CPU-tuned (`max_temp_c` = 90C), but
+  a drive's own critical threshold ([Health monitoring](#health-monitoring-syslog)'s
+  `[[temperature.thresholds]]`) is 60C -- without its own override, a
+  drive at 60C would only compute to a modest partial speed against a
+  curve tuned for a completely different component, not the full-speed
+  response its own danger zone warrants. Each sensor is evaluated against
+  its own curve independently and the fan runs at whichever demands the
+  *highest resulting PWM* -- not "take the hottest raw reading, then feed
+  it through one curve". The default profile's drive/NVMe selectors are
+  set to match their `[[temperature.thresholds]]` entries for exactly
+  this reason (keep them in sync if you change one).
 - **Disconnected sensors are actually detected, not assumed.** A hwmon
   chip can expose more temp inputs than a given board wires up -- this
   board's `it8625` has `temp1`-`temp3` with no diode connected to any of

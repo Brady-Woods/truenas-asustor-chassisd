@@ -133,21 +133,38 @@ min_expected_rpm = 500
 # still not spinning after a few consecutive attempts. No config for that;
 # see src/fan.rs's UNRESPONSIVE_AFTER_STALLS.)
 
-# Sensors feeding this fan's control temp -- the MAX across all of them,
-# not just one, so e.g. a hot drive ramps the fan even with the CPU idle.
-# `chip` alone matches every instance of that hwmon chip (e.g. every
-# populated drive bay for "drivetemp"); narrow with `label`/`input` for a
-# chip with several temps where only some should count. A disconnected
-# sensor (fault flag set, or an implausible reading) is silently excluded,
-# not treated as 0 -- see hal::read_temp_input.
+# Sensors feeding this fan -- each is evaluated against its OWN curve
+# (min_temp_c/max_temp_c below, falling back to this fan's own if unset),
+# and the fan runs at whichever sensor's curve currently demands the
+# highest PWM -- not "take the max raw temperature, then feed it through
+# one shared curve". That distinction matters: a drive at its own 60C
+# critical threshold should mean max_pwm right now, even though this fan's
+# own curve (tuned for the CPU) doesn't reach max_temp_c until 90C. `chip`
+# alone matches every instance of that hwmon chip (e.g. every populated
+# drive bay for "drivetemp"); narrow with `label`/`input` for a chip with
+# several temps where only some should count. A disconnected sensor
+# (fault flag set, or an implausible reading) is silently excluded, not
+# treated as 0 -- see hal::read_temp_input.
 [[fans.sensors]]
 chip = "coretemp"
 label = "Package"       # only the package temp, not individual cores
+# No min_temp_c/max_temp_c override here -- shares this fan's own 45-90C
+# curve, the original hand-tuned values for this CPU.
 
 [[fans.sensors]]
 chip = "drivetemp"      # every SATA bay's drive, whichever is hottest
 min_resample_secs = 30  # changes slowly; no need to reread every update_secs
+# Overridden to this drive's own warn/critical thresholds (see
+# [[temperature.thresholds]] with chip = "drivetemp" above) rather than
+# sharing the CPU's 45-90C curve -- keep these two in sync if you change
+# one.
+min_temp_c = 50.0
+max_temp_c = 60.0
 
 [[fans.sensors]]
 chip = "nvme"            # every NVMe controller, whichever is hottest
 min_resample_secs = 30
+# Same reasoning as drivetemp above -- matches this SSD's own
+# [[temperature.thresholds]] entry.
+min_temp_c = 60.0
+max_temp_c = 70.0

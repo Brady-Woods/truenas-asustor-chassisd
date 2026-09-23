@@ -20,11 +20,21 @@
 //! `min_temp_c`. See the ASCII graph in lm-sensors' fancontrol.txt if this
 //! is confusing on its own -- it was for us too, the first time around.
 //!
-//! Two ways this goes further than upstream fancontrol:
+//! Three ways this goes further than upstream fancontrol:
 //! - **Multiple sensors per fan, not one.** `FanProfile::sensors` is a
-//!   list; the control temp is the max across whichever of them currently
-//!   read as connected (see `hal::read_temp_input`), so e.g. a hot drive
-//!   ramps the fan even with the CPU idle.
+//!   list of whichever currently read as connected (see
+//!   `hal::read_temp_input`), so e.g. a hot drive ramps the fan even with
+//!   the CPU idle.
+//! - **Each sensor can have its own curve endpoints**
+//!   (`SensorSelector::min_temp_c`/`max_temp_c`, falling back to the fan
+//!   profile's own), not just its own reading fed through one shared
+//!   curve -- see `target_pwm_from_sensors`. A drive's own critical
+//!   threshold (60C) is nowhere near a CPU-tuned curve's `max_temp_c`
+//!   (90C); without its own endpoints, a drive at 60C would only compute
+//!   to a modest partial speed, not the full-speed response its own
+//!   danger zone warrants. Each sensor is evaluated against its own curve
+//!   independently, and the *worst resulting PWM* wins -- not the worst
+//!   raw temperature fed through a single curve.
 //! - **Multiple fans, not one.** `Config::fans` is a `Vec`; `main.rs` runs
 //!   one `FanController` per entry, independently.
 //!
@@ -135,7 +145,7 @@ impl FanController {
             return; // chip not loaded (yet) -- try again next tick
         };
 
-        let Some(control_temp) = self.control_temp() else {
+        let Some(sensor_target) = self.target_pwm_from_sensors() else {
             return; // no connected sensor has a reading yet
         };
 
@@ -214,7 +224,7 @@ impl FanController {
             }
         }
 
-        let target = compute_pwm(control_temp, &self.profile);
+        let target = sensor_target;
         // Re-assert manual mode every tick, not just once: some
         // firmware/hardware resets pwmN_enable back to automatic on its
         // own, and fancontrol(8) itself defends against that the same way.
@@ -225,32 +235,45 @@ impl FanController {
         self.last_pwm = Some(target);
     }
 
-    /// Max reading across every configured sensor that currently resolves
-    /// to a connected value, each resampled on its own cadence (fast for
-    /// CPU, which can spike quickly; slower for drive/NVMe temps, which
-    /// change slowly and don't need hammering).
-    fn control_temp(&mut self) -> Option<f32> {
-        let mut max: Option<f32> = None;
+    /// The PWM this fan should run at, right now, per its *hottest-demanding*
+    /// sensor -- not simply "feed the hottest raw temperature through one
+    /// shared curve". Each sensor selector can define its own
+    /// `min_temp_c`/`max_temp_c` (falling back to the fan profile's own if
+    /// unset), so e.g. a drive can be configured to hit `max_pwm` at its
+    /// own critical threshold (60C) even though the fan's CPU-tuned curve
+    /// doesn't reach `max_temp_c` until 90C. Evaluating each sensor against
+    /// its own curve and taking the worst *resulting PWM* (not the worst
+    /// raw temperature first) is what makes that actually work: a drive at
+    /// 61C against a 45-90C shared curve would only compute to a modest
+    /// partial speed, nowhere near the full-speed response its own 60C
+    /// critical threshold warrants.
+    ///
+    /// Each sensor is resampled on its own cadence (fast for CPU, which
+    /// can spike quickly; slower for drive/NVMe temps, which change slowly
+    /// and don't need hammering).
+    fn target_pwm_from_sensors(&mut self) -> Option<u8> {
+        let mut target: Option<u8> = None;
         for i in 0..self.profile.sensors.len() {
-            let min_resample = self.profile.sensors[i]
-                .min_resample_secs
-                .unwrap_or(self.profile.update_secs)
-                .max(1);
+            let sel = &self.profile.sensors[i];
+            let min_resample = sel.min_resample_secs.unwrap_or(self.profile.update_secs).max(1);
             let need_refresh = match self.sensor_cache[i].0 {
                 None => true,
                 Some(t) => t.elapsed() >= Duration::from_secs(min_resample),
             };
             if need_refresh {
-                let v = resolve_selector(&self.profile.sensors[i])
+                let v = resolve_selector(sel)
                     .into_iter()
                     .fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.max(x))));
                 self.sensor_cache[i] = (Some(Instant::now()), v);
             }
-            if let Some(v) = self.sensor_cache[i].1 {
-                max = Some(max.map_or(v, |m: f32| m.max(v)));
+            if let Some(temp_c) = self.sensor_cache[i].1 {
+                let min_t = sel.min_temp_c.unwrap_or(self.profile.min_temp_c);
+                let max_t = sel.max_temp_c.unwrap_or(self.profile.max_temp_c);
+                let pwm = compute_pwm(temp_c, min_t, max_t, &self.profile);
+                target = Some(target.map_or(pwm, |m: u8| m.max(pwm)));
             }
         }
-        max
+        target
     }
 
     fn ensure_manual_mode(&self, hwmon: &str) -> std::io::Result<()> {
@@ -265,18 +288,25 @@ impl FanController {
 /// Ported from lm-sensors' `fancontrol(8)` `UpdateFanSpeeds`: flat
 /// `min_pwm` at/below `min_temp_c`, flat `max_pwm` at/above `max_temp_c`,
 /// and in between a straight line from `min_stop_pwm` (not `min_pwm`) at
-/// `min_temp_c` up to `max_pwm` at `max_temp_c`. Doesn't handle the
-/// stall/kick case -- that's `FanController::update`'s job, since it needs
-/// mutable state (`kick_until`) this pure function doesn't have.
-fn compute_pwm(temp_c: f32, cfg: &FanProfile) -> u8 {
-    let raw = if temp_c <= cfg.min_temp_c {
+/// `min_temp_c` up to `max_pwm` at `max_temp_c`. `min_temp_c`/`max_temp_c`
+/// are passed explicitly rather than always read from `cfg` -- a sensor
+/// selector can override the fan profile's own curve endpoints (see
+/// `target_pwm_from_sensors`), so this needs to evaluate against whichever
+/// pair actually applies to the sensor currently being computed.
+/// `min_stop_pwm`/`min_pwm`/`max_pwm` stay profile-level always -- those
+/// describe the fan itself, not any particular sensor.
+///
+/// Doesn't handle the stall/kick case -- that's `FanController::update`'s
+/// job, since it needs mutable state (`kick_until`) this pure function
+/// doesn't have.
+fn compute_pwm(temp_c: f32, min_temp_c: f32, max_temp_c: f32, cfg: &FanProfile) -> u8 {
+    let raw = if temp_c <= min_temp_c {
         cfg.min_pwm as f32
-    } else if temp_c >= cfg.max_temp_c {
+    } else if temp_c >= max_temp_c {
         cfg.max_pwm as f32
     } else {
-        let (min_t, max_t) = (cfg.min_temp_c, cfg.max_temp_c);
         let (min_stop, max_pwm) = (cfg.min_stop_pwm as f32, cfg.max_pwm as f32);
-        (temp_c - min_t) * (max_pwm - min_stop) / (max_t - min_t) + min_stop
+        (temp_c - min_temp_c) * (max_pwm - min_stop) / (max_temp_c - min_temp_c) + min_stop
     };
     raw.round().clamp(0.0, 255.0) as u8
 }
@@ -304,16 +334,23 @@ mod tests {
         }
     }
 
+    /// Evaluates against `cfg()`'s own min_temp_c/max_temp_c (45/90) --
+    /// the common case, a sensor with no per-selector override.
+    fn pwm(temp_c: f32) -> u8 {
+        let c = cfg();
+        compute_pwm(temp_c, c.min_temp_c, c.max_temp_c, &c)
+    }
+
     #[test]
     fn at_or_below_min_temp_is_flat_min_pwm() {
-        assert_eq!(compute_pwm(30.0, &cfg()), 50);
-        assert_eq!(compute_pwm(45.0, &cfg()), 50);
+        assert_eq!(pwm(30.0), 50);
+        assert_eq!(pwm(45.0), 50);
     }
 
     #[test]
     fn at_or_above_max_temp_is_flat_max_pwm() {
-        assert_eq!(compute_pwm(90.0, &cfg()), 255);
-        assert_eq!(compute_pwm(120.0, &cfg()), 255);
+        assert_eq!(pwm(90.0), 255);
+        assert_eq!(pwm(120.0), 255);
     }
 
     #[test]
@@ -321,16 +358,16 @@ mod tests {
         // The ramp's intercept at min_temp_c is min_stop_pwm(55), not
         // min_pwm(50) -- this is the non-obvious bit the graph in
         // fancontrol.txt documents.
-        let pwm = compute_pwm(45.01, &cfg());
-        assert!((54..=56).contains(&pwm), "got {pwm}");
+        let p = pwm(45.01);
+        assert!((54..=56).contains(&p), "got {p}");
     }
 
     #[test]
     fn midpoint_interpolates_from_min_stop_to_max_pwm() {
         // halfway between 45 and 90 -> halfway between min_stop(55) and 255
-        let pwm = compute_pwm(67.5, &cfg());
+        let p = pwm(67.5);
         let expected = 55 + (255 - 55) / 2;
-        assert!((pwm as i32 - expected as i32).abs() <= 1, "got {pwm}");
+        assert!((p as i32 - expected as i32).abs() <= 1, "got {p}");
     }
 
     #[test]
@@ -338,8 +375,8 @@ mod tests {
         // Spot-check against values observed live (via /etc/fancontrol,
         // the same curve) on nas.skycorgi.net before this daemon took
         // over: modest CPU load kept pwm1 in the 100-200 range.
-        let pwm = compute_pwm(60.0, &cfg());
-        assert!((100..=170).contains(&pwm), "got {pwm}");
+        let p = pwm(60.0);
+        assert!((100..=170).contains(&p), "got {p}");
     }
 
     #[test]
@@ -347,6 +384,26 @@ mod tests {
         // CPU package temp 67C observed live on nas.skycorgi.net produced
         // pwm1=153 through this exact formula -- pinned here so a future
         // change to the algorithm has to justify moving this number.
-        assert_eq!(compute_pwm(67.0, &cfg()), 153);
+        assert_eq!(pwm(67.0), 153);
+    }
+
+    #[test]
+    fn per_sensor_override_hits_max_pwm_at_its_own_threshold_not_the_profiles() {
+        // The actual bug this exists to prevent: a drive at its own 60C
+        // critical threshold must reach max_pwm even though the fan
+        // profile's own (CPU-tuned) max_temp_c is 90 -- a shared curve
+        // would only compute a modest partial speed at 60C, nowhere near
+        // the full-speed response the drive's own danger zone warrants.
+        let c = cfg();
+        let drive_min_t = 50.0; // drivetemp warn threshold
+        let drive_max_t = 60.0; // drivetemp critical threshold
+        assert_eq!(compute_pwm(60.0, drive_min_t, drive_max_t, &c), 255);
+        assert_eq!(compute_pwm(70.0, drive_min_t, drive_max_t, &c), 255); // past its own max too
+    }
+
+    #[test]
+    fn per_sensor_override_still_flat_min_pwm_below_its_own_min() {
+        let c = cfg();
+        assert_eq!(compute_pwm(40.0, 50.0, 60.0, &c), 50); // below the drive's own min_temp_c
     }
 }
