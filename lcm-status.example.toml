@@ -1,0 +1,54 @@
+# lcm-status configuration. Copy to /etc/lcm-status.toml and edit.
+# Every field has a default; you only need to list what you're changing.
+
+[display]
+serial_device = "/dev/ttyS1"
+scroll_step_ms = 300      # ms per character-step while scrolling (~3.3 chars/sec)
+scroll_max_chars = 64     # longest text kept for scrolling; longer is truncated
+scroll_pause_ms = 800     # pause at start/end of a scroll cycle
+
+[rotation]
+dwell_secs = 5            # how long a short (non-scrolling) screen stays up
+resume_after_secs = 30    # resume auto-rotation this long after manual UP/DOWN
+
+[menu]
+confirm_timeout_secs = 10 # auto-cancel a shutdown/restart/eject confirm screen
+
+[sleep]
+enabled = false
+start = "23:00"
+end = "07:00"
+
+[socket]
+path = "/run/lcm-status.sock"
+group = "lcm-status"
+
+[screens]
+network = true
+pools = true               # pool capacity + health, merged into one screen per pool
+hdd = true                 # SMART health + temp, merged into one screen per drive
+temperature = true         # CPU temp + the one real fan (others are unpopulated headers)
+docker = true
+
+[refresh]
+# Floors, not polling intervals -- refresh actually happens right before a
+# screen is (re)displayed, never more often than this even if the rotation
+# loop is faster.
+network_min_secs = 10
+pools_min_secs = 30
+hdd_min_secs = 300        # SMART queries; kept slow to avoid waking spun-down drives
+temperature_min_secs = 10
+docker_min_secs = 10
+
+[temperature]
+units = "c"               # "c" or "f"
+warn_threshold = 60.0
+
+[docker]
+ignore = []                # container names to exclude from health checks
+
+[led]
+nic_mode = "link"          # "link" (solid while connected) or "activity" (dark, flashes on traffic)
+# Front LEDs share [sleep]'s schedule for night mode -- one schedule for
+# both the LCD backlight and the LEDs, not two. Red bay LEDs are always
+# left alone by night mode so a real drive failure still shows.

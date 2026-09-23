@@ -1,0 +1,15 @@
+[Unit]
+Description=ASUSTOR LCM front-panel status display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/lcm-status /etc/lcm-status.toml
+Restart=on-failure
+RestartSec=2
+# Needs root: /dev/ttyS1, the LCD power GPIO/LED, smartctl, and
+# systemctl poweroff/reboot for the panel's shutdown/restart action.
+
+[Install]
+WantedBy=multi-user.target
