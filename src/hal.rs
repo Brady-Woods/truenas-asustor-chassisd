@@ -294,25 +294,82 @@ pub(crate) fn read_sysfs_f32(path: &str) -> Option<f32> {
         .map(|milli_c| milli_c / 1000.0)
 }
 
-/// Every drive-adjacent temp sensor (SATA via `drivetemp`, NVMe via its own
-/// hwmon), read directly from sysfs -- deliberately no smartctl/lsblk/
-/// udevadm calls (unlike `hdd()`, which is intentionally slow/infrequent
-/// to avoid waking spun-down drives for SMART queries -- see
-/// RefreshConfig::hdd_min_secs). This is cheap enough to poll on its own
-/// schedule. Bay identity doesn't matter to the caller (fan control), only
-/// the values do.
-pub(crate) fn drive_and_nvme_temps() -> Vec<f32> {
-    let mut temps = Vec::new();
-    for prefix in ["drivetemp", "nvme"] {
-        if let Some(dirs) = glob_hwmon(prefix) {
-            for hwmon in dirs {
-                if let Some(t) = read_sysfs_f32(&format!("{hwmon}/temp1_input")) {
-                    temps.push(t);
+/// Every `tempN` input a hwmon instance exposes (base names only, e.g.
+/// `["temp1", "temp2"]` -- callers append `_input`/`_label`/`_fault`
+/// themselves). Used to enumerate a chip's sensors without hardcoding how
+/// many it has.
+pub(crate) fn temp_inputs(hwmon: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(hwmon) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix("_input")
+                .filter(|n| n.starts_with("temp"))
+                .map(|n| n.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Reads one `tempN_input`, treating it as "not connected" (`None`) rather
+/// than a real value if either:
+/// - the kernel itself says so (`tempN_fault` == "1", a real signal some
+///   chips expose for an open/disconnected thermal diode), or
+/// - the reading is outside any plausible temperature for hardware that's
+///   actually there (deliberately generous bounds -- this is a last-resort
+///   sanity net, not a warning threshold).
+///
+/// Exists because this board's `it8625` onboard `temp1`-`temp3` have no
+/// diode wired to them at all and read a constant, wildly-out-of-range
+/// value forever (see `asustor-platform-driver`'s CLAUDE.md) -- with
+/// nothing filtering that out, a naive "read every temp this chip has"
+/// sensor selector would let a permanently-disconnected input drag a fan
+/// curve's max() up to full speed forever.
+pub(crate) fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
+    if let Ok(s) = std::fs::read_to_string(format!("{hwmon}/{input}_fault")) {
+        if s.trim() == "1" {
+            return None;
+        }
+    }
+    const PLAUSIBLE_MIN_C: f32 = -20.0;
+    const PLAUSIBLE_MAX_C: f32 = 125.0;
+    read_sysfs_f32(&format!("{hwmon}/{input}_input"))
+        .filter(|&t| (PLAUSIBLE_MIN_C..=PLAUSIBLE_MAX_C).contains(&t))
+}
+
+/// All temp readings matching a `SensorSelector` (config.rs) across every
+/// hwmon instance of the named chip -- e.g. every populated drive bay for
+/// `chip = "drivetemp"`, with no need to enumerate them by name. Chips
+/// with no matching (or currently unreadable/disconnected) input simply
+/// contribute nothing, same as an empty drive bay having no hwmon instance
+/// at all.
+pub(crate) fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> {
+    let mut out = Vec::new();
+    let Some(hwmons) = glob_hwmon(&sel.chip) else {
+        return out;
+    };
+    for hwmon in hwmons {
+        let inputs: Vec<String> = match &sel.input {
+            Some(i) => vec![i.clone()],
+            None => temp_inputs(&hwmon),
+        };
+        for input in inputs {
+            if let Some(wanted_label) = &sel.label {
+                let label = std::fs::read_to_string(format!("{hwmon}/{input}_label")).unwrap_or_default();
+                if !label.contains(wanted_label.as_str()) {
+                    continue;
                 }
+            }
+            if let Some(t) = read_temp_input(&hwmon, &input) {
+                out.push(t);
             }
         }
     }
-    temps
+    out
 }
 
 pub(crate) fn coretemp_package() -> Option<f32> {

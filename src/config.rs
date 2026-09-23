@@ -20,7 +20,14 @@ pub struct Config {
     pub temperature: TemperatureConfig,
     pub docker: DockerConfig,
     pub led: LedConfig,
-    pub fan: FanConfig,
+    /// One entry per physical fan to control -- see `FanProfile`. Defaults
+    /// to this board's single real fan (`default_fans()` below) so the
+    /// daemon behaves the same with no config file at all; an explicit
+    /// `[[fans]]` in the config file replaces the defaults entirely rather
+    /// than merging with them (matches how a fresh `pwmconfig` run replaces
+    /// `/etc/fancontrol` wholesale, not field-by-field).
+    #[serde(default = "default_fans")]
+    pub fans: Vec<FanProfile>,
 }
 
 impl Default for Config {
@@ -36,7 +43,7 @@ impl Default for Config {
             temperature: TemperatureConfig::default(),
             docker: DockerConfig::default(),
             led: LedConfig::default(),
-            fan: FanConfig::default(),
+            fans: default_fans(),
         }
     }
 }
@@ -251,45 +258,77 @@ impl Default for DockerConfig {
     }
 }
 
+/// One physical fan: which pwm output drives it, which sensors feed its
+/// curve, and the curve itself. Config shape deliberately mirrors what
+/// `fancontrol`/`pwmconfig` expose (one curve + one sensor set per pwm
+/// output, `[[fans]]` here playing the role of `FCTEMPS`/`FCFANS`/
+/// `MINTEMP`/etc per device in `/etc/fancontrol`), plus this project's own
+/// enhancement: `sensors` is a *list*, and the control temp is the max
+/// across all of them, not one fixed sensor. Multiple `[[fans]]` blocks
+/// support boards with more than one controllable fan; run `lcm-status
+/// fan-profile` (see `fan_calibrate.rs`) to discover what's actually
+/// connected on a given board rather than guessing.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
-pub struct FanConfig {
+pub struct FanProfile {
+    /// Just a label for logging -- doesn't need to be unique, though it's
+    /// clearer if it is.
+    pub name: String,
     pub enabled: bool,
-    /// How often to re-evaluate the curve and (re)write pwm1. lm-sensors'
-    /// fancontrol(8) default INTERVAL is also 1s; carried over unchanged.
+    /// hwmon chip name (the `name` sysfs file's content, e.g. "it8625")
+    /// that exposes the pwm output. Resolved fresh at runtime, same as
+    /// sensor chips -- hwmon numbers aren't stable across reloads.
+    pub pwm_chip: String,
+    /// Which pwm output on that chip, e.g. 1 for `pwm1`/`pwm1_enable`.
+    pub pwm_index: u32,
+    /// Which tachometer input reports this fan's RPM, e.g. 1 for
+    /// `fan1_input` -- used for stall detection (see fan.rs). `None` if
+    /// this pwm output has no associated tach (some boards genuinely don't
+    /// wire one up); stall detection then falls back to "pwm was
+    /// commanded to 0" only, since there's no RPM to check.
+    pub fan_index: Option<u32>,
+    /// How often to re-evaluate this fan's curve and (re)write its pwm.
+    /// lm-sensors' fancontrol(8) default INTERVAL is also 1s.
     pub update_secs: u64,
-    /// At or below this CPU temp, the fan is allowed to be fully stopped.
+    /// At or below this control temp, the fan is pinned to min_pwm.
     pub min_temp_c: f32,
-    /// At or above this CPU temp, pwm1 is pinned to max_pwm.
+    /// At or above this control temp, the fan is pinned to max_pwm.
     pub max_temp_c: f32,
     /// PWM needed to reliably get a *stopped* fan spinning again. Below
     /// this, a stopped fan stays stopped rather than crawl at a PWM too low
-    /// to actually start it turning.
+    /// to actually start it turning. `lcm-status fan-profile` measures this
+    /// empirically per fan rather than guessing.
     pub min_start_pwm: u8,
     /// Once running, the fan is allowed to coast down to this PWM before
-    /// it's allowed to stop entirely (prevents rapid stop/start cycling
-    /// right at the boundary).
+    /// it's allowed to stop entirely (also the ramp's value at min_temp_c
+    /// -- see fan.rs for why that's not min_pwm; same as upstream
+    /// fancontrol).
     pub min_stop_pwm: u8,
-    /// Floor once the fan is running (the curve's PWM at min_temp_c).
+    /// PWM used flat at/below min_temp_c.
     pub min_pwm: u8,
-    /// Ceiling (the curve's PWM at max_temp_c). 255 = fully on.
+    /// PWM used flat at/above max_temp_c. 255 = fully on.
     pub max_pwm: u8,
-    /// How often to resample drive/NVMe temps for the control-temp max
-    /// (separate from `update_secs`, which governs the CPU reading and the
-    /// pwm1 write). Drive temps change on a much slower timescale than CPU
-    /// load, and this reads via /sys/class/hwmon directly (no smartctl),
-    /// but there's no reason to hammer it every second either.
-    pub drive_temp_min_secs: u64,
+    /// Which sensors feed this fan's control temp -- the max of all of
+    /// them, not just one. Empty means this fan never sees a temp reading,
+    /// which effectively disables it (compute_pwm has nothing to act on).
+    pub sensors: Vec<SensorSelector>,
 }
 
-impl Default for FanConfig {
+impl Default for FanProfile {
     fn default() -> Self {
-        // These match the /etc/fancontrol curve this replaces, hand-tuned
-        // on nas.skycorgi.net's AS6704T (it8625 pwm1, driven by coretemp
-        // package temp -- the chip's own thermal inputs are unconnected on
-        // this board).
-        FanConfig {
+        // Curve defaults match this board's tuned values, so a partial
+        // `[[fans]]` entry (e.g. just overriding pwm_chip/sensors) still
+        // gets a sane curve. pwm_chip/sensors themselves default to empty
+        // -- a profile without them is a meaningless no-op (fan.rs skips a
+        // fan with no sensors resolved), which is a fine failure mode for
+        // "you forgot to fill this in" rather than silently controlling
+        // the wrong chip.
+        FanProfile {
+            name: "fan".to_string(),
             enabled: true,
+            pwm_chip: String::new(),
+            pwm_index: 1,
+            fan_index: None,
             update_secs: 1,
             min_temp_c: 45.0,
             max_temp_c: 90.0,
@@ -297,9 +336,76 @@ impl Default for FanConfig {
             min_stop_pwm: 55,
             min_pwm: 50,
             max_pwm: 255,
-            drive_temp_min_secs: 30,
+            sensors: Vec::new(),
         }
     }
+}
+
+/// Identifies one or more hwmon temperature inputs. `chip` alone (the most
+/// common case) matches every temp input on every hwmon instance of that
+/// chip -- e.g. `chip = "drivetemp"` picks up every populated drive bay,
+/// however many there are, without needing to enumerate them. Narrow with
+/// `input`/`label` for a chip that exposes several temps and only one (or
+/// a specific subset) should count, e.g. `it8625`'s temp1/2/3 (most of
+/// which are unwired on this board -- see `min_resample_secs` note below
+/// on why that's handled by filtering, not by guessing which to list) or
+/// `coretemp`'s per-core inputs alongside its package input.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SensorSelector {
+    /// hwmon chip name, e.g. "coretemp", "drivetemp", "nvme", "it8625".
+    pub chip: String,
+    /// A specific sysfs attribute base name, e.g. "temp2" (for
+    /// `temp2_input`). If unset, matches every `tempN_input` the chip
+    /// exposes.
+    pub input: Option<String>,
+    /// Substring match against `tempN_label`, for a chip with several
+    /// inputs where only some should count (e.g. `label = "Package"` on
+    /// coretemp, to use the package temp and not individual cores).
+    /// Inputs with no label file never match a selector that sets this.
+    pub label: Option<String>,
+    /// Overrides the owning fan's `update_secs` for *this* sensor's
+    /// resample rate. Leave unset to just use `update_secs` (fine for CPU,
+    /// which can change quickly); set higher for slow-changing sensors
+    /// (drive/NVMe temps) so they aren't reread every tick for no reason.
+    /// A disconnected sensor (fault flag set, or an implausible reading --
+    /// see `hal::read_temp_input`) is silently excluded rather than
+    /// treated as 0 or as an error, the same way an unpopulated drive bay
+    /// simply has no `drivetemp` hwmon instance at all.
+    pub min_resample_secs: Option<u64>,
+}
+
+impl Default for SensorSelector {
+    fn default() -> Self {
+        SensorSelector { chip: String::new(), input: None, label: None, min_resample_secs: None }
+    }
+}
+
+/// This board's single real fan (AS6704T: `it8625` `pwm1`/`fan1`; fan2/3
+/// headers exist on the chip but nothing's physically connected -- see
+/// `hal::cpu_and_fan`'s doc comment). Used as `Config`'s default so the
+/// daemon needs no `[[fans]]` config at all to behave the way it always
+/// has; curve values match the `/etc/fancontrol` config this replaced.
+pub fn default_fans() -> Vec<FanProfile> {
+    vec![FanProfile {
+        name: "chassis".to_string(),
+        enabled: true,
+        pwm_chip: "it8625".to_string(),
+        pwm_index: 1,
+        fan_index: Some(1),
+        update_secs: 1,
+        min_temp_c: 45.0,
+        max_temp_c: 90.0,
+        min_start_pwm: 60,
+        min_stop_pwm: 55,
+        min_pwm: 50,
+        max_pwm: 255,
+        sensors: vec![
+            SensorSelector { chip: "coretemp".to_string(), label: Some("Package".to_string()), ..Default::default() },
+            SensorSelector { chip: "drivetemp".to_string(), min_resample_secs: Some(30), ..Default::default() },
+            SensorSelector { chip: "nvme".to_string(), min_resample_secs: Some(30), ..Default::default() },
+        ],
+    }]
 }
 
 impl Config {
