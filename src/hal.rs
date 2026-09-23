@@ -22,12 +22,41 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// Network: every *physical* interface with a global-scope IPv4, one
-/// screen each. Filters out bridges/veth/docker/incus interfaces via
+/// Every *physical* interface with a global-scope IPv4 -- i.e. actually
+/// brought into service in TrueNAS's own network config, as opposed to
+/// merely existing as hardware (`physical_nics()`, below, returns those
+/// too). Filters out bridges/veth/docker/incus interfaces via
 /// /sys/class/net/{iface}/device -- only real hardware NICs have that
 /// symlink, which is a more reliable filter than guessing at name
 /// prefixes (br-, veth, docker0, incusbr0, ... is an open-ended list that
 /// will never fully keep up with every virtual interface naming scheme).
+///
+/// This distinction matters for more than the network screen: a NIC that
+/// exists but was never assigned an address (e.g. an expansion card
+/// that's physically installed but deliberately not cabled/configured
+/// yet) reports link-down forever, same as a real outage would -- but
+/// it's not a fault, since nothing ever expected it to be connected. See
+/// `state::recompute_status_led`, which uses this (not `physical_nics()`)
+/// for exactly that reason -- found live when the status LED sat amber
+/// with every actual health check green, because the AQC113 card (present
+/// in hardware, never configured with an IP) was being treated the same
+/// as a real link failure on the NICs that matter.
+pub fn configured_nics() -> Vec<String> {
+    let Some(out) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
+            let iface = line.split_whitespace().nth(1)?.trim_end_matches(':').to_string();
+            std::path::Path::new(&format!("/sys/class/net/{iface}/device"))
+                .exists()
+                .then_some(iface)
+        })
+        .collect()
+}
+
+/// One screen per interface `configured_nics()` returns, with its address.
 pub fn network() -> Vec<Screen> {
     let out = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]);
     let Some(out) = out else {
@@ -65,8 +94,11 @@ pub fn network() -> Vec<Screen> {
 }
 
 /// Every physical NIC name (same /sys/class/net/{iface}/device filter as
-/// `network()`), regardless of whether it currently has an address --
-/// used for link-state LED checks, not just the display screen.
+/// `network()`), regardless of whether it currently has an address -- used
+/// for per-port LED convention (nic_mode, night mode), which makes sense
+/// to apply to hardware that exists whether or not it's in service. NOT
+/// used for "is the network down" fault detection -- see `configured_nics`
+/// for that, and why the distinction matters.
 pub fn physical_nics() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return Vec::new();

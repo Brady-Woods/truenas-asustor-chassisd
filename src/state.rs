@@ -200,7 +200,11 @@ impl AppState {
             .any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"))
         {
             StatusPattern::Failed
-        } else if hal::physical_nics().iter().any(|i| led::link_is_down(i)) {
+        } else if hal::configured_nics().iter().any(|i| led::link_is_down(i)) {
+            // Only NICs actually brought into service (have an address) --
+            // an installed-but-unconfigured card (e.g. AQC113 with no
+            // cable/IP yet) reports link-down forever without being a
+            // fault. See `hal::configured_nics`'s doc comment.
             StatusPattern::NetworkDown
         } else {
             StatusPattern::Ok
