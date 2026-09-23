@@ -40,8 +40,20 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
 # interface this project writes to actually exists.
 check_driver() {
     log "Checking for asustor-platform-driver (nas-deploy branch)..."
+    # This and the platform driver's own Post Init script (see
+    # truenas-asustor-deploy/components/platform-driver/) both run as
+    # POSTINIT Init/Shutdown Scripts, and TrueNAS doesn't guarantee which
+    # runs first. On a fresh boot environment the driver may still be
+    # mid-rebuild when this starts, so poll instead of failing immediately.
+    wait_secs="${DRIVER_WAIT_SECS:-60}"
+    waited=0
+    while ! lsmod | grep -q '^asustor_gpio_it87'; do
+        [ "$waited" -ge "$wait_secs" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
     if ! lsmod | grep -q '^asustor_gpio_it87'; then
-        fail "asustor_gpio_it87 kernel module not loaded.
+        fail "asustor_gpio_it87 kernel module not loaded (waited ${wait_secs}s).
   lcm-status's LED support (bay LEDs, status LED, LCD power/sleep) requires
   mafredri/asustor-platform-driver, branch nas-deploy (main + PRs #46, #47, #48):
     https://github.com/mafredri/asustor-platform-driver/pulls
