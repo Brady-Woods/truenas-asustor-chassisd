@@ -75,6 +75,20 @@ pub struct FanController {
 }
 
 impl FanController {
+    /// Current health, for the status LED (`state::recompute_status_led`)
+    /// -- current state, not transition-gated the way this fan's own
+    /// syslog lines are (the LED always reflects "right now").
+    pub fn health_level(&self) -> crate::socket::Level {
+        use crate::socket::Level;
+        if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS {
+            Level::Critical
+        } else if self.consecutive_stalls > 0 || self.low_rpm_warned {
+            Level::Warn
+        } else {
+            Level::Info
+        }
+    }
+
     pub fn new(profile: FanProfile) -> Self {
         let sensor_cache = vec![(None, None); profile.sensors.len()];
         FanController {

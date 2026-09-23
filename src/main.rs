@@ -124,6 +124,7 @@ fn run_daemon(args: &[String]) {
     for f in &mut fans {
         f.tick();
     }
+    state.set_fan_health(worst_fan_health(&fans));
 
     let serial_fd = lcm.as_raw_fd();
 
@@ -140,6 +141,7 @@ fn run_daemon(args: &[String]) {
         for f in &mut fans {
             f.tick();
         }
+        state.set_fan_health(worst_fan_health(&fans));
 
         let effect = state.tick();
         apply_effect(effect, &mut lcm, &cfg);
@@ -238,6 +240,14 @@ fn next_wake_ms(_cfg: &Config) -> i32 {
     // threaded through the poll() call. At idle (no scrolling, no pending
     // timers) this is the only cost -- one wakeup per 100ms is negligible.
     100
+}
+
+/// Worst current health across every configured fan -- fed into
+/// `AppState::set_fan_health` each tick so the status LED can factor fan
+/// trouble in. Lives here (not in `state.rs`) because `FanController`s are
+/// a separate top-level value from `AppState` in this loop, not owned by it.
+fn worst_fan_health(fans: &[fan::FanController]) -> socket::Level {
+    fans.iter().map(|f| f.health_level()).max().unwrap_or(socket::Level::Info)
 }
 
 fn run_probe_command(cmd: &str, args: &[String]) {

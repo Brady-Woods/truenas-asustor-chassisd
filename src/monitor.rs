@@ -17,18 +17,16 @@
 use crate::config::TemperatureConfig;
 use crate::hal::all_connected_temps;
 use crate::led::BayState;
+use crate::socket::Level;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TempLevel {
-    Normal,
-    Warning,
-    Critical,
-}
-
 pub struct HealthMonitor {
-    temp_levels: HashMap<String, TempLevel>,
+    /// Keyed by the same description string `all_connected_temps` logs
+    /// with -- fine as a map key (stable per sensor across calls; only
+    /// changes if the sensor's label/chip itself changes, which would
+    /// mean it's a different sensor anyway).
+    temp_levels: HashMap<String, Level>,
     pool_healths: HashMap<String, String>,
     bay_states: HashMap<u32, BayState>,
     /// Temp monitoring runs on its own clock (`maybe_check_temps`),
@@ -66,39 +64,62 @@ impl HealthMonitor {
     }
 
     /// Every currently-connected temp sensor on the box (not just what a
-    /// fan curve happens to use) against `warn_threshold`/
-    /// `critical_threshold`. A sensor that drops out of the connected set
-    /// entirely (module reload, disk removed) just stops being tracked --
-    /// not treated as a return to "normal", since it isn't a real reading.
+    /// fan curve happens to use) against its chip's threshold override if
+    /// one's configured, else the global `warn_threshold`/
+    /// `critical_threshold` fallback -- see `config::default_temp_thresholds`
+    /// for why a CPU/HDD/NVMe shouldn't share one pair. A sensor that drops
+    /// out of the connected set entirely (module reload, disk removed)
+    /// just stops being tracked -- not treated as a return to "normal",
+    /// since it isn't a real reading.
     fn check_temps(&mut self, cfg: &TemperatureConfig) {
-        for (label, temp_c) in all_connected_temps() {
-            let level = if temp_c >= cfg.critical_threshold {
-                TempLevel::Critical
-            } else if temp_c >= cfg.warn_threshold {
-                TempLevel::Warning
+        for (chip, label, temp_c) in all_connected_temps() {
+            let (warn, crit) = cfg
+                .thresholds
+                .iter()
+                .find(|t| t.chip == chip)
+                .map(|t| (t.warn_threshold, t.critical_threshold))
+                .unwrap_or((cfg.warn_threshold, cfg.critical_threshold));
+
+            let level = if temp_c >= crit {
+                Level::Critical
+            } else if temp_c >= warn {
+                Level::Warn
             } else {
-                TempLevel::Normal
+                Level::Info
             };
             let prev = self.temp_levels.insert(label.clone(), level);
             if prev == Some(level) {
                 continue; // no change
             }
             match level {
-                TempLevel::Critical => crate::syslog::critical(&format!(
-                    "{label}: {temp_c:.1}C, at or above critical threshold ({:.1}C)",
-                    cfg.critical_threshold
+                Level::Critical => crate::syslog::critical(&format!(
+                    "{label}: {temp_c:.1}C, at or above critical threshold ({crit:.1}C)"
                 )),
-                TempLevel::Warning => crate::syslog::warning(&format!(
-                    "{label}: {temp_c:.1}C, at or above warning threshold ({:.1}C)",
-                    cfg.warn_threshold
+                Level::Warn => crate::syslog::warning(&format!(
+                    "{label}: {temp_c:.1}C, at or above warning threshold ({warn:.1}C)"
                 )),
-                TempLevel::Normal => {
+                _ => {
                     if prev.is_some() {
                         crate::syslog::notice(&format!("{label}: back to {temp_c:.1}C, below warning threshold"));
                     }
                 }
             }
         }
+    }
+
+    /// Worst currently-tracked temp level, for the status LED
+    /// (`state::recompute_status_led`) -- current state, not
+    /// transition-gated like the logging above (the LED always reflects
+    /// "right now", syslog is specifically for "something changed").
+    pub fn worst_temp_level(&self) -> Level {
+        self.temp_levels.values().copied().max().unwrap_or(Level::Info)
+    }
+
+    /// Whether any bay currently reports a confirmed SMART failure --
+    /// same "current state, not transition-gated" reasoning as
+    /// `worst_temp_level`.
+    pub fn any_bay_failed(&self) -> bool {
+        self.bay_states.values().any(|s| *s == BayState::Failed)
     }
 
     /// `healths`: (pool name, health string) from `zpool list -H -o

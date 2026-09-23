@@ -20,6 +20,7 @@ pub struct Config {
     pub temperature: TemperatureConfig,
     pub docker: DockerConfig,
     pub led: LedConfig,
+    pub network: NetworkConfig,
     /// One entry per physical fan to control -- see `FanProfile`. Defaults
     /// to this board's single real fan (`default_fans()` below) so the
     /// daemon behaves the same with no config file at all; an explicit
@@ -43,7 +44,62 @@ impl Default for Config {
             temperature: TemperatureConfig::default(),
             docker: DockerConfig::default(),
             led: LedConfig::default(),
+            network: NetworkConfig::default(),
             fans: default_fans(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct NetworkConfig {
+    /// Whether network link state feeds the status LED at all. Set false
+    /// to go back to pool-health/socket-overrides only.
+    pub enabled: bool,
+    /// Which interfaces' link state counts for status-LED purposes. Empty
+    /// (default) means "whatever currently has an IP" (`hal::configured_nics`)
+    /// -- auto-adjusts as interfaces are configured/unconfigured. Set
+    /// explicitly to pin the list (e.g. if you want a specific NIC
+    /// monitored even before it has an address yet, or want to exclude one
+    /// that does).
+    pub monitored_nics: Vec<String>,
+    /// Status-LED severity when *some* (but not all) monitored NICs are
+    /// down -- link failure on a redundant/bonded setup is degraded, not
+    /// necessarily an outage.
+    pub some_down_level: NetworkLevel,
+    /// Status-LED severity when *every* monitored NIC is down -- normally
+    /// worse than "some", since that's a real total network outage.
+    pub all_down_level: NetworkLevel,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        NetworkConfig {
+            enabled: true,
+            monitored_nics: Vec::new(),
+            some_down_level: NetworkLevel::Warning,
+            all_down_level: NetworkLevel::Error,
+        }
+    }
+}
+
+/// `crate::socket::Level`'s Warn/Error, spelled out for this config context
+/// (Info/Critical aren't sensible choices here: Info wouldn't show on the
+/// LED at all, and a link failure alone -- unlike a stalled fan or a
+/// pool actually gone -- isn't the "flash red" tier of emergency by
+/// default; set both to the same value if you disagree for your setup).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkLevel {
+    Warning,
+    Error,
+}
+
+impl From<NetworkLevel> for crate::socket::Level {
+    fn from(l: NetworkLevel) -> Self {
+        match l {
+            NetworkLevel::Warning => crate::socket::Level::Warn,
+            NetworkLevel::Error => crate::socket::Level::Error,
         }
     }
 }
@@ -223,14 +279,74 @@ impl Default for RefreshConfig {
 #[serde(default)]
 pub struct TemperatureConfig {
     pub units: TempUnits,
-    /// Highlight on the temperature screen, and log a syslog WARNING for
-    /// (`monitor::HealthMonitor`), any currently-connected sensor at or
+    /// Fallback for any sensor not matched by `thresholds` below. Highlight
+    /// on the temperature screen, and log a syslog WARNING
+    /// (`monitor::HealthMonitor`), for any currently-connected sensor at or
     /// above this. Always degrees C regardless of `units` (which only
     /// affects the temperature *screen's* display, not this comparison).
     pub warn_threshold: f32,
-    /// Log a syslog CRITICAL instead of a warning for any sensor at or
-    /// above this. Always degrees C, same as `warn_threshold`.
+    /// Fallback critical threshold -- log CRITICAL instead of WARNING for
+    /// any sensor at or above this. Always degrees C.
     pub critical_threshold: f32,
+    /// Per-chip overrides -- a CPU, an HDD, and an NVMe SSD have very
+    /// different safe operating ranges, so one global pair is a blunt
+    /// instrument. Matched by `chip` (the hwmon `name` file's content,
+    /// e.g. "coretemp", "drivetemp", "nvme") against every sensor that
+    /// chip exposes; a chip with no matching entry here falls back to
+    /// `warn_threshold`/`critical_threshold` above. See `default_temp_thresholds()`
+    /// for this hardware's defaults and the research behind them.
+    pub thresholds: Vec<TempThresholdOverride>,
+}
+
+/// One chip's warn/critical pair -- see `TemperatureConfig::thresholds`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct TempThresholdOverride {
+    pub chip: String,
+    pub warn_threshold: f32,
+    pub critical_threshold: f32,
+}
+
+impl Default for TempThresholdOverride {
+    fn default() -> Self {
+        TempThresholdOverride { chip: String::new(), warn_threshold: 75.0, critical_threshold: 85.0 }
+    }
+}
+
+/// This board's per-chip thresholds, sourced from each component's actual
+/// datasheet where one was publicly available (2026-09-23) rather than
+/// guessed:
+///
+/// - **coretemp** (Intel Celeron N5105): Intel ARK lists TjMax (T
+///   Junction, the throttle/shutdown point) at 105C. Warn at 85C, critical
+///   at 100C -- both comfortably under TjMax, critical close enough to it
+///   to mean "throttling is imminent or already happening", not a
+///   hypothetical.
+/// - **drivetemp** (WD Ultrastar DC HC550, this box's 4 bays): WD's own
+///   datasheet lists operating temperature 5-60C, with MTBF/AFR derating
+///   starting above 40C ambient and their own worst-case reference point
+///   being 60C ambient / 65C device temp. Warn at 50C (comfortably into
+///   the derating zone but well short of the limit), critical at 60C
+///   (the drive's own spec'd operating ceiling).
+/// - **nvme** (WD Black SN750): WD's datasheet lists operating temperature
+///   (their "composite temperature", the same value this chip's `nvme`
+///   hwmon reports) as 0-70C. Warn at 60C, critical at 70C -- the spec's
+///   own ceiling, not a margin below it, since composite temp already *is*
+///   the number WD says not to exceed.
+///
+/// **Not included, deliberately:** the AQC113 NIC's board-level PHY/MAC
+/// temperature sensors. No public datasheet with a numeric junction/case
+/// limit was found for this chip (Marvell's technical datasheets aren't
+/// publicly indexed the way Intel's/WD's are) -- rather than fabricate a
+/// specific-looking number with no real source, this chip falls back to
+/// the global `warn_threshold`/`critical_threshold` default. Worth
+/// revisiting if Marvell's actual datasheet ever turns up.
+pub fn default_temp_thresholds() -> Vec<TempThresholdOverride> {
+    vec![
+        TempThresholdOverride { chip: "coretemp".to_string(), warn_threshold: 85.0, critical_threshold: 100.0 },
+        TempThresholdOverride { chip: "drivetemp".to_string(), warn_threshold: 50.0, critical_threshold: 60.0 },
+        TempThresholdOverride { chip: "nvme".to_string(), warn_threshold: 60.0, critical_threshold: 70.0 },
+    ]
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -244,19 +360,19 @@ impl Default for TemperatureConfig {
     fn default() -> Self {
         TemperatureConfig {
             units: TempUnits::C,
-            // Observed live on nas.skycorgi.net (2026-09-23): CPU package
-            // temp normally sits in the 57-67C range under everyday load,
-            // so a lower threshold here would fire constantly and become
-            // noise instead of signal -- the whole point of alerting on
-            // this is a threshold that's normally quiet. 75C leaves real
-            // headroom above routine operation while still well under
-            // critical_threshold.
+            // Fallback for whatever `thresholds` doesn't cover -- mainly
+            // the ACPI thermal zone and the AQC113 NIC's sensors on this
+            // board (see default_temp_thresholds() for why the NIC has no
+            // dedicated, datasheet-sourced entry of its own). Observed
+            // live (2026-09-23): CPU package temp normally sits 57-67C
+            // under everyday load -- since CPU now has its own
+            // datasheet-sourced entry in `thresholds`, that observation no
+            // longer directly justifies this fallback, but it's a
+            // reasonable generic "getting warm" ceiling for silicon in
+            // general absent a specific spec.
             warn_threshold: 75.0,
-            // Comfortably under the default fan curve's max_temp_c (90 --
-            // the point where the fan is already pinned to full speed, so
-            // there's nothing more cooling can do about it), leaving a
-            // real early-warning gap before things get to that point.
             critical_threshold: 85.0,
+            thresholds: default_temp_thresholds(),
         }
     }
 }
