@@ -1,5 +1,6 @@
 mod config;
 mod fan;
+mod fan_calibrate;
 mod hal;
 mod led;
 mod protocol;
@@ -35,6 +36,20 @@ fn main() {
 
     if cmd == "init" || cmd == "settext" || cmd == "listen" {
         return run_probe_command(cmd, &args);
+    }
+
+    if cmd == "fan-profile" {
+        // Skip flags (e.g. --yes) when looking for a positional config
+        // path, rather than blindly taking args[2] -- `--yes` would
+        // otherwise get parsed as the path.
+        let path = args
+            .iter()
+            .skip(2)
+            .find(|a| !a.starts_with('-'))
+            .map(|s| Path::new(s.as_str()))
+            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        fan_calibrate::run(path);
+        return;
     }
 
     run_daemon(&args);
@@ -90,12 +105,15 @@ fn run_daemon(args: &[String]) {
     state.refresh_all();
     state.init_leds();
 
-    // Runs on its own cadence (cfg.fan.update_secs, independent of the LCD
-    // rotation/scroll timing below) -- fire once immediately so the fan
+    // One controller per configured fan, each on its own cadence
+    // (independent of the LCD rotation/scroll timing below). `tick()`
+    // fires immediately on this first call (no `last_tick` yet), so the
     // curve applies from startup rather than waiting a full interval.
-    let mut fan = fan::FanState::new();
-    fan.update(&cfg.fan);
-    let mut last_fan_update = Instant::now();
+    let mut fans: Vec<fan::FanController> =
+        cfg.fans.iter().cloned().map(fan::FanController::new).collect();
+    for f in &mut fans {
+        f.tick();
+    }
 
     let serial_fd = lcm.as_raw_fd();
 
@@ -109,9 +127,8 @@ fn run_daemon(args: &[String]) {
             state.set_schedule_sleep_wanted(in_sleep_window(&cfg.sleep.start, &cfg.sleep.end, now_hhmm()));
         }
 
-        if last_fan_update.elapsed() >= Duration::from_secs(cfg.fan.update_secs.max(1)) {
-            fan.update(&cfg.fan);
-            last_fan_update = Instant::now();
+        for f in &mut fans {
+            f.tick();
         }
 
         let effect = state.tick();

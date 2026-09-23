@@ -210,25 +210,89 @@ triggers use):
 
 ## Fan control
 
-Drives `pwm1` (the `it8625` hwmon chip's one populated fan header) from
-temperature -- see `src/fan.rs`. This used to be lm-sensors' `fancontrol`
-package's job; it's implemented here now because `fancontrol` turned out
-not to be part of TrueNAS SCALE's base image after all (see "Deploying,
-and surviving TrueNAS upgrades" below), and reimplementing the curve logic
+Drives one or more pwm outputs from temperature -- see `src/fan.rs` (the
+control loop) and `src/fan_calibrate.rs` (the `lcm-status fan-profile`
+discovery tool, below). This used to be lm-sensors' `fancontrol` package's
+job; it's implemented here now because `fancontrol` turned out not to be
+part of TrueNAS SCALE's base image after all (see "Deploying, and
+surviving TrueNAS upgrades" below), and reimplementing the curve logic
 means fan control depends on nothing but this daemon.
 
-The curve algorithm is ported directly from upstream `fancontrol(8)`'s
-`UpdateFanSpeeds`, configured under `[fan]` in `lcm-status.toml` with the
-same `min_temp_c`/`max_temp_c`/`min_start_pwm`/`min_stop_pwm`/`min_pwm`/
-`max_pwm` knobs `/etc/fancontrol` used to have. One difference from
-upstream: the control temperature is `max(CPU package temp, every SATA
-drive's `drivetemp` reading, every NVMe controller's reading)`, not CPU
-alone -- a hot drive ramps the fan even with the CPU idle. CPU temp is
-read fresh every `update_secs` (default 1s, matching upstream's default
-`INTERVAL`); drive/NVMe temps are resampled only every
-`drive_temp_min_secs` (default 30s) since they change slowly and reading
-them (`/sys/class/hwmon/*/temp1_input` directly, no `smartctl`) has no
-reason to run as often as the CPU check.
+The curve algorithm itself is ported directly from upstream
+`fancontrol(8)`'s `UpdateFanSpeeds` -- linear ramp between `min_temp_c`
+and `max_temp_c`, with `min_start_pwm`/`min_stop_pwm` stall hysteresis;
+see the doc comment at the top of `fan.rs` for the one non-obvious bit
+(the ramp's intercept at `min_temp_c` is `min_stop_pwm`, not `min_pwm`).
+Config is `[[fans]]` in `lcm-status.toml`, one block per physical fan --
+deliberately shaped like what `fancontrol`/`pwmconfig` expose (a pwm
+output, a curve, and the sensor(s) that drive it), so it generalizes to
+boards with more than one real fan, not just this one's single `it8625`
+`pwm1`.
+
+Two ways this goes further than upstream fancontrol:
+
+- **Multiple sensors per fan.** `sensors` under a `[[fans]]` block is a
+  list, not one fixed sensor -- the control temp is the max across
+  whichever of them currently reads as connected. The default profile uses
+  CPU package temp, every SATA drive (`drivetemp`), and every NVMe
+  controller, so a hot drive ramps the fan even with the CPU idle. Each
+  selector can be resampled on its own schedule (`min_resample_secs`) --
+  CPU temp can change quickly so it's read every tick by default; drive/
+  NVMe temps change slowly and default to every 30s, read straight from
+  `/sys/class/hwmon` with no `smartctl` calls.
+- **Disconnected sensors are actually detected, not assumed.** A hwmon
+  chip can expose more temp inputs than a given board wires up -- this
+  board's `it8625` has `temp1`-`temp3` with no diode connected to any of
+  them, reading a constant, wildly-out-of-range value forever.
+  `hal::read_temp_input` treats a set `tempN_fault` flag, or a reading
+  outside a generous plausible range, as "not connected" and excludes it,
+  rather than letting a phantom sensor drag every fan to full speed
+  forever. A `chip = "..."` selector with no `input` set matches *every*
+  temp input that chip has, relying on this filtering rather than needing
+  you to already know which specific inputs are real.
+
+### Discovering what's actually connected: `lcm-status fan-profile`
+
+```sh
+sudo lcm-status fan-profile [config-path] [--yes]
+```
+
+The `pwmconfig` equivalent for this project. Read-only for sensors
+(reports every temp input found, and whether it looks connected); for pwm
+outputs it's necessarily invasive -- it takes over every pwm output it
+finds for the duration (stopping `lcm-status.service` first if it's
+running, restarting it when done), ramps each one through its range, and
+measures what happens:
+
+1. **Proves causation, not just correlation**, before crediting a pwm
+   output with controlling a fan: ramps to max, then to a low value, then
+   back to max, and only counts it if some fan's RPM actually drops at the
+   low point and recovers afterward. A naive "ramp to max, see what's
+   nonzero" check isn't enough -- found the hard way on this exact board,
+   whose `it8625` exposes `pwm1` through `pwm6` in sysfs but has only
+   `pwm1` wired to an actual fan header. The other five "detect" a
+   response under a naive check purely because the one real fan is still
+   drifting toward steady-state from whichever pwm was tested *previously*
+   -- they do nothing at all when actually tested causally.
+2. For each pwm output that does control a real fan, ramps it down to find
+   where it stalls (empirical `min_stop_pwm`) and back up to find where it
+   restarts (empirical `min_start_pwm`). Some fans (this board's included)
+   never technically reach 0 RPM at any commanded duty -- the tool detects
+   and reports that case explicitly rather than reporting a misleading
+   `min_start_pwm`, but a low/zero empirical stall point still isn't
+   necessarily a *good* PWM to run at continuously (noise, stability,
+   wear) the way a real 0-RPM stall/restart threshold would be. Treat the
+   numbers as a starting point to sanity-check, not a final answer --
+   pwmconfig has the same limitation.
+3. Prints a `[[fans]]` block per fan found, and the full sensor inventory
+   with connected/unconnected verdicts, for you to review and assemble
+   into `lcm-status.toml` -- it doesn't write your config for you. Which
+   sensors should drive which fan, and what `min_temp_c`/`max_temp_c` to
+   use, are judgment calls a PWM sweep can't make.
+
+Restores every pwm output's original enable-mode/value when done,
+regardless of what it found. `--yes` skips the confirmation prompt (for
+non-interactive use); otherwise it asks before touching any hardware.
 
 ## The socket protocol
 
