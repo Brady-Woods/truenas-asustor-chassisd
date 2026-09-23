@@ -515,11 +515,31 @@ pub struct SensorSelector {
     /// treated as 0 or as an error, the same way an unpopulated drive bay
     /// simply has no `drivetemp` hwmon instance at all.
     pub min_resample_secs: Option<u64>,
+    /// Override the owning fan's `min_temp_c`/`max_temp_c` for *this*
+    /// sensor's own contribution to the curve, instead of sharing the
+    /// fan's (falls back to the fan's own value if unset). This matters
+    /// because different sensors reach their own danger zone at very
+    /// different temperatures: this board's fan curve is CPU-tuned
+    /// (max_temp_c=90), but a drive's own critical threshold is 60C --
+    /// without its own override, a drive at 60C would only compute to a
+    /// modest partial speed against the CPU's curve, not the full-speed
+    /// response its own critical threshold warrants. See
+    /// `default_fans()`, which sets these to match
+    /// `default_temp_thresholds()` for exactly that reason.
+    pub min_temp_c: Option<f32>,
+    pub max_temp_c: Option<f32>,
 }
 
 impl Default for SensorSelector {
     fn default() -> Self {
-        SensorSelector { chip: String::new(), input: None, label: None, min_resample_secs: None }
+        SensorSelector {
+            chip: String::new(),
+            input: None,
+            label: None,
+            min_resample_secs: None,
+            min_temp_c: None,
+            max_temp_c: None,
+        }
     }
 }
 
@@ -543,9 +563,30 @@ pub fn default_fans() -> Vec<FanProfile> {
         min_pwm: 50,
         max_pwm: 255,
         sensors: vec![
+            // CPU: no override -- shares this fan's own curve (45-90C),
+            // the original hand-tuned values.
             SensorSelector { chip: "coretemp".to_string(), label: Some("Package".to_string()), ..Default::default() },
-            SensorSelector { chip: "drivetemp".to_string(), min_resample_secs: Some(30), ..Default::default() },
-            SensorSelector { chip: "nvme".to_string(), min_resample_secs: Some(30), ..Default::default() },
+            // Drive/NVMe: overridden to their own warn/critical thresholds
+            // from `default_temp_thresholds()` (50/60C, 60/70C) rather than
+            // sharing the CPU's 45-90C curve -- a drive/SSD at its own
+            // critical threshold should already mean max_pwm, not a modest
+            // partial speed computed against a curve tuned for a
+            // completely different component's danger zone. Keep these in
+            // sync with `default_temp_thresholds()` if you change one.
+            SensorSelector {
+                chip: "drivetemp".to_string(),
+                min_resample_secs: Some(30),
+                min_temp_c: Some(50.0),
+                max_temp_c: Some(60.0),
+                ..Default::default()
+            },
+            SensorSelector {
+                chip: "nvme".to_string(),
+                min_resample_secs: Some(30),
+                min_temp_c: Some(60.0),
+                max_temp_c: Some(70.0),
+                ..Default::default()
+            },
         ],
         // `lcm-status fan-profile` measured ~2600 RPM at pwm=255 on this
         // board (2026-09-23) -- well clear of normal operating range
