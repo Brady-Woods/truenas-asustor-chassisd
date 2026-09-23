@@ -298,6 +298,39 @@ Restores every pwm output's original enable-mode/value when done,
 regardless of what it found. `--yes` skips the confirmation prompt (for
 non-interactive use); otherwise it asks before touching any hardware.
 
+## Health monitoring (syslog)
+
+`monitor.rs` logs to syslog (`syslog.rs`, real `syslog(3)` calls with
+actual `LOG_WARNING`/`LOG_CRIT`/etc. priorities -- not just `eprintln!`
+text, which is all one priority to journald no matter what it says) on
+three kinds of transition, each gated so it logs once when a condition is
+entered and once when it clears, never every poll for a sustained
+condition:
+
+| What | Warning | Critical |
+|---|---|---|
+| Any currently-connected temp sensor (not just CPU -- every SATA/NVMe/NIC/etc. sensor that reads as connected, see "properly identifying unconnected sensors" under Fan control) | `[temperature].warn_threshold` (default 75C) | `[temperature].critical_threshold` (default 85C) |
+| A configured fan's RPM | below `[[fans]].min_expected_rpm`, if set (spinning, but slower than it should be) | stalled (0 RPM) and still unresponsive after a few restart attempts (`fan.rs`'s `UNRESPONSIVE_AFTER_STALLS`) -- the first restart attempt alone only logs a warning, since a single transient stall that self-heals next tick isn't a fault |
+| ZFS pool health (`zpool list`) | `DEGRADED` | `FAULTED`/`UNAVAIL`/`OFFLINE`/anything else that isn't `ONLINE` |
+| Drive SMART status | -- | a bay's SMART overall-health reports `FAILED` |
+
+Temperature monitoring runs on its own clock (`temperature_min_secs`,
+`HealthMonitor::maybe_check_temps`), deliberately independent of whether
+the temperature *screen* is enabled -- alerting has no business being
+silently disabled because someone turned off an LCD screen. Pool/SMART
+monitoring piggybacks on the same `zpool`/`smartctl` calls the pools/hdd
+screens and bay LEDs already make (on `pools_min_secs`/`hdd_min_secs`),
+so this adds no new polling beyond what already existed -- again
+independent of whether those screens are displayed, only of whether the
+underlying data gets *fetched* (which now happens regardless).
+
+Check what actually got logged:
+
+```sh
+journalctl -u lcm-status -p warning   # warnings and above
+journalctl -u lcm-status -p crit      # critical only
+```
+
 ## The socket protocol
 
 `/run/lcm-status.sock` (configurable), a Unix socket owned `root:lcm-status`

@@ -97,6 +97,7 @@ pub struct AppState {
     scroll0: Scroll,
     scroll1: Scroll,
     eject_available: bool,
+    monitor: crate::monitor::HealthMonitor,
 }
 
 /// What the event loop should actually do this tick.
@@ -131,23 +132,26 @@ impl AppState {
             scroll0: Scroll::default(),
             scroll1: Scroll::default(),
             eject_available: false,
+            monitor: crate::monitor::HealthMonitor::new(),
         }
     }
 
     /// Applies the front LEDs' initial state at daemon startup: NIC mode
     /// from config, and a first pass of the health-driven status/bay LEDs
     /// so they're not left in whatever the driver's own boot defaults were.
-    pub fn init_leds(&self) {
+    pub fn init_leds(&mut self) {
         for iface in hal::physical_nics() {
             led::set_nic_mode(&iface, self.cfg.led.nic_mode);
         }
         self.update_health_leds();
     }
 
-    fn update_health_leds(&self) {
-        for (bay, bay_state) in hal::bay_led_states() {
+    fn update_health_leds(&mut self) {
+        let bay_states = hal::bay_led_states();
+        for &(bay, bay_state) in &bay_states {
             led::set_bay(bay, bay_state);
         }
+        self.monitor.check_bays(&bay_states);
         // An active override's bay alert takes precedence over whatever
         // health-derived state that bay just got set to.
         self.reapply_bay_alert();
@@ -246,13 +250,23 @@ impl AppState {
             self.network_cache.screens = hal::network();
             self.network_cache.last_refresh = Some(Instant::now());
         }
-        if self.cfg.screens.pools && self.pools_cache.stale(Duration::from_secs(r.pools_min_secs)) {
-            self.pools_cache.screens = hal::pools();
+        // Pool/hdd staleness (and so, health monitoring + LED updates) is
+        // checked regardless of `cfg.screens.pools`/`.hdd` -- those only
+        // gate the *display* screen, populated separately below. Alerting
+        // has no business being silently disabled because someone turned
+        // off an LCD screen.
+        if self.pools_cache.stale(Duration::from_secs(r.pools_min_secs)) {
+            self.monitor.check_pools(&hal::pool_healths());
+            if self.cfg.screens.pools {
+                self.pools_cache.screens = hal::pools();
+            }
             self.pools_cache.last_refresh = Some(Instant::now());
             pools_or_hdd_changed = true;
         }
-        if self.cfg.screens.hdd && self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs)) {
-            self.hdd_cache.screens = hal::hdd();
+        if self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs)) {
+            if self.cfg.screens.hdd {
+                self.hdd_cache.screens = hal::hdd();
+            }
             self.hdd_cache.last_refresh = Some(Instant::now());
             pools_or_hdd_changed = true;
         }
@@ -262,6 +276,9 @@ impl AppState {
             self.temperature_cache.screens = hal::cpu_and_fan(&self.cfg);
             self.temperature_cache.last_refresh = Some(Instant::now());
         }
+        // Independent of the temperature screen/cache above -- see
+        // HealthMonitor::maybe_check_temps.
+        self.monitor.maybe_check_temps(&self.cfg);
         if self.cfg.screens.docker && self.docker_cache.stale(Duration::from_secs(r.docker_min_secs)) {
             self.docker_cache.screens = hal::docker_issues(&self.cfg.docker.ignore);
             self.docker_cache.last_refresh = Some(Instant::now());

@@ -3,9 +3,11 @@ mod fan;
 mod fan_calibrate;
 mod hal;
 mod led;
+mod monitor;
 mod protocol;
 mod socket;
 mod state;
+mod syslog;
 
 use config::Config;
 use protocol::{Key, Lcm, LCM_DEVICE};
@@ -56,12 +58,20 @@ fn main() {
 }
 
 fn run_daemon(args: &[String]) {
+    syslog::init();
+
     let cfg_path = args
         .get(1)
         .filter(|a| a.as_str() != "daemon")
         .map(String::as_str)
         .unwrap_or(config::DEFAULT_CONFIG_PATH);
     let cfg = Config::load(Path::new(cfg_path));
+    syslog::info(&format!(
+        "starting: {} fan(s) configured, temperature warn/critical at {:.0}C/{:.0}C",
+        cfg.fans.iter().filter(|f| f.enabled).count(),
+        cfg.temperature.warn_threshold,
+        cfg.temperature.critical_threshold,
+    ));
 
     let mut lcm = Lcm::open(&cfg.display.serial_device).unwrap_or_else(|e| {
         eprintln!("failed to open {}: {e}", cfg.display.serial_device);

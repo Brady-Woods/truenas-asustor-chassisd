@@ -223,9 +223,14 @@ impl Default for RefreshConfig {
 #[serde(default)]
 pub struct TemperatureConfig {
     pub units: TempUnits,
-    /// Highlight (and let alerts trigger on) temps at or above this, in
-    /// whichever unit `units` is set to.
+    /// Highlight on the temperature screen, and log a syslog WARNING for
+    /// (`monitor::HealthMonitor`), any currently-connected sensor at or
+    /// above this. Always degrees C regardless of `units` (which only
+    /// affects the temperature *screen's* display, not this comparison).
     pub warn_threshold: f32,
+    /// Log a syslog CRITICAL instead of a warning for any sensor at or
+    /// above this. Always degrees C, same as `warn_threshold`.
+    pub critical_threshold: f32,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +244,19 @@ impl Default for TemperatureConfig {
     fn default() -> Self {
         TemperatureConfig {
             units: TempUnits::C,
-            warn_threshold: 60.0,
+            // Observed live on nas.skycorgi.net (2026-09-23): CPU package
+            // temp normally sits in the 57-67C range under everyday load,
+            // so a lower threshold here would fire constantly and become
+            // noise instead of signal -- the whole point of alerting on
+            // this is a threshold that's normally quiet. 75C leaves real
+            // headroom above routine operation while still well under
+            // critical_threshold.
+            warn_threshold: 75.0,
+            // Comfortably under the default fan curve's max_temp_c (90 --
+            // the point where the fan is already pinned to full speed, so
+            // there's nothing more cooling can do about it), leaving a
+            // real early-warning gap before things get to that point.
+            critical_threshold: 85.0,
         }
     }
 }
@@ -312,6 +329,14 @@ pub struct FanProfile {
     /// them, not just one. Empty means this fan never sees a temp reading,
     /// which effectively disables it (compute_pwm has nothing to act on).
     pub sensors: Vec<SensorSelector>,
+    /// Log a syslog WARNING if this fan is confirmed running (not
+    /// intentionally stopped) but its RPM is below this -- a bearing
+    /// wearing out or a partial obstruction can show up as "spinning, but
+    /// slower than it should" well before an outright stall. `None`
+    /// (default) disables the check; `lcm-status fan-profile`'s measured
+    /// max RPM at pwm=255 is a reasonable starting point (e.g. ~60-70% of
+    /// it) if you want to set one.
+    pub min_expected_rpm: Option<u32>,
 }
 
 impl Default for FanProfile {
@@ -337,6 +362,7 @@ impl Default for FanProfile {
             min_pwm: 50,
             max_pwm: 255,
             sensors: Vec::new(),
+            min_expected_rpm: None,
         }
     }
 }
@@ -405,6 +431,11 @@ pub fn default_fans() -> Vec<FanProfile> {
             SensorSelector { chip: "drivetemp".to_string(), min_resample_secs: Some(30), ..Default::default() },
             SensorSelector { chip: "nvme".to_string(), min_resample_secs: Some(30), ..Default::default() },
         ],
+        // `lcm-status fan-profile` measured ~2600 RPM at pwm=255 on this
+        // board (2026-09-23) -- well clear of normal operating range
+        // (observed ~1300-2000 RPM day to day), so this only fires for a
+        // genuinely underperforming fan, not routine low-load speeds.
+        min_expected_rpm: Some(500),
     }]
 }
 
