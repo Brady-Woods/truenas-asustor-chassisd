@@ -208,6 +208,28 @@ triggers use):
 | `Alert` | an `error`/`critical` socket message named this bay (`bay=N`) but it isn't a confirmed SMART failure -- 1000ms/1000ms red flash, same rate as the status LED |
 | `Standby` | drive is spun down -- green flashes slowly (250ms/9750ms) |
 
+## Fan control
+
+Drives `pwm1` (the `it8625` hwmon chip's one populated fan header) from
+temperature -- see `src/fan.rs`. This used to be lm-sensors' `fancontrol`
+package's job; it's implemented here now because `fancontrol` turned out
+not to be part of TrueNAS SCALE's base image after all (see "Deploying,
+and surviving TrueNAS upgrades" below), and reimplementing the curve logic
+means fan control depends on nothing but this daemon.
+
+The curve algorithm is ported directly from upstream `fancontrol(8)`'s
+`UpdateFanSpeeds`, configured under `[fan]` in `lcm-status.toml` with the
+same `min_temp_c`/`max_temp_c`/`min_start_pwm`/`min_stop_pwm`/`min_pwm`/
+`max_pwm` knobs `/etc/fancontrol` used to have. One difference from
+upstream: the control temperature is `max(CPU package temp, every SATA
+drive's `drivetemp` reading, every NVMe controller's reading)`, not CPU
+alone -- a hot drive ramps the fan even with the CPU idle. CPU temp is
+read fresh every `update_secs` (default 1s, matching upstream's default
+`INTERVAL`); drive/NVMe temps are resampled only every
+`drive_temp_min_secs` (default 30s) since they change slowly and reading
+them (`/sys/class/hwmon/*/temp1_input` directly, no `smartctl`) has no
+reason to run as often as the CPU check.
+
 ## The socket protocol
 
 `/run/lcm-status.sock` (configurable), a Unix socket owned `root:lcm-status`
@@ -279,25 +301,36 @@ sudo ./deploy.sh
 
 is the whole build+install pipeline: checks the driver dependency first
 and refuses to continue without it, builds in a throwaway container
-(nothing installed on the host toolchain-wise), installs the binary,
-installs the config only if one doesn't already exist (never clobbers
-edits), installs and enables the systemd unit, and registers itself as a
-TrueNAS **POSTINIT Init/Shutdown Script**
-(`midclt call initshutdownscript.query`) so the whole thing re-runs on
-every boot.
+(nothing installed on the host toolchain-wise), installs the config only
+if one doesn't already exist (never clobbers edits), installs and enables
+the systemd unit, and registers itself as a TrueNAS **POSTINIT
+Init/Shutdown Script** (`midclt call initshutdownscript.query`) so the
+whole thing re-runs on every boot.
 
 That last part is what makes this durable across TrueNAS updates: SCALE
-updates land in a new ZFS boot environment
-(`boot-pool/ROOT/<version>`), and there's no guarantee files placed
-directly under `/usr/local` or `/etc/systemd/system` on the old one carry
-over into the new one -- that depends on update internals this project
-has no business assuming. What *is* guaranteed to survive is TrueNAS's own
-config database, which is exactly where Init/Shutdown Scripts live. So
-even a fresh boot environment that's missing the binary, the group, and
-the systemd unit entirely will self-heal on its very first boot, with no
-manual re-deploy step. The source tree itself lives under the data pool
-(`/mnt/.../home/...`, not the boot pool), for the same reason -- it's
-storage TrueNAS updates never touch.
+updates land in a new ZFS boot environment (`boot-pool/ROOT/<version>`),
+and `/usr` -- including `/usr/local` -- is **read-only by default** on a
+fresh one. The binary is deliberately never installed there: it runs
+straight out of this checkout (the systemd unit's `ExecStart` points at
+`target/release/lcm-status` in place, substituted in by `deploy.sh`).
+`/etc/systemd/system` and `/etc/lcm-status.toml` *are* writable, just not
+carried forward from update to update -- which is fine, since `deploy.sh`
+reinstalls both every run rather than treating first-install as special.
+What's actually durable is TrueNAS's own config database, which is where
+Init/Shutdown Scripts live. So even a fresh boot environment missing the
+group, the systemd unit, and everything under `/etc` will self-heal on its
+very first boot, with no manual re-deploy step. The source tree itself
+lives under the data pool (`/mnt/.../home/...`, not the boot pool), for
+the same reason -- it's storage TrueNAS updates never touch.
+
+(This was found the hard way: an earlier version of this script installed
+the binary to `/usr/local/sbin` and worked fine across same-kernel
+reboots, because those all reused the one boot environment that had been
+hand-patched `readonly=off` months before this project existed. The first
+*real* TrueNAS update it went through landed on a genuinely fresh boot
+environment and failed with `Read-only file system` -- see
+`truenas-asustor-deploy`'s `docs/RUNBOOK.md` for the full story, which hit
+the identical issue in the platform driver at the same time.)
 
 ## Manual testing / probing
 

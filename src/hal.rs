@@ -287,14 +287,35 @@ fn nvme_temp_for(dev_name: &str) -> Option<f32> {
     None
 }
 
-fn read_sysfs_f32(path: &str) -> Option<f32> {
+pub(crate) fn read_sysfs_f32(path: &str) -> Option<f32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .map(|milli_c| milli_c / 1000.0)
 }
 
-fn coretemp_package() -> Option<f32> {
+/// Every drive-adjacent temp sensor (SATA via `drivetemp`, NVMe via its own
+/// hwmon), read directly from sysfs -- deliberately no smartctl/lsblk/
+/// udevadm calls (unlike `hdd()`, which is intentionally slow/infrequent
+/// to avoid waking spun-down drives for SMART queries -- see
+/// RefreshConfig::hdd_min_secs). This is cheap enough to poll on its own
+/// schedule. Bay identity doesn't matter to the caller (fan control), only
+/// the values do.
+pub(crate) fn drive_and_nvme_temps() -> Vec<f32> {
+    let mut temps = Vec::new();
+    for prefix in ["drivetemp", "nvme"] {
+        if let Some(dirs) = glob_hwmon(prefix) {
+            for hwmon in dirs {
+                if let Some(t) = read_sysfs_f32(&format!("{hwmon}/temp1_input")) {
+                    temps.push(t);
+                }
+            }
+        }
+    }
+    temps
+}
+
+pub(crate) fn coretemp_package() -> Option<f32> {
     for hwmon in glob_hwmon("coretemp")? {
         for entry in std::fs::read_dir(&hwmon).ok()?.flatten() {
             let name = entry.file_name();
@@ -360,11 +381,11 @@ fn fan1_rpm() -> Option<f32> {
     None
 }
 
-fn read_sysfs_raw_f32(path: &str) -> Option<f32> {
+pub(crate) fn read_sysfs_raw_f32(path: &str) -> Option<f32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
+pub(crate) fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
         let path = entry.path();

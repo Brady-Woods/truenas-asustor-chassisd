@@ -7,21 +7,25 @@
 #   sudo ./deploy.sh
 #
 # What "durable across TrueNAS upgrades" means here: TrueNAS SCALE updates
-# land in a new ZFS boot environment (boot-pool/ROOT/<version>), and there
-# is no guarantee files placed directly under /usr/local or
-# /etc/systemd/system on the current one survive into the next -- that
-# depends on update internals this script has no business assuming. What
-# IS guaranteed to survive is TrueNAS's own config database, so this
-# script registers itself as a POSTINIT Init/Shutdown Script (System
-# Settings -> Advanced in the UI, or `midclt call initshutdownscript.query`)
-# and re-running it is exactly what that does on every boot -- so even a
-# boot environment that lost /usr/local entirely self-heals on the next
-# start, no manual re-deploy needed after an update.
+# land in a new ZFS boot environment (boot-pool/ROOT/<version>), and
+# /usr -- and everything under it, including /usr/local -- is read-only by
+# default on a fresh one (confirmed live on the first real update this
+# project went through: an earlier version of this script tried to
+# `install` the binary into /usr/local/sbin and failed with "Read-only
+# file system"). So the binary runs straight out of this checkout instead
+# (on a normal writable data-pool dataset), never installed anywhere.
+# /etc *is* writable in a fresh boot environment (just not persisted
+# across updates, which is exactly why this script re-installs the config/
+# unit every time rather than treating a first install as special), and
+# TrueNAS's own config database (which is what backs Init/Shutdown
+# Scripts) is genuinely durable -- this script registers itself as a
+# POSTINIT script there, so re-running it is exactly what happens on every
+# boot, no manual re-deploy needed after an update.
 
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN_PATH=/usr/local/sbin/lcm-status
+BIN_PATH="$SCRIPT_DIR/target/release/lcm-status"
 CONFIG_PATH=/etc/lcm-status.toml
 UNIT_PATH=/etc/systemd/system/lcm-status.service
 GROUP=lcm-status
@@ -79,9 +83,8 @@ docker run --rm \
 log "Ensuring group '$GROUP' exists..."
 groupadd -f "$GROUP"
 
-# --- 4. Install binary -----------------------------------------------------
-log "Installing binary to $BIN_PATH..."
-install -m 0755 "$SCRIPT_DIR/target/release/lcm-status" "$BIN_PATH"
+# --- 4. Binary needs no install step -- it runs straight from the build
+# output in this checkout ($BIN_PATH); see the note above on why.
 
 # --- 5. Install config, but never clobber an existing (possibly edited) one
 if [ ! -f "$CONFIG_PATH" ]; then
@@ -92,8 +95,10 @@ else
 fi
 
 # --- 6. systemd unit -------------------------------------------------------
+# Substitute the real binary path (this checkout, see $BIN_PATH above) in
+# place of the @LCM_STATUS_BIN@ placeholder the checked-in unit carries.
 log "Installing systemd unit..."
-install -m 0644 "$SCRIPT_DIR/lcm-status.service" "$UNIT_PATH"
+sed "s|@LCM_STATUS_BIN@|$BIN_PATH|" "$SCRIPT_DIR/lcm-status.service" > "$UNIT_PATH"
 systemctl daemon-reload
 systemctl enable lcm-status.service
 systemctl restart lcm-status.service

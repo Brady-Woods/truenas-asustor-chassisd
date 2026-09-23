@@ -1,4 +1,5 @@
 mod config;
+mod fan;
 mod hal;
 mod led;
 mod protocol;
@@ -89,6 +90,13 @@ fn run_daemon(args: &[String]) {
     state.refresh_all();
     state.init_leds();
 
+    // Runs on its own cadence (cfg.fan.update_secs, independent of the LCD
+    // rotation/scroll timing below) -- fire once immediately so the fan
+    // curve applies from startup rather than waiting a full interval.
+    let mut fan = fan::FanState::new();
+    fan.update(&cfg.fan);
+    let mut last_fan_update = Instant::now();
+
     let serial_fd = lcm.as_raw_fd();
 
     loop {
@@ -99,6 +107,11 @@ fn run_daemon(args: &[String]) {
 
         if cfg.sleep.enabled {
             state.set_schedule_sleep_wanted(in_sleep_window(&cfg.sleep.start, &cfg.sleep.end, now_hhmm()));
+        }
+
+        if last_fan_update.elapsed() >= Duration::from_secs(cfg.fan.update_secs.max(1)) {
+            fan.update(&cfg.fan);
+            last_fan_update = Instant::now();
         }
 
         let effect = state.tick();
