@@ -73,12 +73,7 @@ impl HealthMonitor {
     /// since it isn't a real reading.
     fn check_temps(&mut self, cfg: &TemperatureConfig) {
         for (chip, label, temp_c) in all_connected_temps() {
-            let (warn, crit) = cfg
-                .thresholds
-                .iter()
-                .find(|t| t.chip == chip)
-                .map(|t| (t.warn_threshold, t.critical_threshold))
-                .unwrap_or((cfg.warn_threshold, cfg.critical_threshold));
+            let (warn, crit) = crate::config::resolve_temp_threshold(cfg, &chip);
 
             let level = if temp_c >= crit {
                 Level::Critical

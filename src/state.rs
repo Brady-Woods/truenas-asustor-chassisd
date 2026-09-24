@@ -108,6 +108,22 @@ pub struct AppState {
     fan_health: Level,
 }
 
+/// Everything that feeds the status LED, plus the resulting verdict --
+/// see `AppState::health_summary`. `pub(crate)` since this is an
+/// implementation detail shared with `report.rs`, not part of the crate's
+/// (nonexistent) public API.
+pub(crate) struct HealthSummary {
+    pub pool_healths: Vec<(String, String)>,
+    pub pool_degraded: bool,
+    pub pool_faulted: bool,
+    pub bay_failed: bool,
+    pub temp_level: Level,
+    pub network_level: Level,
+    pub fan_health: Level,
+    pub overall: Level,
+    pub pattern: led::StatusPattern,
+}
+
 /// What the event loop should actually do this tick.
 pub enum Effect {
     Render(String, String),
@@ -206,19 +222,33 @@ impl AppState {
     /// miss a real problem) while completely disconnected from what the
     /// rest of the daemon was actually observing.
     fn recompute_status_led(&self) {
-        use led::StatusPattern;
-
         if let Some(ov) = &self.over {
             if let Some(pattern) = led::pattern_for_level(ov.level) {
                 led::set_status(pattern);
                 return;
             }
         }
+        led::set_status(self.health_summary().pattern);
+    }
 
-        let healths = hal::pool_healths();
-        let pool_degraded = healths.iter().any(|(_, h)| h == "DEGRADED");
+    /// The same aggregate `recompute_status_led` turns into an LED
+    /// pattern, plus the individual contributing pieces -- shared with
+    /// `report::build` (the `status` socket request) so both use exactly
+    /// this computation, not two copies that could drift. Deliberately
+    /// does *not* factor in an active override (`self.over`) the way
+    /// `recompute_status_led` does -- an override is what's currently
+    /// being *shown*, this is the health computation underneath it,
+    /// which the report labels separately (see `override_summary`).
+    pub(crate) fn health_summary(&self) -> HealthSummary {
+        use led::StatusPattern;
+
+        let pool_healths = hal::pool_healths();
+        let pool_degraded = pool_healths.iter().any(|(_, h)| h == "DEGRADED");
         let pool_faulted =
-            healths.iter().any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
+            pool_healths.iter().any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
+        let bay_failed = self.monitor.any_bay_failed();
+        let temp_level = self.monitor.worst_temp_level();
+        let network_level = self.network_health_level();
 
         // Worst of: this fan's health (pushed in from main.rs each tick,
         // since FanControllers live outside AppState), every currently-
@@ -226,15 +256,10 @@ impl AppState {
         // bay is a confirmed SMART failure (Error -- a failed drive is
         // serious, same tier as a solid-red pool fault, even though it
         // doesn't necessarily mean the pool itself has degraded yet).
-        let general = [
-            self.fan_health,
-            self.monitor.worst_temp_level(),
-            self.network_health_level(),
-            if self.monitor.any_bay_failed() { Level::Error } else { Level::Info },
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(Level::Info);
+        let general = [self.fan_health, temp_level, network_level, if bay_failed { Level::Error } else { Level::Info }]
+            .into_iter()
+            .max()
+            .unwrap_or(Level::Info);
 
         let pattern = if general == Level::Critical {
             StatusPattern::CriticalFlashing
@@ -251,7 +276,28 @@ impl AppState {
         } else {
             StatusPattern::Ok
         };
-        led::set_status(pattern);
+
+        HealthSummary {
+            pool_healths,
+            pool_degraded,
+            pool_faulted,
+            bay_failed,
+            temp_level,
+            network_level,
+            fan_health: self.fan_health,
+            overall: general,
+            pattern,
+        }
+    }
+
+    /// Human-readable description of the active socket override, if any --
+    /// for the `status` report. `None` when nothing's overriding the
+    /// health-derived display.
+    pub(crate) fn override_summary(&self) -> Option<String> {
+        self.over.as_ref().map(|o| {
+            let bay = o.bay.map(|b| format!(" bay={b}")).unwrap_or_default();
+            format!("{:?}{bay}: {} / {}", o.level, o.line0, o.line1)
+        })
     }
 
     /// Network's contribution to the aggregate above -- see
@@ -514,6 +560,11 @@ impl AppState {
                     self.pending_over = Some(ov);
                 }
             }
+            // Handled directly in main.rs's loop (needs `fans`, which
+            // lives outside AppState) before a command ever reaches here
+            // -- never actually matched at runtime, just keeps this
+            // exhaustive.
+            SocketCommand::StatusRequest(_) => {}
         }
     }
 

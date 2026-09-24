@@ -349,6 +349,19 @@ pub fn default_temp_thresholds() -> Vec<TempThresholdOverride> {
     ]
 }
 
+/// (warn, critical) for a given hwmon chip name -- its `thresholds`
+/// override if one matches, else the global fallback pair. Shared by
+/// `monitor::HealthMonitor::check_temps` and the `status` report
+/// (`report.rs`) so both apply exactly the same resolution, not two
+/// copies that could drift.
+pub fn resolve_temp_threshold(cfg: &TemperatureConfig, chip: &str) -> (f32, f32) {
+    cfg.thresholds
+        .iter()
+        .find(|t| t.chip == chip)
+        .map(|t| (t.warn_threshold, t.critical_threshold))
+        .unwrap_or((cfg.warn_threshold, cfg.critical_threshold))
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TempUnits {

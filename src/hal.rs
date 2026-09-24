@@ -56,19 +56,15 @@ pub fn configured_nics() -> Vec<String> {
         .collect()
 }
 
-/// One screen per *every* physical NIC (`physical_nics()`, not just
-/// `configured_nics()`), so a card that's plugged in but never assigned an
-/// address -- or one with no cable at all -- is still visible here rather
-/// than silently absent. Line 1 is the IP if it has one, otherwise
-/// `"connected, no IP"` (link up, nothing configured) or `"disconnected"`
-/// (no carrier) -- distinguishing those two matters: the first says "go
-/// configure this in Network settings", the second says "check the
-/// cable", and before this they looked identical (both just missing from
-/// the screen).
-pub fn network() -> Vec<Screen> {
-    let mut with_ip = std::collections::HashMap::new();
-    if let Some(out) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) {
-        for line in out.lines() {
+/// Every interface with a global-scope IPv4, mapped to that address --
+/// the raw data `configured_nics()` (names only) and `network()` (display
+/// screens) both build on, and also used directly by `report::build` for
+/// the `status` request. Extracted so there's one parser for `ip -4 -o
+/// addr show scope global`, not three.
+pub(crate) fn ip_by_iface() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(text) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) {
+        for line in text.lines() {
             // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
             let mut f = line.split_whitespace();
             let Some(iface) = f.nth(1).map(|s| s.trim_end_matches(':').to_string()) else {
@@ -81,22 +77,37 @@ pub fn network() -> Vec<Screen> {
             else {
                 continue;
             };
-            with_ip.insert(iface, ip);
+            out.insert(iface, ip);
         }
     }
+    out
+}
+
+/// `"connected, no IP"` (link up, nothing configured) or `"disconnected"`
+/// (no carrier) for an interface with no address -- see `network()`'s doc
+/// comment for why that distinction is worth making at all.
+pub(crate) fn nic_link_text(iface: &str) -> String {
+    let connected =
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")).map(|s| s.trim() == "1").unwrap_or(false);
+    if connected { "connected, no IP".to_string() } else { "disconnected".to_string() }
+}
+
+/// One screen per *every* physical NIC (`physical_nics()`, not just
+/// `configured_nics()`), so a card that's plugged in but never assigned an
+/// address -- or one with no cable at all -- is still visible here rather
+/// than silently absent. Line 1 is the IP if it has one, otherwise
+/// `"connected, no IP"` (link up, nothing configured) or `"disconnected"`
+/// (no carrier) -- distinguishing those two matters: the first says "go
+/// configure this in Network settings", the second says "check the
+/// cable", and before this they looked identical (both just missing from
+/// the screen).
+pub fn network() -> Vec<Screen> {
+    let with_ip = ip_by_iface();
 
     let screens: Vec<Screen> = physical_nics()
         .into_iter()
         .map(|iface| {
-            let line1 = match with_ip.get(&iface) {
-                Some(ip) => ip.clone(),
-                None => {
-                    let connected = std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
-                        .map(|s| s.trim() == "1")
-                        .unwrap_or(false);
-                    if connected { "connected, no IP".to_string() } else { "disconnected".to_string() }
-                }
-            };
+            let line1 = with_ip.get(&iface).cloned().unwrap_or_else(|| nic_link_text(&iface));
             Screen { line0: iface, line1 }
         })
         .collect();

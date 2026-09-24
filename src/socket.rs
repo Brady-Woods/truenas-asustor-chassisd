@@ -1,11 +1,22 @@
 //! Unix socket listener: lets other processes (an LED daemon, cron jobs,
-//! ad-hoc scripts) push text onto the display. Runs on its own thread and
+//! ad-hoc scripts) push text onto the display, or (`STATUS`) pull a
+//! terminal-readable health report back out. Runs on its own thread and
 //! hands parsed commands to the main event loop over a channel, so the
-//! socket's blocking accept() loop never touches the display state directly.
+//! socket's blocking accept() loop never touches the display/fan state
+//! directly.
+//!
+//! `STATUS` is the one request/response case: everything else here is
+//! fire-and-forget (the sender doesn't wait for a reply), but a status
+//! report needs live data only the main loop has (fan stall history,
+//! active overrides) -- so this asks for one, using a fresh one-shot
+//! `mpsc` channel per request as the reply path, and waits (up to a
+//! timeout) for the main loop to compute and send one back before writing
+//! it to the client and closing the connection.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 /// Ordered so `a < b` means "b is at least as severe" -- used both for the
 /// LCD override precedence (a higher level can replace a lower one, never
@@ -35,7 +46,7 @@ impl Level {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SocketCommand {
     Show {
         level: Level,
@@ -51,6 +62,12 @@ pub enum SocketCommand {
     Clear {
         bay: Option<u32>,
     },
+    /// A `STATUS` request came in on some connection; send the current
+    /// terminal-readable report (see `report.rs`) back on this channel.
+    /// One fresh channel per request, not a `Debug`/`PartialEq`-friendly
+    /// payload like the other variants, hence the manual `Clone`-only
+    /// derive above (`mpsc::Sender` is `Clone` but not `Debug`).
+    StatusRequest(Sender<String>),
 }
 
 /// Parses one message from a connection: either a `SHOW`/`CLEAR` header
@@ -93,11 +110,33 @@ fn parse_bay<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<u32> {
 }
 
 fn handle_connection(stream: UnixStream, tx: &Sender<SocketCommand>) {
+    // A second handle to the same socket, kept for writing a STATUS
+    // response after the BufReader below has consumed the original for
+    // reading -- both directions of a Unix stream socket are independent,
+    // so this is fine even though `stream` itself is about to be moved.
+    let writer = stream.try_clone().ok();
+
     let reader = BufReader::new(stream);
     let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
     if lines.is_empty() {
         return;
     }
+
+    if lines[0].trim().eq_ignore_ascii_case("STATUS") {
+        let Some(mut writer) = writer else { return };
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        if tx.send(SocketCommand::StatusRequest(resp_tx)).is_err() {
+            return;
+        }
+        // The main loop polls at a ~100ms ceiling, so this should resolve
+        // almost immediately; the timeout is just so a client can't hang
+        // forever if the daemon's main loop is somehow wedged.
+        if let Ok(report) = resp_rx.recv_timeout(Duration::from_secs(5)) {
+            let _ = writer.write_all(report.as_bytes());
+        }
+        return;
+    }
+
     if let Some(cmd) = parse_message(&lines) {
         let _ = tx.send(cmd);
     }

@@ -450,6 +450,71 @@ printf "SHOW critical 0 bay=2\nDRIVE FAILURE\nCheck bay 2\n" \
 printf "CLEAR\n" | nc -U /run/lcm-status.sock -q1
 ```
 
+### `STATUS`: dump a live health report to the terminal
+
+```sh
+sudo lcm-status status [config-path]
+```
+
+The one request/response exception to the fire-and-forget protocol above:
+sends `STATUS`, and the running daemon writes back a full terminal-
+readable report (`report.rs`) instead of just accepting a display
+command. Needs root or membership in the socket's group (same
+`root:lcm-status`, `0660` as everything else here) -- there's nothing
+being written to the display, but the report itself covers privileged
+reads (SMART, pool health).
+
+Talks to whatever's *actually running*, not a fresh recomputation --
+`AppState::health_summary()` (the exact same computation driving the
+status LED, so this can never disagree with what the LED shows),
+`FanController::status_line()` for each configured fan (live pwm/RPM plus
+accumulated stall/low-RPM health only the running process knows, not
+something a brand-new invocation could reconstruct), fresh `hal::` reads
+for every connected temp sensor (with its resolved threshold and current
+level), every pool, every drive bay's SMART state, and every physical
+NIC's link/monitoring status, plus the active socket override if any:
+
+```
+=== lcm-status report ===
+
+-- Fans --
+  chassis (pwm1): pwm=104 (40%) 1339rpm [Info]
+
+-- Temperatures --
+  coretemp temp1 "Package id 0"              56.0C  [ok      ] (warn 85.0C / crit 100.0C)
+  drivetemp temp1                            37.0C  [ok      ] (warn 50.0C / crit 60.0C)
+  ...
+
+-- Pools --
+  HDD              ONLINE
+  ...
+
+-- Drive bays (SMART) --
+  bay 1: Normal
+  ...
+
+-- Network --
+  enp2s0     192.168.1.196        monitored, link up
+  enp9s0     disconnected         not monitored, link down
+
+-- Active override --
+  none
+
+-- Overall status LED --
+  pattern: Ok
+  severity: Info  (fan=Info temp=Info network=Info pool_degraded=false pool_faulted=false bay_failed=false)
+```
+
+Implementation note, if you're extending the protocol further: `handle_connection`
+keeps a second cloned handle to the stream for writing the response after
+the `BufReader` has consumed the original for reading -- a Unix stream
+socket's two directions are independent, so this works even though a
+plain read loop would otherwise "consume" the connection. The client
+(`request_status` in `main.rs`) sends its request, then shuts down just
+its *write* half (`Shutdown::Write`) so the daemon's `.lines()` sees EOF
+and stops waiting for more input, while the read half stays open to
+receive the reply.
+
 ## Config
 
 `/etc/lcm-status.toml`, hand-edited, every field defaulted -- see
