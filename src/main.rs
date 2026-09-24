@@ -5,6 +5,7 @@ mod hal;
 mod led;
 mod monitor;
 mod protocol;
+mod report;
 mod socket;
 mod state;
 mod syslog;
@@ -54,7 +55,47 @@ fn main() {
         return;
     }
 
+    if cmd == "status" {
+        let path = args.get(2).map(Path::new).unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        let socket_path = Config::load(path).socket.path;
+        request_status(&socket_path);
+        return;
+    }
+
     run_daemon(&args);
+}
+
+/// Client side of the `STATUS` request: connect to the running daemon's
+/// own socket, ask for a report, print it, exit. Talks to whatever's
+/// actually running -- not a fresh one-shot snapshot the way `hal-test`
+/// is -- so it reflects live accumulated state (a fan's stall history, an
+/// active override) a brand new process invocation couldn't know about.
+fn request_status(socket_path: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to connect to {socket_path}: {e} (is lcm-status running?)");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = stream.write_all(b"STATUS\n") {
+        eprintln!("failed to send request: {e}");
+        std::process::exit(1);
+    }
+    // Signals "done sending" without closing the read half -- the daemon's
+    // BufReader.lines() needs to see EOF on its read side to stop waiting
+    // for more input, but we still need to read its response afterward.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    let mut response = String::new();
+    if let Err(e) = stream.read_to_string(&mut response) {
+        eprintln!("failed to read response: {e}");
+        std::process::exit(1);
+    }
+    print!("{response}");
 }
 
 fn run_daemon(args: &[String]) {
@@ -130,7 +171,14 @@ fn run_daemon(args: &[String]) {
 
     loop {
         // Drain any socket commands that arrived since the last wakeup.
+        // STATUS is handled here rather than forwarded into
+        // `apply_socket_command`: building the report needs `fans` too,
+        // which lives out here alongside `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
+            if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
+                let _ = resp_tx.send(report::build(&state, &fans, &cfg));
+                continue;
+            }
             state.apply_socket_command(cmd);
         }
 

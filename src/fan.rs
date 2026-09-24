@@ -85,6 +85,25 @@ pub struct FanController {
 }
 
 impl FanController {
+    /// One line for the `status` report: name, commanded pwm (raw + %),
+    /// live RPM (fresh sysfs read, not cached), and current health. `--`
+    /// for RPM if this profile has no `fan_index` configured (no tach to
+    /// read) or the chip isn't resolved (not loaded yet).
+    pub fn status_line(&self) -> String {
+        let pwm = self.last_pwm.unwrap_or(0);
+        let pct = pwm as u32 * 100 / 255;
+        let rpm = match (&self.hwmon, self.profile.fan_index) {
+            (Some(hwmon), Some(n)) => read_sysfs_raw_f32(&format!("{hwmon}/fan{n}_input"))
+                .map(|r| format!("{r:.0}rpm"))
+                .unwrap_or_else(|| "--".to_string()),
+            _ => "--".to_string(),
+        };
+        format!(
+            "{} (pwm{}): pwm={pwm} ({pct}%) {rpm} [{:?}]",
+            self.profile.name, self.profile.pwm_index, self.health_level()
+        )
+    }
+
     /// Current health, for the status LED (`state::recompute_status_led`)
     /// -- current state, not transition-gated the way this fan's own
     /// syslog lines are (the LED always reflects "right now").
