@@ -96,6 +96,11 @@ pub struct AppState {
     awake_override_until: Option<Instant>,
     scroll0: Scroll,
     scroll1: Scroll,
+    /// Last text actually handed to the caller via `Effect::Render`, so
+    /// `render()` can skip re-sending it when nothing changed instead of
+    /// rewriting the display on every ~100ms tick regardless. `None`
+    /// forces a redraw (e.g. right after waking the panel).
+    last_rendered: Option<(String, String)>,
     eject_available: bool,
     monitor: crate::monitor::HealthMonitor,
     /// Worst current fan health across every configured fan -- pushed in
@@ -155,6 +160,7 @@ impl AppState {
             awake_override_until: None,
             scroll0: Scroll::default(),
             scroll1: Scroll::default(),
+            last_rendered: None,
             eject_available: false,
             monitor: crate::monitor::HealthMonitor::new(),
             fan_health: Level::Info,
@@ -436,6 +442,7 @@ impl AppState {
             self.awake_override_until =
                 Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
             self.refresh_all();
+            self.last_rendered = None;
             return Effect::SetLcdPower(true);
         }
 
@@ -608,6 +615,7 @@ impl AppState {
                 led::set_nic_mode(&iface, self.cfg.led.nic_mode);
             }
             self.refresh_all();
+            self.last_rendered = None;
             return Effect::SetLcdPower(true);
         }
         if self.sleeping {
@@ -701,6 +709,16 @@ impl AppState {
         let cap = self.cfg.display.scroll_max_chars;
         let line0 = self.scroll_step(0, truncate(&raw0, cap));
         let line1 = self.scroll_step(1, truncate(&raw1, cap));
+
+        // Only actually worth a serial write when the text changed --
+        // otherwise this fires every ~100ms tick for no reason, which
+        // dominates the serial link and starves the MCU's unsolicited
+        // button frames of a clear window to be read in.
+        let unchanged = matches!(&self.last_rendered, Some((l0, l1)) if *l0 == line0 && *l1 == line1);
+        if unchanged {
+            return Effect::None;
+        }
+        self.last_rendered = Some((line0.clone(), line1.clone()));
         Effect::Render(line0, line1)
     }
 

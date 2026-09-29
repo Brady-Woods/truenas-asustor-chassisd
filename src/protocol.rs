@@ -17,6 +17,11 @@ const FRAME_MAX: usize = 22;
 
 pub struct Lcm {
     port: File,
+    /// Unsolicited `0xF0` frames (button presses, version reports) that
+    /// `send_and_ack` ran into -- and had to ACK -- while it was waiting
+    /// for its own ACK. Drained by `take_pending` so the caller can still
+    /// dispatch them instead of losing them.
+    pending: Vec<(u8, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +94,7 @@ impl Lcm {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(Lcm { port })
+        Ok(Lcm { port, pending: Vec::new() })
     }
 
     pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
@@ -132,6 +137,19 @@ impl Lcm {
                 Ok(1) => {
                     buf[got] = byte[0];
                     got += 1;
+                    // Byte 1 (N) tells us the exact frame length (N + 4) as
+                    // soon as it arrives -- stop there instead of idling
+                    // through the rest of `timeout` waiting for bytes that
+                    // aren't coming. Without this, every call blocked for
+                    // ~the full timeout even on an immediate, complete
+                    // reply, which widened the window for an unsolicited
+                    // button frame to land mid-`send_and_ack` and get lost.
+                    if got >= 2 {
+                        let expected = buf[1] as usize + 4;
+                        if expected <= FRAME_MAX && got >= expected {
+                            break;
+                        }
+                    }
                 }
                 _ => continue,
             }
@@ -143,13 +161,47 @@ impl Lcm {
         Ok(parse_reply(&buf, got))
     }
 
-    /// Sends a frame and waits for the corresponding ACK (opcode+1, echoing subcmd).
+    /// Sends a frame and waits for the corresponding ACK (opcode `0xF1`,
+    /// echoing `subcmd`). The MCU can interleave an unsolicited `0xF0`
+    /// frame of its own (a button press, a version report) at any time,
+    /// including while we're sitting here waiting for our own ACK -- that
+    /// frame still has to be ACKed immediately (or the MCU will keep
+    /// resending it, see the module doc) rather than silently dropped, so
+    /// it's queued in `pending` and reading continues for our actual ACK
+    /// within what's left of `timeout`. Call `take_pending` afterward to
+    /// pick up anything that got queued this way.
     pub fn send_and_ack(&mut self, opcode: u8, subcmd: u8, payload: &[u8], timeout: Duration) -> io::Result<bool> {
         self.send(opcode, subcmd, payload)?;
-        match self.read_frame(timeout)? {
-            Some((_op, sc, pl, ok)) => Ok(ok && sc == subcmd && pl.first() == Some(&0)),
-            None => Ok(false),
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            match self.read_frame(remaining)? {
+                Some((op, sc, pl, ok)) if ok && op == 0xF1 && sc == subcmd => {
+                    return Ok(pl.first() == Some(&0));
+                }
+                Some((op, sc, pl, ok)) if ok && op == 0xF0 => {
+                    let _ = self.ack(sc);
+                    self.pending.push((sc, pl));
+                }
+                Some(_) => {
+                    // Mismatched or checksum-bad frame -- not our ACK,
+                    // keep waiting for it.
+                }
+                None => return Ok(false),
+            }
         }
+    }
+
+    /// Drains unsolicited MCU frames `send_and_ack` had to queue instead of
+    /// discarding (see its doc). Callers should check this after any `Lcm`
+    /// call that goes through `send_and_ack` (`set_text`, the init
+    /// sequence) so a button press that arrived mid-write isn't missed
+    /// until the MCU eventually resends it.
+    pub fn take_pending(&mut self) -> Vec<(u8, Vec<u8>)> {
+        std::mem::take(&mut self.pending)
     }
 
     /// Sets up to 16 ASCII chars on the given line (0 or 1), space-padded/truncated.

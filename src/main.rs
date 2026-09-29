@@ -193,6 +193,7 @@ fn run_daemon(args: &[String]) {
 
         let effect = state.tick();
         apply_effect(effect, &mut lcm, &cfg);
+        drain_pending_keys(&mut state, &mut lcm, &cfg);
 
         // Wait for the next thing that could matter: a serial byte, or the
         // next timer deadline (scroll step / dwell / confirm timeout).
@@ -215,9 +216,27 @@ fn run_daemon(args: &[String]) {
                             let key: Key = code.into();
                             let effect = state.handle_key(key);
                             apply_effect(effect, &mut lcm, &cfg);
+                            drain_pending_keys(&mut state, &mut lcm, &cfg);
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Dispatches button presses `Lcm::send_and_ack` had to queue (see its
+/// doc) instead of discarding -- e.g. a press that arrived while a
+/// `set_text` call was mid-flight waiting on its own ACK. Feeds each one
+/// through `state.handle_key` exactly like the top-level poll() path does,
+/// so it isn't lost until the MCU gets around to resending it.
+fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, cfg: &Config) {
+    for (subcmd, payload) in lcm.take_pending() {
+        if subcmd == 0x80 {
+            if let Some(&code) = payload.first() {
+                let key: Key = code.into();
+                let effect = state.handle_key(key);
+                apply_effect(effect, lcm, cfg);
             }
         }
     }
