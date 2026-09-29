@@ -15,9 +15,9 @@ resume_after_secs = 30    # resume auto-rotation this long after manual UP/DOWN
 confirm_timeout_secs = 10 # auto-cancel a shutdown/restart/eject confirm screen
 
 [sleep]
-enabled = false
-start = "23:00"
-end = "07:00"
+enabled = true
+start = "22:00"
+end = "06:00"
 
 [socket]
 path = "/run/lcm-status.sock"
