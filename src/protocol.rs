@@ -22,6 +22,12 @@ pub struct Lcm {
     /// for its own ACK. Drained by `take_pending` so the caller can still
     /// dispatch them instead of losing them.
     pending: Vec<(u8, Vec<u8>)>,
+    /// Text last *confirmed* written to each line (index 0/1) -- only set
+    /// on a successful ACK, see `set_text`. Lets repeated calls with
+    /// unchanged text skip the wire entirely, while a call that failed
+    /// keeps retrying on every subsequent call with that text instead of
+    /// being silently dropped forever.
+    last_sent: [Option<String>; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +100,7 @@ impl Lcm {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(Lcm { port, pending: Vec::new() })
+        Ok(Lcm { port, pending: Vec::new(), last_sent: [None, None] })
     }
 
     pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
@@ -205,13 +211,49 @@ impl Lcm {
     }
 
     /// Sets up to 16 ASCII chars on the given line (0 or 1), space-padded/truncated.
+    /// A no-op (no wire traffic) if `text` is already confirmed showing on
+    /// that line -- see `last_sent`.
     pub fn set_text(&mut self, line: u8, text: &str, flag: u8) -> io::Result<bool> {
+        let idx = (line & 1) as usize;
+        if self.last_sent[idx].as_deref() == Some(text) {
+            return Ok(true);
+        }
+
         let mut payload = vec![line, flag];
         let bytes = text.as_bytes();
         let take = bytes.len().min(16);
         payload.extend_from_slice(&bytes[..take]);
         payload.extend(std::iter::repeat(b' ').take(16 - take));
-        self.send_and_ack(0xF0, 0x27, &payload, Duration::from_millis(300))
+
+        // The MCU needs a brief settle time after ACKing one command
+        // before it'll accept the next -- same reason the power-on init
+        // sequence sleeps 15ms between its two steps. Two of these calls
+        // fire back-to-back every render (one per line); sent immediately
+        // after each other the second one reliably gets NACKed, so retry
+        // with that same gap rather than leaving that line stale.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            if self.send_and_ack(0xF0, 0x27, &payload, Duration::from_millis(300))? {
+                self.last_sent[idx] = Some(text.to_string());
+                return Ok(true);
+            }
+        }
+        // Left uncached on failure so the next call with this same text
+        // (the caller will keep asking, since as far as it's concerned
+        // this is still the text that should be showing) retries instead
+        // of being treated as "already sent".
+        Ok(false)
+    }
+
+    /// Forces the next `set_text` call for each line to actually hit the
+    /// wire even if the text matches what's cached -- needed after the LCD
+    /// is power-cycled (see the `SetLcdPower` effect), since that clears
+    /// its display and `last_sent` would otherwise wrongly believe it's
+    /// still showing the last text sent before the cycle.
+    pub fn invalidate_display_cache(&mut self) {
+        self.last_sent = [None, None];
     }
 
     /// Replies to an unsolicited MCU frame the way lcmd does: ACK with status 0.
