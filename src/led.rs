@@ -127,14 +127,22 @@ pub fn set_bay(bay: u32, state: BayState) {
     }
 }
 
-/// Night mode: dark status/network/USB LEDs, bay green LEDs off -- but red
-/// bay LEDs are deliberately left alone so a real failure still shows even
-/// while "asleep", same principle as a critical alert waking the LCD.
+/// Night mode: dark status/power/network/USB LEDs, bay green LEDs off --
+/// but red bay LEDs are deliberately left alone so a real failure still
+/// shows even while "asleep", same principle as a critical alert waking
+/// the LCD.
 pub fn enter_night_mode(nic_ifaces: &[String]) {
     write_attr("green:status", "trigger", "none");
     set_solid("green:status", false);
     write_attr("red:status", "trigger", "none");
     set_solid("red:status", false);
+
+    // The physical front "Power" LED (bi-color blue/red, GPIO-driven --
+    // per mafredri/asustor-platform-driver's CLAUDE.md) is a separate
+    // device from the status LED above; nothing else in this codebase
+    // touches it.
+    set_solid("blue:power", false);
+    set_solid("red:power", false);
 
     for bay in 1..=4 {
         write_attr(&format!("sata{bay}:green:disk"), "trigger", "none");
@@ -144,6 +152,12 @@ pub fn enter_night_mode(nic_ifaces: &[String]) {
 
     set_solid("green:usb", false);
     write_attr("green:usb", "trigger", "none");
+
+    // `blue:lan` isn't itself an LED -- it's the shared power rail for
+    // both front LAN LEDs (per the same driver notes); off darkens both
+    // regardless of whatever per-port link/activity state the below is
+    // (separately) trying to reflect.
+    set_solid("blue:lan", false);
 
     for iface in nic_ifaces {
         for chip_led in [format!("{iface}-0::lan"), format!("{iface}-1::lan")] {
@@ -161,11 +175,16 @@ pub fn exit_night_mode(nic_ifaces: &[String]) {
     write_attr("red:status", "trigger", "panic");
     set_solid("red:status", false);
 
+    set_solid("blue:power", true);
+    set_solid("red:power", false);
+
     for bay in 1..=4 {
         write_attr(&format!("sata{bay}:green:disk"), "trigger", &format!("asustor-sata{bay}"));
     }
 
     write_attr("green:usb", "trigger", "asustor-front-usb");
+
+    set_solid("blue:lan", true);
 
     for iface in nic_ifaces {
         let a = format!("{iface}-0::lan");
