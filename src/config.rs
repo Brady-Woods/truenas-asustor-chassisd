@@ -175,10 +175,6 @@ pub struct SleepConfig {
     /// 24h "HH:MM" local time.
     pub start: String,
     pub end: String,
-    /// sysfs LED-class brightness file controlling real backlight power.
-    /// Confirmed on AS6704T v2 as /sys/class/leds/power:lcd/brightness;
-    /// override if a different model exposes it under another name.
-    pub lcd_power_path: String,
 }
 
 impl Default for SleepConfig {
@@ -187,7 +183,6 @@ impl Default for SleepConfig {
             enabled: false,
             start: "23:00".to_string(),
             end: "07:00".to_string(),
-            lcd_power_path: "/sys/class/leds/power:lcd/brightness".to_string(),
         }
     }
 }

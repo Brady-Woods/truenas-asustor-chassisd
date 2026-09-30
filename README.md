@@ -147,27 +147,29 @@ serial opcode for "start scrolling" anywhere in the protocol. ADM's own
 ## LCD power (sleep mode)
 
 The LCD's power is **not** part of the serial protocol at all -- it's a
-separate GPIO line. Disassembling `Hal_Lcm_Set_Power` in `libnhal.so`
-showed it calls into either `It87_Set_Gpio` or `Set_System_Gpio` depending
-on platform ID, i.e. a Super I/O chip GPIO pin, not a UART command.
-
-On this hardware that GPIO is already exposed cleanly by the platform
-driver as a standard LED-class device:
+separate GPIO line, already exposed cleanly by the platform driver as a
+standard LED-class device:
 
 ```sh
 echo 0 > /sys/class/leds/power:lcd/brightness   # off
 echo 1 > /sys/class/leds/power:lcd/brightness   # on
 ```
 
-Toggling it **power-cycles the LCD** -- confirmed live (off, then back on,
-both verified visually against the physical panel). That means waking from
-sleep needs the power-on init sequence (`0xF0/0x11` then `0xF0/0x22`)
-resent, not just a resumed text write; `main.rs`/`state.rs` handle this on
-every sleep->wake transition.
+Toggling it **power-cycles the LCD's own MCU, not just a backlight** --
+confirmed live: zero serial frames (including a button press) arrive from
+the panel for as long as it's held at 0. That makes it unusable for this
+project's actual goal: a schedule-driven "night mode" that a button press
+can still interrupt. So `lcm-status` never touches this GPIO at all --
+`[sleep]` instead blanks both display lines (`state.rs`'s `sleeping` flag)
+while leaving the panel fully powered, which keeps it listening for a
+button the whole time. The trade-off is a dark-but-not-black backlight
+glow, confirmed acceptable live against the physical unit; toggle
+`power:lcd` by hand (as above) if you want it fully dark and don't need
+buttons to wake it.
 
 Per `asustord`'s own `LED-MODES.md`, `power:lcd` should **only** be used
-by this project -- other LED "night mode" logic explicitly avoids it for
-the same reboot-on-toggle reason.
+by this project's own logic if at all -- other LED "night mode" logic
+explicitly avoids it for the same reboot-on-toggle reason.
 
 ## Front LEDs
 

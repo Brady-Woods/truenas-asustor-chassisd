@@ -128,7 +128,6 @@ pub(crate) struct HealthSummary {
 pub enum Effect {
     Render(String, String),
     RunAction(Action),
-    SetLcdPower(bool),
     None,
 }
 
@@ -432,11 +431,21 @@ impl AppState {
             // Stays awake for one resume-after-inactivity period even
             // though the schedule still wants it asleep, so a groggy 2am
             // glance doesn't get plunged back into darkness mid-read.
+            //
+            // Mirrors tick()'s schedule-driven wake below: without this,
+            // a button-triggered wake only restored the status/bay LEDs
+            // (an incidental side effect of refresh_all()'s health
+            // recompute) while the Power LED and LAN LED rail -- only
+            // ever restored by exit_night_mode -- stayed dark.
             self.sleeping = false;
             self.awake_override_until =
                 Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
+            led::exit_night_mode(&hal::physical_nics());
+            for iface in hal::physical_nics() {
+                led::set_nic_mode(&iface, self.cfg.led.nic_mode);
+            }
             self.refresh_all();
-            return Effect::SetLcdPower(true);
+            return self.render();
         }
 
         match &mut self.mode {
@@ -599,7 +608,12 @@ impl AppState {
         {
             self.sleeping = true;
             led::enter_night_mode(&hal::physical_nics());
-            return Effect::SetLcdPower(false);
+            // Blanks the text but leaves the panel's own MCU powered --
+            // unlike cutting power:lcd, which also kills the MCU (and so,
+            // its ability to report a button press at all: confirmed live,
+            // zero serial frames arrive while power:lcd is 0). This is the
+            // whole point: night mode has to stay wakeable by a button.
+            return Effect::Render(String::new(), String::new());
         }
         if !self.schedule_wants_sleep && self.sleeping {
             self.sleeping = false;
@@ -608,10 +622,10 @@ impl AppState {
                 led::set_nic_mode(&iface, self.cfg.led.nic_mode);
             }
             self.refresh_all();
-            return Effect::SetLcdPower(true);
+            return self.render();
         }
         if self.sleeping {
-            return Effect::None;
+            return Effect::Render(String::new(), String::new());
         }
 
         self.refresh_stale();

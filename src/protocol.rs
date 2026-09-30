@@ -247,15 +247,6 @@ impl Lcm {
         Ok(false)
     }
 
-    /// Forces the next `set_text` call for each line to actually hit the
-    /// wire even if the text matches what's cached -- needed after the LCD
-    /// is power-cycled (see the `SetLcdPower` effect), since that clears
-    /// its display and `last_sent` would otherwise wrongly believe it's
-    /// still showing the last text sent before the cycle.
-    pub fn invalidate_display_cache(&mut self) {
-        self.last_sent = [None, None];
-    }
-
     /// Replies to an unsolicited MCU frame the way lcmd does: ACK with status 0.
     pub fn ack(&mut self, subcmd: u8) -> io::Result<()> {
         self.send(0xF1, subcmd, &[0x00])
