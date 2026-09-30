@@ -249,16 +249,6 @@ fn apply_effect(effect: Effect, lcm: &mut Lcm, cfg: &Config) {
             let _ = lcm.set_text(1, &line1, 0);
         }
         Effect::RunAction(action) => run_action(action, cfg),
-        Effect::SetLcdPower(on) => {
-            set_lcd_power(cfg, on);
-            if on {
-                // Power-cycling the LCD clears its display, so whatever
-                // Lcm::set_text last confirmed showing is stale -- force
-                // the next render to actually hit the wire instead of
-                // assuming it's already correct.
-                lcm.invalidate_display_cache();
-            }
-        }
         Effect::None => {}
     }
 }
@@ -278,10 +268,6 @@ fn run_action(action: Action, _cfg: &Config) {
             eprintln!("eject requested -- not yet wired to the actual front-port device");
         }
     }
-}
-
-fn set_lcd_power(cfg: &Config, on: bool) {
-    let _ = std::fs::write(&cfg.sleep.lcd_power_path, if on { "1" } else { "0" });
 }
 
 /// Local wall-clock hour/minute (`[sleep].start`/`.end` are documented as
