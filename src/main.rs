@@ -284,13 +284,19 @@ fn set_lcd_power(cfg: &Config, on: bool) {
     let _ = std::fs::write(&cfg.sleep.lcd_power_path, if on { "1" } else { "0" });
 }
 
+/// Local wall-clock hour/minute (`[sleep].start`/`.end` are documented as
+/// local time, see config.rs). Needs `libc::localtime_r` -- computing this
+/// from `SystemTime`/`UNIX_EPOCH` directly gives UTC, not local time, which
+/// silently shifted the sleep window by the system's UTC offset (e.g. 7
+/// hours early on a Pacific-time box) with no error or indication anything
+/// was wrong.
 fn now_hhmm() -> (u32, u32) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs_of_day = now % 86400;
-    ((secs_of_day / 3600) as u32, ((secs_of_day % 3600) / 60) as u32)
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (tm.tm_hour as u32, tm.tm_min as u32)
+    }
 }
 
 fn in_sleep_window(start: &str, end: &str, now: (u32, u32)) -> bool {
