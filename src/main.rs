@@ -229,13 +229,9 @@ fn run_daemon(cfg_path: &Path) {
         );
     }
 
-    // Blink triggers (RAID-degraded flash, critical-alert flash, bay
-    // standby flash) need this loaded; it's not on by default on TrueNAS.
-    if !led::ledtrig_timer_loaded() {
-        let _ = std::process::Command::new("modprobe")
-            .arg("ledtrig-timer")
-            .status();
-    }
+    // Blink patterns need ledtrig-timer and the NIC LEDs ledtrig-netdev;
+    // neither is loaded by default on TrueNAS.
+    led::ensure_trigger_modules();
 
     // Started before the first (slow, subprocess-heavy) refresh below so
     // fan control is never waiting on it.

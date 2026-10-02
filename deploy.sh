@@ -70,6 +70,16 @@ check_driver() {
 }
 check_driver
 
+# --- 1b. LED trigger modules -----------------------------------------------
+# ledtrig-timer (every blink pattern) and ledtrig-netdev ([led] nic_mode and
+# night mode on the RTL8125 NIC LEDs) ship with the TrueNAS kernel but
+# aren't loaded by default. The daemon loads them itself on every start
+# (led::ensure_trigger_modules); doing it here as well just makes a missing
+# module visible at deploy time rather than only in the journal.
+for m in ledtrig-timer ledtrig-netdev; do
+    modprobe "$m" || log "WARNING: modprobe $m failed -- LEDs that use it won't change"
+done
+
 # --- 2. Build, in a throwaway container -- nothing installed on the host -
 log "Building (containerized rust:alpine, musl target)..."
 docker run --rm \
