@@ -92,6 +92,16 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     }
     out.push('\n');
 
+    // Fresh ioctl reads for every physical NIC, configured or not, so a
+    // NIC's WOL can be checked before deciding to add it to `[wol] nics`.
+    out.push_str("-- Wake-on-LAN --\n");
+    let mut nics = hal::physical_nics();
+    nics.sort();
+    for iface in nics {
+        let _ = writeln!(out, "  {}", crate::wol::describe(&iface, &cfg.wol));
+    }
+    out.push('\n');
+
     out.push_str("-- Active override --\n");
     let active = state.override_summary();
     let _ = writeln!(out, "  {}\n", active.as_deref().unwrap_or("none"));
