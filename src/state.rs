@@ -885,11 +885,13 @@ impl AppState {
                 line1,
             } => {
                 // error/critical are meant to always be seen: force them to
-                // persist regardless of whatever ttl the caller passed.
+                // persist regardless of whatever ttl the caller passed. A
+                // ttl too large to represent as an `Instant` persists too,
+                // rather than panicking the daemon.
                 let expires_at = if level.always_visible() || ttl_secs == 0 {
                     None
                 } else {
-                    Some(Instant::now() + Duration::from_secs(ttl_secs))
+                    Instant::now().checked_add(Duration::from_secs(ttl_secs))
                 };
                 let ov = Override {
                     level,
@@ -1224,6 +1226,20 @@ mod tests {
 
     fn active(state: &AppState) -> Option<(Level, &str)> {
         state.over.as_ref().map(|o| (o.level, o.line0.as_str()))
+    }
+
+    #[test]
+    fn huge_show_ttl_persists_instead_of_panicking() {
+        let mut s = state();
+        s.apply_socket_command(SocketCommand::Show {
+            level: Level::Info,
+            ttl_secs: u64::MAX,
+            bay: None,
+            line0: "FOREVER".to_string(),
+            line1: String::new(),
+        });
+        assert_eq!(active(&s), Some((Level::Info, "FOREVER")));
+        assert!(s.over.as_ref().is_some_and(|o| o.expires_at.is_none()));
     }
 
     #[test]
