@@ -302,7 +302,9 @@ impl LocalTime {
     /// `localtime_r` -- the same source `[sleep]` uses (see
     /// `main::now_hhmm` for why not `SystemTime` arithmetic).
     pub fn from_epoch(t: i64) -> LocalTime {
-        let t: libc::time_t = t;
+        // `t` is passed as-is: `time_t` is `i64` on every 64-bit target
+        // this builds for, and naming `libc::time_t` is deprecated on musl
+        // (the alpine build `deploy.sh` uses).
         // SAFETY: `tm` is plain data for which all-zeroes is valid, and
         // both pointers passed to the reentrant `localtime_r` are to
         // locals that outlive the call.
