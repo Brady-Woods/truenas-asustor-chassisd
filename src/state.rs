@@ -4,7 +4,7 @@
 //! but not a confirm screen") are enforced in one spot, not scattered
 //! across the event loop.
 
-use crate::config::Config;
+use crate::config::{Category, Config};
 use crate::hal::{self, Screen};
 use crate::protocol::Key;
 use crate::led;
@@ -364,7 +364,7 @@ impl AppState {
         let mut pools_or_hdd_changed = false;
 
         if self.cfg.screens.network && self.network_cache.stale(Duration::from_secs(r.network_min_secs)) {
-            self.network_cache.screens = hal::network();
+            self.network_cache.screens = hal::network(&self.cfg.templates.network);
             self.network_cache.last_refresh = Some(Instant::now());
         }
         // Pool/hdd staleness (and so, health monitoring + LED updates) is
@@ -375,14 +375,14 @@ impl AppState {
         if self.pools_cache.stale(Duration::from_secs(r.pools_min_secs)) {
             self.monitor.check_pools(&hal::pool_healths());
             if self.cfg.screens.pools {
-                self.pools_cache.screens = hal::pools();
+                self.pools_cache.screens = hal::pools(&self.cfg.templates.pool);
             }
             self.pools_cache.last_refresh = Some(Instant::now());
             pools_or_hdd_changed = true;
         }
         if self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs)) {
             if self.cfg.screens.hdd {
-                self.hdd_cache.screens = hal::hdd();
+                self.hdd_cache.screens = hal::hdd(&self.cfg);
             }
             self.hdd_cache.last_refresh = Some(Instant::now());
             pools_or_hdd_changed = true;
@@ -397,16 +397,21 @@ impl AppState {
         // HealthMonitor::maybe_check_temps.
         self.monitor.maybe_check_temps(&self.cfg);
         if self.cfg.screens.docker && self.docker_cache.stale(Duration::from_secs(r.docker_min_secs)) {
-            self.docker_cache.screens = hal::docker_issues(&self.cfg.docker.ignore);
+            self.docker_cache.screens = hal::docker_issues(&self.cfg.docker.ignore, &self.cfg.templates.docker);
             self.docker_cache.last_refresh = Some(Instant::now());
         }
 
         let mut screens = Vec::new();
-        screens.extend(self.network_cache.screens.clone());
-        screens.extend(self.pools_cache.screens.clone());
-        screens.extend(self.hdd_cache.screens.clone());
-        screens.extend(self.temperature_cache.screens.clone());
-        screens.extend(self.docker_cache.screens.clone());
+        for category in self.cfg.screens.effective_order() {
+            let cache = match category {
+                Category::Network => &self.network_cache,
+                Category::Pools => &self.pools_cache,
+                Category::Hdd => &self.hdd_cache,
+                Category::Temperature => &self.temperature_cache,
+                Category::Docker => &self.docker_cache,
+            };
+            screens.extend(cache.screens.iter().cloned());
+        }
         if screens.is_empty() {
             screens.push(Screen {
                 line0: "LCM-STATUS".into(),
@@ -749,7 +754,7 @@ impl AppState {
                     scroll.offset += 1;
                     scroll.last_step = Some(now);
                     // Loop with a gap of spaces between the end and restart.
-                    let gap = 4;
+                    let gap = cfg.scroll_gap;
                     if scroll.offset > chars.len() + gap {
                         scroll.offset = 0;
                         scroll.started = Some(now); // pause again at the loop point
@@ -760,8 +765,7 @@ impl AppState {
         }
 
         let mut window = String::with_capacity(16);
-        let gap = 4;
-        let padded_len = chars.len() + gap;
+        let padded_len = chars.len() + cfg.scroll_gap;
         for i in 0..16 {
             let pos = (scroll.offset + i) % padded_len;
             window.push(if pos < chars.len() { chars[pos] } else { ' ' });

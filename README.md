@@ -522,8 +522,20 @@ receive the reply.
 `/etc/lcm-status.toml`, hand-edited, every field defaulted -- see
 `lcm-status.example.toml` for the full annotated reference (scroll
 speed/limits, per-category refresh floors, sleep schedule, which screens
-are enabled, NIC LED mode, Docker containers to ignore, temperature
-units/warning threshold).
+are enabled and in what order, NIC LED mode, Docker containers to ignore,
+temperature units/warning threshold).
+
+The text on each status screen comes from `[templates.*]`: `{variable}`
+templates per screen kind (`network`, `pool`, `hdd`, `cpu`, `fan`,
+`docker`), each with its own variable list documented in the example
+config. The defaults reproduce the built-in text. A block that sets only
+one line leaves the other line blank; leave the block out entirely to keep
+its defaults. Templates are checked at
+load: one with an unknown variable or a stray brace is logged and falls
+back to its default, without affecting the other screens. Fallback screens
+("no disks found"), socket overrides and the action/confirm menu aren't
+templated. `lcm-status hal-test [path]` renders every screen using that
+config, so you can preview edits before restarting the daemon.
 
 ## Deploying, and surviving TrueNAS upgrades
 
@@ -574,6 +586,6 @@ lcm-status init                    # send the power-on sequence
 lcm-status settext 0 "HELLO"       # write up to 16 chars to line 0 or 1
 lcm-status listen 60               # print every unsolicited frame (button
                                     # presses, MCU version reports) for 60s
-lcm-status hal-test                # dump everything hal.rs would gather
+lcm-status hal-test [path]         # dump every screen, rendered with that config's templates
 lcm-status check-config [path]     # parse and print a config file
 ```

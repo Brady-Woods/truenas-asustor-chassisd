@@ -9,6 +9,7 @@ mod report;
 mod socket;
 mod state;
 mod syslog;
+mod template;
 
 use config::Config;
 use protocol::{Key, Lcm, LCM_DEVICE};
@@ -28,12 +29,16 @@ fn main() {
     }
 
     if cmd == "hal-test" {
-        let cfg = Config::default();
-        println!("-- network --\n{:#?}", hal::network());
-        println!("-- pools --\n{:#?}", hal::pools());
-        println!("-- hdd --\n{:#?}", hal::hdd());
+        // Uses the real config (not defaults) so [templates.*] edits can be
+        // previewed without restarting the daemon.
+        let path = args.get(2).map(Path::new).unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        let cfg = Config::load(path);
+        let t = &cfg.templates;
+        println!("-- network --\n{:#?}", hal::network(&t.network));
+        println!("-- pools --\n{:#?}", hal::pools(&t.pool));
+        println!("-- hdd --\n{:#?}", hal::hdd(&cfg));
         println!("-- temperature/fan --\n{:#?}", hal::cpu_and_fan(&cfg));
-        println!("-- docker issues --\n{:#?}", hal::docker_issues(&cfg.docker.ignore));
+        println!("-- docker issues --\n{:#?}", hal::docker_issues(&cfg.docker.ignore, &t.docker));
         return;
     }
 

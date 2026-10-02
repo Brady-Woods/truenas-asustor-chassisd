@@ -6,6 +6,7 @@ serial_device = "/dev/ttyS1"
 scroll_step_ms = 300      # ms per character-step while scrolling (~3.3 chars/sec)
 scroll_max_chars = 64     # longest text kept for scrolling; longer is truncated
 scroll_pause_ms = 800     # pause at start/end of a scroll cycle
+scroll_gap = 4            # blank chars between a scrolling line's end and its restart
 
 [rotation]
 dwell_secs = 5            # how long a short (non-scrolling) screen stays up
@@ -29,6 +30,51 @@ pools = true               # pool capacity + health, merged into one screen per 
 hdd = true                 # SMART health + temp, merged into one screen per drive
 temperature = true         # CPU temp + the one real fan (others are unpopulated headers)
 docker = true
+# Rotation order. Categories left out are appended in this default order,
+# so e.g. ["docker"] just moves docker to the front.
+order = ["network", "pools", "hdd", "temperature", "docker"]
+
+# LCD text for each screen, as {variable} templates. The panel is 16 chars
+# wide; anything longer scrolls (up to [display].scroll_max_chars). Leave a
+# whole block out to keep its defaults; a block that sets only one line
+# leaves the other line blank. An unknown {variable} is reported at startup
+# (and by `lcm-status check-config`), and that one screen falls back to
+# its default. Use {{ and }} for literal braces. Trailing spaces are
+# trimmed, so a trailing variable that comes out empty (e.g. hdd {temp}
+# with no reading) doesn't leave a gap. Preview with `lcm-status hal-test`.
+[templates.network]        # one per physical NIC
+# {iface} {ip} (empty if none) {link} ("up"/"down")
+# {ip_or_status} (IP, else "connected, no IP" / "disconnected")
+line0 = "{iface}"
+line1 = "{ip_or_status}"
+
+[templates.pool]           # one per zpool
+# {name} {size} {alloc} {free} {cap} (e.g. "42%") {health}
+line0 = "{name}: {health}"
+line1 = "{alloc}/{size} {cap}"
+
+[templates.hdd]            # one per disk
+# {label} ("BAY3 sda", or just "nvme0n1" for non-bay drives) {bay} (empty
+# for NVMe) {dev} {status} (PASSED/FAILED/STANDBY/UNKNOWN/N/A)
+# {temp} (e.g. "34C", in [temperature].units; empty if no reading)
+line0 = "{label}"
+line1 = "{status} {temp}"
+
+[templates.cpu]
+# {temp} (number, in [temperature].units) {unit} ("C"/"F")
+# {warn} (" !" at/above warn_threshold, else empty)
+line0 = "CPU"
+line1 = "{temp}{unit}{warn}"
+
+[templates.fan]
+# {rpm}
+line0 = "FAN"
+line1 = "{rpm} RPM"
+
+[templates.docker]         # one per unhealthy container
+# {name} {status} (docker ps status text)
+line0 = "DOCKER {name}"
+line1 = "{status}"
 
 [refresh]
 # Floors, not polling intervals -- refresh actually happens right before a
@@ -41,7 +87,7 @@ temperature_min_secs = 10
 docker_min_secs = 10
 
 [temperature]
-units = "c"                 # "c" or "f" (display only -- thresholds below are always degrees C)
+units = "c"                 # "c" or "f" for the CPU and HDD screens (display only -- thresholds below are always degrees C)
 # Fallback for any sensor not matched by [[temperature.thresholds]] below --
 # highlights the temperature screen's "!" and, via syslog
 # (monitor::HealthMonitor), logs a WARNING/CRITICAL on the transition into

@@ -2,7 +2,7 @@
 //! synchronous, best-effort snapshot -- callers decide how often to call
 //! these (see the refresh-on-display design), not this module.
 
-use crate::config::{Config, TempUnits};
+use crate::config::{Config, ScreenTemplate, TempUnits};
 use std::process::Command;
 
 /// Two 16-char-window-ready lines. Line contents may be longer than 16
@@ -11,6 +11,15 @@ use std::process::Command;
 pub struct Screen {
     pub line0: String,
     pub line1: String,
+}
+
+/// Renders one `[templates.*]` entry into a `Screen`. `vars` must cover
+/// that kind's `TemplatesConfig::*_VARS` list.
+fn render(tpl: &ScreenTemplate, vars: &[(&str, &str)]) -> Screen {
+    Screen {
+        line0: crate::template::render(&tpl.line0, vars),
+        line1: crate::template::render(&tpl.line1, vars),
+    }
 }
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
@@ -87,9 +96,11 @@ pub(crate) fn ip_by_iface() -> std::collections::HashMap<String, String> {
 /// (no carrier) for an interface with no address -- see `network()`'s doc
 /// comment for why that distinction is worth making at all.
 pub(crate) fn nic_link_text(iface: &str) -> String {
-    let connected =
-        std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")).map(|s| s.trim() == "1").unwrap_or(false);
-    if connected { "connected, no IP".to_string() } else { "disconnected".to_string() }
+    if carrier_up(iface) { "connected, no IP".to_string() } else { "disconnected".to_string() }
+}
+
+fn carrier_up(iface: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")).map(|s| s.trim() == "1").unwrap_or(false)
 }
 
 /// One screen per *every* physical NIC (`physical_nics()`, not just
@@ -101,14 +112,19 @@ pub(crate) fn nic_link_text(iface: &str) -> String {
 /// configure this in Network settings", the second says "check the
 /// cable", and before this they looked identical (both just missing from
 /// the screen).
-pub fn network() -> Vec<Screen> {
+pub fn network(tpl: &ScreenTemplate) -> Vec<Screen> {
     let with_ip = ip_by_iface();
 
     let screens: Vec<Screen> = physical_nics()
         .into_iter()
         .map(|iface| {
-            let line1 = with_ip.get(&iface).cloned().unwrap_or_else(|| nic_link_text(&iface));
-            Screen { line0: iface, line1 }
+            let ip = with_ip.get(&iface).map(String::as_str).unwrap_or("");
+            let link = if carrier_up(&iface) { "up" } else { "down" };
+            let ip_or_status = if ip.is_empty() { nic_link_text(&iface) } else { ip.to_string() };
+            render(
+                tpl,
+                &[("iface", &iface), ("ip", ip), ("link", link), ("ip_or_status", &ip_or_status)],
+            )
         })
         .collect();
 
@@ -145,10 +161,10 @@ pub fn physical_nics() -> Vec<String> {
 
 /// Storage + RAID health merged: pool name & health on line 0, capacity on
 /// line 1 -- one `zpool list` call instead of two.
-pub fn pools() -> Vec<Screen> {
+pub fn pools(tpl: &ScreenTemplate) -> Vec<Screen> {
     let out = run(
         "zpool",
-        &["list", "-H", "-o", "name,size,alloc,capacity,health"],
+        &["list", "-H", "-o", "name,size,alloc,free,capacity,health"],
     );
     let Some(out) = out else {
         return vec![Screen {
@@ -163,12 +179,13 @@ pub fn pools() -> Vec<Screen> {
             let name = f.next().unwrap_or("?");
             let size = f.next().unwrap_or("?");
             let alloc = f.next().unwrap_or("?");
+            let free = f.next().unwrap_or("?");
             let cap = f.next().unwrap_or("?");
             let health = f.next().unwrap_or("?");
-            Screen {
-                line0: format!("{name}: {health}"),
-                line1: format!("{alloc}/{size} {cap}"),
-            }
+            render(
+                tpl,
+                &[("name", name), ("size", size), ("alloc", alloc), ("free", free), ("cap", cap), ("health", health)],
+            )
         })
         .collect()
 }
@@ -231,7 +248,7 @@ pub fn bay_led_states() -> Vec<(u32, crate::led::BayState)> {
 /// BAY3), which is a real, stable physical identifier -- confirmed to
 /// match this board's ata1..4 <-> sata1..4 LED convention, not just
 /// whatever order the kernel happened to enumerate sdX in.
-pub fn hdd() -> Vec<Screen> {
+pub fn hdd(cfg: &Config) -> Vec<Screen> {
     let disks = list_disks();
 
     if disks.is_empty() {
@@ -261,16 +278,23 @@ pub fn hdd() -> Vec<Screen> {
                 })
                 .unwrap_or_else(|| "N/A".to_string());
 
-            let (label, temp) = match ata_port_for(d) {
+            let bay = ata_port_for(d);
+            let (label, temp) = match bay {
                 Some(bay) => (format!("BAY{bay} {d}"), bay_temps.get(&bay).copied()),
                 None => (d.clone(), nvme_temp_for(d)),
             };
+            let bay = bay.map(|b| b.to_string()).unwrap_or_default();
+            let temp = temp
+                .map(|t| {
+                    let (val, unit) = display_temp(t, cfg.temperature.units);
+                    format!("{val:.0}{unit}")
+                })
+                .unwrap_or_default();
 
-            let line1 = match temp {
-                Some(t) => format!("{status} {:.0}C", t),
-                None => status,
-            };
-            Screen { line0: label, line1 }
+            render(
+                &cfg.templates.hdd,
+                &[("label", &label), ("bay", &bay), ("dev", d), ("status", &status), ("temp", &temp)],
+            )
         })
         .collect()
 }
@@ -281,13 +305,10 @@ pub fn hdd() -> Vec<Screen> {
 pub fn cpu_and_fan(cfg: &Config) -> Vec<Screen> {
     let mut screens = Vec::new();
     if let Some(cpu_c) = coretemp_package() {
-        screens.push(temp_screen("CPU", cpu_c, cfg));
+        screens.push(cpu_screen(cpu_c, cfg));
     }
     if let Some(rpm) = fan1_rpm() {
-        screens.push(Screen {
-            line0: "FAN".into(),
-            line1: format!("{rpm:.0} RPM"),
-        });
+        screens.push(render(&cfg.templates.fan, &[("rpm", &format!("{rpm:.0}"))]));
     }
     if screens.is_empty() {
         screens.push(Screen {
@@ -298,16 +319,18 @@ pub fn cpu_and_fan(cfg: &Config) -> Vec<Screen> {
     screens
 }
 
-fn temp_screen(label: &str, celsius: f32, cfg: &Config) -> Screen {
-    let (val, unit) = match cfg.temperature.units {
+/// Converts for display only -- thresholds are always compared in C.
+fn display_temp(celsius: f32, units: TempUnits) -> (f32, &'static str) {
+    match units {
         TempUnits::C => (celsius, "C"),
         TempUnits::F => (celsius * 9.0 / 5.0 + 32.0, "F"),
-    };
-    let warn = celsius >= cfg.temperature.warn_threshold;
-    Screen {
-        line0: label.to_string(),
-        line1: format!("{:.0}{unit}{}", val, if warn { " !" } else { "" }),
     }
+}
+
+fn cpu_screen(celsius: f32, cfg: &Config) -> Screen {
+    let (val, unit) = display_temp(celsius, cfg.temperature.units);
+    let warn = if celsius >= cfg.temperature.warn_threshold { " !" } else { "" };
+    render(&cfg.templates.cpu, &[("temp", &format!("{val:.0}")), ("unit", unit), ("warn", warn)])
 }
 
 /// Resolves a block device to its physical bay number via
@@ -571,7 +594,7 @@ pub(crate) fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
 
 /// Docker: any container not "healthy" or plain "Up" (running, no healthcheck).
 /// Returns one screen per problem container; empty if everything's fine.
-pub fn docker_issues(ignore: &[String]) -> Vec<Screen> {
+pub fn docker_issues(ignore: &[String], tpl: &ScreenTemplate) -> Vec<Screen> {
     let out = run(
         "docker",
         &["ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
@@ -592,10 +615,7 @@ pub fn docker_issues(ignore: &[String]) -> Vec<Screen> {
             if ok {
                 None
             } else {
-                Some(Screen {
-                    line0: format!("DOCKER {name}"),
-                    line1: status.to_string(),
-                })
+                Some(render(tpl, &[("name", name), ("status", status)]))
             }
         })
         .collect()
