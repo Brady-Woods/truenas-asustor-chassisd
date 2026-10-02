@@ -1,7 +1,10 @@
 [package]
 name = "lcm-status"
 version = "1.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
+description = "Front-panel LCD, LED and fan control daemon for ASUSTOR NAS hardware running TrueNAS SCALE"
+publish = false
 
 [profile.release]
 opt-level = 2
@@ -11,3 +14,13 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 toml = "0.8"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+# An explicit `match` on Ok/Err (or Some/None) often reads better than the
+# `if let ... else` this lint asks for.
+single_match_else = "allow"

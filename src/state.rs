@@ -69,9 +69,7 @@ struct CategoryCache {
 
 impl CategoryCache {
     fn stale(&self, floor: Duration) -> bool {
-        self.last_refresh
-            .map(|t| t.elapsed() >= floor)
-            .unwrap_or(true)
+        self.last_refresh.is_none_or(|t| t.elapsed() >= floor)
     }
 }
 
@@ -248,11 +246,11 @@ impl AppState {
     /// miss a real problem) while completely disconnected from what the
     /// rest of the daemon was actually observing.
     fn recompute_status_led(&self) {
-        if let Some(ov) = &self.over {
-            if let Some(pattern) = led::pattern_for_level(ov.level) {
-                led::set_status(pattern);
-                return;
-            }
+        if let Some(ov) = &self.over
+            && let Some(pattern) = led::pattern_for_level(ov.level)
+        {
+            led::set_status(pattern);
+            return;
         }
         led::set_status(self.health_summary().pattern);
     }
@@ -493,11 +491,11 @@ impl AppState {
         match &mut self.mode {
             Mode::Status => match key {
                 Key::Up => {
-                    self.page(-1);
+                    self.page(false);
                     Effect::None
                 }
                 Key::Down => {
-                    self.page(1);
+                    self.page(true);
                     Effect::None
                 }
                 Key::Enter => {
@@ -552,13 +550,17 @@ impl AppState {
         }
     }
 
-    fn page(&mut self, delta: isize) {
-        if self.screens.is_empty() {
+    /// Manual UP (`forward = false`) / DOWN paging, wrapping at both ends.
+    fn page(&mut self, forward: bool) {
+        let len = self.screens.len();
+        if len == 0 {
             return;
         }
-        let len = self.screens.len() as isize;
-        let new = (self.index as isize + delta).rem_euclid(len);
-        self.index = new as usize;
+        self.index = if forward {
+            (self.index + 1) % len
+        } else {
+            (self.index + len - 1) % len
+        };
         self.auto_rotate = false;
         self.resume_at =
             Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
@@ -673,8 +675,7 @@ impl AppState {
         // post-manual-wake grace period.
         let grace_active = self
             .awake_override_until
-            .map(|t| Instant::now() < t)
-            .unwrap_or(false);
+            .is_some_and(|t| Instant::now() < t);
         if !grace_active {
             self.awake_override_until = None;
         }
@@ -705,32 +706,30 @@ impl AppState {
         self.refresh_stale();
 
         // Expire a timed-out override.
-        if let Some(ov) = &self.over {
-            if let Some(exp) = ov.expires_at {
-                if Instant::now() >= exp {
-                    self.over = None;
-                    self.reset_scroll();
-                    self.sync_leds_to_override();
-                }
-            }
+        if let Some(ov) = &self.over
+            && let Some(exp) = ov.expires_at
+            && Instant::now() >= exp
+        {
+            self.over = None;
+            self.reset_scroll();
+            self.sync_leds_to_override();
         }
 
         // Resume auto-rotation after manual paging goes idle.
-        if !self.auto_rotate {
-            if let Some(resume_at) = self.resume_at {
-                if Instant::now() >= resume_at {
-                    self.auto_rotate = true;
-                    self.resume_at = None;
-                }
-            }
+        if !self.auto_rotate
+            && let Some(resume_at) = self.resume_at
+            && Instant::now() >= resume_at
+        {
+            self.auto_rotate = true;
+            self.resume_at = None;
         }
 
         // Auto-cancel a stale confirm screen.
-        if let Mode::Confirm { deadline, .. } = &self.mode {
-            if Instant::now() >= *deadline {
-                self.mode = Mode::Status;
-                self.apply_pending_override();
-            }
+        if let Mode::Confirm { deadline, .. } = &self.mode
+            && Instant::now() >= *deadline
+        {
+            self.mode = Mode::Status;
+            self.apply_pending_override();
         }
 
         // Advance rotation if it's this screen's turn to change and nothing
@@ -775,7 +774,7 @@ impl AppState {
             }
             Mode::ActionMenu { options, selection } => {
                 let marker = |i: usize| if i == *selection { ">" } else { " " };
-                let opt = |i: usize| options.get(i).map(|a| a.label()).unwrap_or("");
+                let opt = |i: usize| options.get(i).map_or("", |a| a.label());
                 (
                     format!("{}{}", marker(*selection), opt(*selection)),
                     "UP/DN ENTER BACK".to_string(),
@@ -819,22 +818,20 @@ impl AppState {
         let now = Instant::now();
         let in_start_pause = scroll
             .started
-            .map(|s| now.duration_since(s) < Duration::from_millis(cfg.scroll_pause_ms))
-            .unwrap_or(false);
+            .is_some_and(|s| now.duration_since(s) < Duration::from_millis(cfg.scroll_pause_ms));
 
-        if !in_start_pause {
-            if let Some(last) = scroll.last_step {
-                if now.duration_since(last) >= Duration::from_millis(cfg.scroll_step_ms) {
-                    scroll.offset += 1;
-                    scroll.last_step = Some(now);
-                    // Loop with a gap of spaces between the end and restart.
-                    let gap = cfg.scroll_gap;
-                    if scroll.offset > chars.len() + gap {
-                        scroll.offset = 0;
-                        scroll.started = Some(now); // pause again at the loop point
-                        scroll.completed_a_pass = true;
-                    }
-                }
+        if !in_start_pause
+            && let Some(last) = scroll.last_step
+            && now.duration_since(last) >= Duration::from_millis(cfg.scroll_step_ms)
+        {
+            scroll.offset += 1;
+            scroll.last_step = Some(now);
+            // Loop with a gap of spaces between the end and restart.
+            let gap = cfg.scroll_gap;
+            if scroll.offset > chars.len() + gap {
+                scroll.offset = 0;
+                scroll.started = Some(now); // pause again at the loop point
+                scroll.completed_a_pass = true;
             }
         }
 

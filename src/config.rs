@@ -231,6 +231,7 @@ impl Default for SocketConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[expect(clippy::struct_excessive_bools, reason = "one on/off key per screen")]
 pub struct ScreensConfig {
     pub network: bool,
     /// Pool capacity + health, merged into one screen per pool.
@@ -397,6 +398,7 @@ impl TemplatesConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[expect(clippy::struct_field_names, reason = "field names are the config keys")]
 pub struct RefreshConfig {
     /// Minimum seconds between refreshes for each category, even if the
     /// rotation loop comes back around faster. Refresh is otherwise
@@ -520,8 +522,9 @@ pub fn resolve_temp_threshold(cfg: &TemperatureConfig, chip: &str) -> (f32, f32)
     cfg.thresholds
         .iter()
         .find(|t| t.chip == chip)
-        .map(|t| (t.warn_threshold, t.critical_threshold))
-        .unwrap_or((cfg.warn_threshold, cfg.critical_threshold))
+        .map_or((cfg.warn_threshold, cfg.critical_threshold), |t| {
+            (t.warn_threshold, t.critical_threshold)
+        })
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -592,9 +595,9 @@ pub struct FanProfile {
     /// How often to re-evaluate this fan's curve and (re)write its pwm.
     /// lm-sensors' fancontrol(8) default INTERVAL is also 1s.
     pub update_secs: u64,
-    /// At or below this control temp, the fan is pinned to min_pwm.
+    /// At or below this control temp, the fan is pinned to `min_pwm`.
     pub min_temp_c: f32,
-    /// At or above this control temp, the fan is pinned to max_pwm.
+    /// At or above this control temp, the fan is pinned to `max_pwm`.
     pub max_temp_c: f32,
     /// PWM needed to reliably get a *stopped* fan spinning again. Below
     /// this, a stopped fan stays stopped rather than crawl at a PWM too low
@@ -602,18 +605,18 @@ pub struct FanProfile {
     /// empirically per fan rather than guessing.
     pub min_start_pwm: u8,
     /// Once running, the fan is allowed to coast down to this PWM before
-    /// it's allowed to stop entirely (also the ramp's value at min_temp_c
-    /// -- see fan.rs for why that's not min_pwm; same as upstream
+    /// it's allowed to stop entirely (also the ramp's value at `min_temp_c`
+    /// -- see fan.rs for why that's not `min_pwm`; same as upstream
     /// fancontrol).
     pub min_stop_pwm: u8,
-    /// PWM used flat at/below min_temp_c. 0 lets the fan stop there; it's
+    /// PWM used flat at/below `min_temp_c`. 0 lets the fan stop there; it's
     /// kicked with `min_start_pwm` when the curve next wants it spinning.
     pub min_pwm: u8,
-    /// PWM used flat at/above max_temp_c. 255 = fully on.
+    /// PWM used flat at/above `max_temp_c`. 255 = fully on.
     pub max_pwm: u8,
     /// Which sensors feed this fan's control temp -- the max of all of
     /// them, not just one. Empty means this fan never sees a temp reading,
-    /// which effectively disables it (compute_pwm has nothing to act on).
+    /// which effectively disables it (`compute_pwm` has nothing to act on).
     pub sensors: Vec<SensorSelector>,
     /// Log a syslog WARNING if this fan is confirmed running (not
     /// intentionally stopped) but its RPM is below this -- a bearing
@@ -690,7 +693,7 @@ pub struct SensorSelector {
     /// fan's (falls back to the fan's own value if unset). This matters
     /// because different sensors reach their own danger zone at very
     /// different temperatures: this board's fan curve is CPU-tuned
-    /// (max_temp_c=90), but a drive's own critical threshold is 60C --
+    /// (`max_temp_c` = 90), but a drive's own critical threshold is 60C --
     /// without its own override, a drive at 60C would only compute to a
     /// modest partial speed against the CPU's curve, not the full-speed
     /// response its own critical threshold warrants. See

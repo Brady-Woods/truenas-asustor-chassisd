@@ -200,7 +200,7 @@ pub fn network(tpl: &ScreenTemplate) -> Vec<Screen> {
     let screens: Vec<Screen> = physical_nics()
         .into_iter()
         .map(|iface| {
-            let ip = with_ip.get(&iface).map(String::as_str).unwrap_or("");
+            let ip = with_ip.get(&iface).map_or("", String::as_str);
             let link = if carrier_up(&iface) { "up" } else { "down" };
             let ip_or_status = if ip.is_empty() {
                 nic_link_text(&iface)
@@ -231,7 +231,7 @@ pub fn network(tpl: &ScreenTemplate) -> Vec<Screen> {
 
 /// Every physical NIC name (same /sys/class/net/{iface}/device filter as
 /// `network()`), regardless of whether it currently has an address -- used
-/// for per-port LED convention (nic_mode, night mode), which makes sense
+/// for per-port LED convention (`nic_mode`, night mode), which makes sense
 /// to apply to hardware that exists whether or not it's in service. NOT
 /// used for "is the network down" fault detection -- see `configured_nics`
 /// for that, and why the distinction matters.
@@ -497,11 +497,11 @@ fn cpu_screen(celsius: f32, cfg: &Config) -> Screen {
 }
 
 /// Resolves a block device to its physical bay number via
-/// /sys/class/ata_port/ataX/port_no -- the same stable, per-controller
+/// `/sys/class/ata_port/ataX/port_no` -- the same stable, per-controller
 /// source the LED driver's own bay triggers use. That driver computes the
 /// LED name from `ap->port_no + 1` in kernel source (0-indexed internal
 /// field), but the "+1" already happened before the value reached sysfs --
-/// confirmed empirically: ata1's port_no reads back as 1, not 0. So the
+/// confirmed empirically: ata1's `port_no` reads back as 1, not 0. So the
 /// sysfs value is already the human-facing bay number as-is.
 /// Deliberately NOT the "ataN" name itself: that's a global counter across
 /// every SATA controller in probe order, so it only happens to match bay
@@ -528,8 +528,7 @@ fn nvme_temp_for(dev_name: &str) -> Option<f32> {
     // "nvme0n1" -> "nvme0" (split at the last 'n', which introduces the namespace number)
     let controller = dev_name
         .rsplit_once('n')
-        .map(|(ctrl, _ns)| ctrl)
-        .unwrap_or(dev_name);
+        .map_or(dev_name, |(ctrl, _ns)| ctrl);
     // An hwmon whose `device` link can't be read is skipped, not treated
     // as the end of the search.
     let hwmon = glob_hwmon("nvme")?.into_iter().find(|hwmon| {
@@ -560,7 +559,7 @@ pub fn temp_inputs(hwmon: &str) -> Vec<String> {
             let name = e.file_name().to_string_lossy().to_string();
             name.strip_suffix("_input")
                 .filter(|n| n.starts_with("temp"))
-                .map(|n| n.to_string())
+                .map(std::string::ToString::to_string)
         })
         .collect();
     names.sort();
@@ -580,15 +579,15 @@ pub fn temp_inputs(hwmon: &str) -> Vec<String> {
 /// value forever (see `asustor-platform-driver`'s CLAUDE.md) -- with
 /// nothing filtering that out, a naive "read every temp this chip has"
 /// sensor selector would let a permanently-disconnected input drag a fan
-/// curve's max() up to full speed forever.
+/// curve's `max()` up to full speed forever.
 pub fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
-    if let Ok(s) = std::fs::read_to_string(format!("{hwmon}/{input}_fault")) {
-        if s.trim() == "1" {
-            return None;
-        }
-    }
     const PLAUSIBLE_MIN_C: f32 = -20.0;
     const PLAUSIBLE_MAX_C: f32 = 125.0;
+    if let Ok(s) = std::fs::read_to_string(format!("{hwmon}/{input}_fault"))
+        && s.trim() == "1"
+    {
+        return None;
+    }
     read_sysfs_f32(&format!("{hwmon}/{input}_input"))
         .filter(|&t| (PLAUSIBLE_MIN_C..=PLAUSIBLE_MAX_C).contains(&t))
 }
@@ -692,13 +691,13 @@ pub fn coretemp_package() -> Option<f32> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("temp") && name.ends_with("_label") {
-                if let Ok(label) = std::fs::read_to_string(entry.path()) {
-                    if label.trim().starts_with("Package") {
-                        let input = entry.path().to_string_lossy().replace("_label", "_input");
-                        return read_sysfs_f32(&input);
-                    }
-                }
+            if name.starts_with("temp")
+                && name.ends_with("_label")
+                && let Ok(label) = std::fs::read_to_string(entry.path())
+                && label.trim().starts_with("Package")
+            {
+                let input = entry.path().to_string_lossy().replace("_label", "_input");
+                return read_sysfs_f32(&input);
             }
         }
     }
@@ -744,10 +743,10 @@ fn block_device_for_hwmon(hwmon: &str) -> Option<String> {
 /// rather than failed fans (same story as the dead chassis temp probes).
 fn fan1_rpm() -> Option<f32> {
     for hwmon in glob_hwmon("it8625")? {
-        if let Some(rpm) = read_sysfs_raw_f32(&format!("{hwmon}/fan1_input")) {
-            if rpm > 0.0 {
-                return Some(rpm);
-            }
+        if let Some(rpm) = read_sysfs_raw_f32(&format!("{hwmon}/fan1_input"))
+            && rpm > 0.0
+        {
+            return Some(rpm);
         }
     }
     None
@@ -761,10 +760,10 @@ pub fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
         let path = entry.path();
-        if let Ok(name) = std::fs::read_to_string(path.join("name")) {
-            if name.trim().starts_with(name_prefix) {
-                found.push(path.to_string_lossy().to_string());
-            }
+        if let Ok(name) = std::fs::read_to_string(path.join("name"))
+            && name.trim().starts_with(name_prefix)
+        {
+            found.push(path.to_string_lossy().to_string());
         }
     }
     Some(found)

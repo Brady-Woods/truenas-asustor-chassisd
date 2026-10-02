@@ -1,0 +1,2 @@
+# Proper nouns that doc_markdown would otherwise want in backticks.
+doc-valid-idents = ["TrueNAS", "NVMe", "PCIe", "TjMax", "SmartGuardian", "ASUSTOR", "MiB", "KiB", "ACKed", "ACKing", "ACKs", ".."]

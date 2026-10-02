@@ -2,7 +2,7 @@
 //! ad-hoc scripts) push text onto the display, or (`STATUS`) pull a
 //! terminal-readable health report back out. Runs on its own thread and
 //! hands parsed commands to the main event loop over a channel, so the
-//! socket's blocking accept() loop never touches the display/fan state
+//! socket's blocking `accept()` loop never touches the display/fan state
 //! directly.
 //!
 //! `STATUS` is the one request/response case: everything else here is
