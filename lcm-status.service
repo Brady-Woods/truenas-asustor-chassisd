@@ -12,7 +12,8 @@ ExecStart=@LCM_STATUS_BIN@ daemon /etc/lcm-status.toml
 Restart=on-failure
 RestartSec=2
 # Needs root: /dev/ttyS1, the LCD power GPIO/LED, smartctl, and
-# systemctl poweroff/reboot for the panel's shutdown/restart action.
+# systemctl poweroff/reboot for the panel's shutdown/restart action and
+# the power schedule, and /sys/class/rtc/rtc0/wakealarm for its power on.
 
 [Install]
 WantedBy=multi-user.target

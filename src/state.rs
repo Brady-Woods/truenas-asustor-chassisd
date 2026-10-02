@@ -46,6 +46,14 @@ enum Mode {
     },
     /// An action was selected; awaiting confirm/cancel.
     Confirm { action: Action, deadline: Instant },
+    /// A `[[power_schedule]]` shutdown/restart is about to happen: counts
+    /// down to `deadline`, then runs `action`; any key cancels it.
+    Countdown {
+        action: Action,
+        deadline: Instant,
+        /// Which rule, for syslog.
+        label: String,
+    },
 }
 
 /// A scroll cursor for a line whose text overflows 16 chars.
@@ -547,6 +555,68 @@ impl AppState {
                 }
                 _ => Effect::None,
             },
+            // Any button at all, so whoever is standing at the box can stop
+            // it without having to know which one.
+            Mode::Countdown { action, label, .. } => {
+                crate::syslog::notice(&format!(
+                    "power schedule: {label}: cancelled from the front panel"
+                ));
+                let line0 = action.label().to_string();
+                self.mode = Mode::Status;
+                self.apply_pending_override();
+                self.show_override(Override {
+                    level: Level::Info,
+                    expires_at: Some(Instant::now() + Duration::from_secs(5)),
+                    bay: None,
+                    line0,
+                    line1: "CANCELLED".into(),
+                });
+                self.render()
+            }
+        }
+    }
+
+    /// A `[[power_schedule]]` shutdown/restart came due (`power::Scheduler`):
+    /// counts down on the panel for `secs` -- any button cancels -- and
+    /// then `tick` hands `action` back to the event loop to run. Takes
+    /// over from the action menu or a confirm screen, and wakes the panel
+    /// from night mode, so it can't go unseen. If a countdown is already
+    /// running it's kept, except that a shutdown replaces a restart.
+    pub fn start_countdown(&mut self, action: Action, secs: u64, label: &str) {
+        if let Mode::Countdown {
+            action: running, ..
+        } = &mut self.mode
+        {
+            if action == Action::Shutdown && *running == Action::Restart {
+                *running = Action::Shutdown;
+            }
+            return;
+        }
+        if self.sleeping {
+            self.wake();
+        }
+        self.mode = Mode::Countdown {
+            action,
+            deadline: Instant::now() + Duration::from_secs(secs),
+            label: label.to_string(),
+        };
+        self.reset_scroll();
+    }
+
+    /// The running power-schedule countdown, if any -- for the `status`
+    /// report.
+    pub fn countdown_summary(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Countdown {
+                action,
+                deadline,
+                label,
+            } => Some(format!(
+                "{} in {}s ({label}; any front-panel button cancels)",
+                action.label(),
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            )),
+            _ => None,
         }
     }
 
@@ -703,6 +773,25 @@ impl AppState {
             return Effect::Render(String::new(), String::new());
         }
 
+        // Checked before `refresh_stale`, which can block on slow
+        // subprocesses, so a shutdown isn't held up behind a SMART scan.
+        if let Mode::Countdown {
+            action,
+            deadline,
+            label,
+        } = &self.mode
+            && Instant::now() >= *deadline
+        {
+            let action = *action;
+            crate::syslog::warning(&format!(
+                "power schedule: {label}: countdown over, running {}",
+                action.label().to_ascii_lowercase()
+            ));
+            self.mode = Mode::Status;
+            self.apply_pending_override();
+            return Effect::RunAction(action);
+        }
+
         self.refresh_stale();
 
         // Expire a timed-out override.
@@ -784,6 +873,16 @@ impl AppState {
                 format!("CONFIRM {}?", action.label()),
                 "ENTER=yes BACK=no".to_string(),
             ),
+            Mode::Countdown {
+                action, deadline, ..
+            } => (
+                format!(
+                    "{} IN {}",
+                    action.label(),
+                    countdown_text(deadline.saturating_duration_since(Instant::now()))
+                ),
+                "ANY KEY: CANCEL".to_string(),
+            ),
         };
 
         let cap = self.cfg.display.scroll_max_chars;
@@ -847,6 +946,18 @@ impl AppState {
 
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// Time left on a countdown, rounded up so it never shows 0 while there's
+/// still time: "0:42", or whole minutes ("15m") from 10 minutes up, so
+/// "SHUTDOWN IN ..." always fits on one 16-char line without scrolling.
+fn countdown_text(left: Duration) -> String {
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    if secs >= 600 {
+        format!("{}m", secs.div_ceil(60))
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1035,81 @@ mod tests {
         assert!(s.sleeping);
         assert!(active(&s).is_none());
         assert!(!test_writes::wrote("blue:power", "brightness", "1"));
+    }
+
+    fn lines(effect: Effect) -> (String, String) {
+        match effect {
+            Effect::Render(l0, l1) => (l0, l1),
+            _ => panic!("expected a render"),
+        }
+    }
+
+    #[test]
+    fn countdown_shows_then_runs_the_action() {
+        let mut s = state();
+        s.start_countdown(Action::Shutdown, 60, "#1 test");
+        let (l0, l1) = lines(s.render());
+        assert_eq!(l0, "SHUTDOWN IN 1:00");
+        assert_eq!(l1, "ANY KEY: CANCEL");
+        assert!(s.countdown_summary().is_some());
+
+        let mut s = state();
+        s.start_countdown(Action::Restart, 0, "#1 test");
+        assert!(matches!(s.tick(), Effect::RunAction(Action::Restart)));
+        assert!(matches!(s.mode, Mode::Status));
+    }
+
+    #[test]
+    fn any_key_cancels_a_countdown() {
+        for key in [Key::Up, Key::Down, Key::Back, Key::Enter, Key::Wake] {
+            let mut s = state();
+            s.start_countdown(Action::Shutdown, 60, "#1 test");
+            assert!(!matches!(s.handle_key(key), Effect::RunAction(_)));
+            assert!(matches!(s.mode, Mode::Status), "{key:?}");
+            assert_eq!(active(&s), Some((Level::Info, "SHUTDOWN")));
+        }
+    }
+
+    #[test]
+    fn countdown_takes_over_the_menu_and_holds_socket_messages() {
+        let mut s = state();
+        s.handle_key(Key::Enter); // action menu open
+        s.start_countdown(Action::Restart, 60, "#1 test");
+        assert!(matches!(s.mode, Mode::Countdown { .. }));
+        show(&mut s, Level::Error, "DISK");
+        assert!(active(&s).is_none(), "countdown must not be interrupted");
+        // A shutdown due meanwhile upgrades it; nothing downgrades it.
+        s.start_countdown(Action::Shutdown, 600, "#2 test");
+        s.start_countdown(Action::Restart, 600, "#3 test");
+        assert!(matches!(
+            s.mode,
+            Mode::Countdown {
+                action: Action::Shutdown,
+                ..
+            }
+        ));
+        s.handle_key(Key::Back);
+        assert_eq!(active(&s), Some((Level::Error, "DISK")));
+    }
+
+    #[test]
+    fn countdown_wakes_the_panel_and_keeps_it_awake() {
+        let mut s = state();
+        s.sleeping = true;
+        s.set_schedule_sleep_wanted(true);
+        s.start_countdown(Action::Shutdown, 60, "#1 test");
+        assert!(!s.sleeping);
+        let (l0, _) = lines(s.tick());
+        assert!(l0.starts_with("SHUTDOWN IN"), "{l0}");
+        assert!(!s.sleeping);
+    }
+
+    #[test]
+    fn countdown_text_fits_the_panel() {
+        assert_eq!(countdown_text(Duration::from_millis(41_200)), "0:42");
+        assert_eq!(countdown_text(Duration::from_secs(599)), "9:59");
+        assert_eq!(countdown_text(Duration::from_secs(3600)), "60m");
+        assert!(format!("SHUTDOWN IN {}", countdown_text(Duration::from_secs(599))).len() <= 16);
     }
 
     #[test]
