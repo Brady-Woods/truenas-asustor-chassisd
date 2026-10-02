@@ -462,14 +462,13 @@ fn nvme_temp_for(dev_name: &str) -> Option<f32> {
         .rsplit_once('n')
         .map(|(ctrl, _ns)| ctrl)
         .unwrap_or(dev_name);
-    for hwmon in glob_hwmon("nvme")? {
-        let device_link = std::fs::read_link(format!("{hwmon}/device")).ok()?;
-        let link_name = device_link.file_name()?.to_string_lossy().to_string();
-        if link_name == controller {
-            return read_sysfs_f32(&format!("{hwmon}/temp1_input"));
-        }
-    }
-    None
+    // An hwmon whose `device` link can't be read is skipped, not treated
+    // as the end of the search.
+    let hwmon = glob_hwmon("nvme")?.into_iter().find(|hwmon| {
+        std::fs::read_link(format!("{hwmon}/device"))
+            .is_ok_and(|link| link.file_name().is_some_and(|n| n == controller))
+    })?;
+    read_sysfs_f32(&format!("{hwmon}/temp1_input"))
 }
 
 pub(crate) fn read_sysfs_f32(path: &str) -> Option<f32> {
@@ -616,7 +615,12 @@ pub(crate) fn all_connected_temps() -> Vec<(String, String, f32)> {
 
 pub(crate) fn coretemp_package() -> Option<f32> {
     for hwmon in glob_hwmon("coretemp")? {
-        for entry in std::fs::read_dir(&hwmon).ok()?.flatten() {
+        // A transiently unreadable instance is skipped, not the end of
+        // the search.
+        let Ok(entries) = std::fs::read_dir(&hwmon) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("temp") && name.ends_with("_label") {
