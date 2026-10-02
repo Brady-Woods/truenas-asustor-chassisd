@@ -582,10 +582,17 @@ The binary doubles as a CLI for testing against the hardware directly
 (all of this is how the protocol above was originally verified):
 
 ```sh
+lcm-status daemon [path]           # run the daemon (what the systemd unit does)
 lcm-status init                    # send the power-on sequence
 lcm-status settext 0 "HELLO"       # write up to 16 chars to line 0 or 1
 lcm-status listen 60               # print every unsolicited frame (button
                                     # presses, MCU version reports) for 60s
 lcm-status hal-test [path]         # dump every screen, rendered with that config's templates
 lcm-status check-config [path]     # parse and print a config file
+lcm-status --help                  # usage
 ```
+
+An unrecognized subcommand is an error (exit status 2), not a config
+path. Only `daemon` (or a bare argument that looks like a path, the
+form older unit files used) starts the daemon, and the daemon refuses to
+start if another instance is already listening on the socket.

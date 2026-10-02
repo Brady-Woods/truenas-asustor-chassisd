@@ -19,10 +19,7 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
-pub fn run(config_path: &Path) {
-    let args: Vec<String> = std::env::args().collect();
-    let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-
+pub fn run(config_path: &Path, assume_yes: bool) {
     if !running_as_root() {
         eprintln!("must run as root (reads/writes hwmon pwm files)");
         std::process::exit(1);

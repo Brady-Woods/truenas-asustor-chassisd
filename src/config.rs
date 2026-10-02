@@ -791,7 +791,14 @@ impl Config {
                     Config::default()
                 }
             },
-            Err(_) => Config::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("{} not found, using defaults", path.display());
+                Config::default()
+            }
+            Err(e) => {
+                eprintln!("failed to read {}: {e}, using defaults", path.display());
+                Config::default()
+            }
         }
     }
 }
