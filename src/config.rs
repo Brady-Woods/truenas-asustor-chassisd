@@ -612,7 +612,8 @@ pub struct FanProfile {
     /// -- see fan.rs for why that's not min_pwm; same as upstream
     /// fancontrol).
     pub min_stop_pwm: u8,
-    /// PWM used flat at/below min_temp_c.
+    /// PWM used flat at/below min_temp_c. 0 lets the fan stop there; it's
+    /// kicked with `min_start_pwm` when the curve next wants it spinning.
     pub min_pwm: u8,
     /// PWM used flat at/above max_temp_c. 255 = fully on.
     pub max_pwm: u8,
