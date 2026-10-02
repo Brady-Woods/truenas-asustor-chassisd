@@ -205,7 +205,9 @@ pub struct LedConfig {
 
 impl Default for LedConfig {
     fn default() -> Self {
-        LedConfig { nic_mode: crate::led::NicLedMode::Link }
+        LedConfig {
+            nic_mode: crate::led::NicLedMode::Link,
+        }
     }
 }
 
@@ -267,8 +269,13 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 5] =
-        [Category::Network, Category::Pools, Category::Hdd, Category::Temperature, Category::Docker];
+    pub const ALL: [Category; 5] = [
+        Category::Network,
+        Category::Pools,
+        Category::Hdd,
+        Category::Temperature,
+        Category::Docker,
+    ];
 }
 
 impl ScreensConfig {
@@ -296,7 +303,10 @@ pub struct ScreenTemplate {
 
 impl ScreenTemplate {
     fn new(line0: &str, line1: &str) -> Self {
-        ScreenTemplate { line0: line0.to_string(), line1: line1.to_string() }
+        ScreenTemplate {
+            line0: line0.to_string(),
+            line1: line1.to_string(),
+        }
     }
 }
 
@@ -347,26 +357,40 @@ impl TemplatesConfig {
     pub fn validate(&mut self) -> Vec<String> {
         let defaults = TemplatesConfig::default();
         let mut errors = Vec::new();
-        let mut check = |kind: &str, tpl: &mut ScreenTemplate, default: ScreenTemplate, vars: &[&str]| {
-            let problem = [&tpl.line0, &tpl.line1].into_iter().find_map(|line| {
-                match crate::template::placeholders(line) {
-                    Err(e) => Some(e),
-                    Ok(names) => names.into_iter().find(|n| !vars.contains(n)).map(|n| {
-                        format!("unknown variable {{{n}}} in \"{line}\" (available: {})", vars.join(", "))
-                    }),
+        let mut check =
+            |kind: &str, tpl: &mut ScreenTemplate, default: ScreenTemplate, vars: &[&str]| {
+                let problem = [&tpl.line0, &tpl.line1].into_iter().find_map(|line| {
+                    match crate::template::placeholders(line) {
+                        Err(e) => Some(e),
+                        Ok(names) => names.into_iter().find(|n| !vars.contains(n)).map(|n| {
+                            format!(
+                                "unknown variable {{{n}}} in \"{line}\" (available: {})",
+                                vars.join(", ")
+                            )
+                        }),
+                    }
+                });
+                if let Some(p) = problem {
+                    errors.push(format!("[templates.{kind}]: {p}; using the default"));
+                    *tpl = default;
                 }
-            });
-            if let Some(p) = problem {
-                errors.push(format!("[templates.{kind}]: {p}; using the default"));
-                *tpl = default;
-            }
-        };
-        check("network", &mut self.network, defaults.network, Self::NETWORK_VARS);
+            };
+        check(
+            "network",
+            &mut self.network,
+            defaults.network,
+            Self::NETWORK_VARS,
+        );
         check("pool", &mut self.pool, defaults.pool, Self::POOL_VARS);
         check("hdd", &mut self.hdd, defaults.hdd, Self::HDD_VARS);
         check("cpu", &mut self.cpu, defaults.cpu, Self::CPU_VARS);
         check("fan", &mut self.fan, defaults.fan, Self::FAN_VARS);
-        check("docker", &mut self.docker, defaults.docker, Self::DOCKER_VARS);
+        check(
+            "docker",
+            &mut self.docker,
+            defaults.docker,
+            Self::DOCKER_VARS,
+        );
         errors
     }
 }
@@ -431,7 +455,11 @@ pub struct TempThresholdOverride {
 
 impl Default for TempThresholdOverride {
     fn default() -> Self {
-        TempThresholdOverride { chip: String::new(), warn_threshold: 75.0, critical_threshold: 85.0 }
+        TempThresholdOverride {
+            chip: String::new(),
+            warn_threshold: 75.0,
+            critical_threshold: 85.0,
+        }
     }
 }
 
@@ -465,9 +493,21 @@ impl Default for TempThresholdOverride {
 /// revisiting if Marvell's actual datasheet ever turns up.
 pub fn default_temp_thresholds() -> Vec<TempThresholdOverride> {
     vec![
-        TempThresholdOverride { chip: "coretemp".to_string(), warn_threshold: 85.0, critical_threshold: 100.0 },
-        TempThresholdOverride { chip: "drivetemp".to_string(), warn_threshold: 50.0, critical_threshold: 60.0 },
-        TempThresholdOverride { chip: "nvme".to_string(), warn_threshold: 60.0, critical_threshold: 70.0 },
+        TempThresholdOverride {
+            chip: "coretemp".to_string(),
+            warn_threshold: 85.0,
+            critical_threshold: 100.0,
+        },
+        TempThresholdOverride {
+            chip: "drivetemp".to_string(),
+            warn_threshold: 50.0,
+            critical_threshold: 60.0,
+        },
+        TempThresholdOverride {
+            chip: "nvme".to_string(),
+            warn_threshold: 60.0,
+            critical_threshold: 70.0,
+        },
     ]
 }
 
@@ -700,7 +740,11 @@ pub fn default_fans() -> Vec<FanProfile> {
         sensors: vec![
             // CPU: no override -- shares this fan's own curve (45-90C),
             // the original hand-tuned values.
-            SensorSelector { chip: "coretemp".to_string(), label: Some("Package".to_string()), ..Default::default() },
+            SensorSelector {
+                chip: "coretemp".to_string(),
+                label: Some("Package".to_string()),
+                ..Default::default()
+            },
             // Drive/NVMe: overridden to their own warn/critical thresholds
             // from `default_temp_thresholds()` (50/60C, 60/70C) rather than
             // sharing the CPU's 45-90C curve -- a drive/SSD at its own
@@ -778,8 +822,9 @@ mod tests {
 
     #[test]
     fn unknown_variable_falls_back_per_screen() {
-        let (cfg, errors) =
-            parse("[templates.pool]\nline1 = \"{fre} free\"\n[templates.fan]\nline0 = \"CHASSIS\"\n");
+        let (cfg, errors) = parse(
+            "[templates.pool]\nline1 = \"{fre} free\"\n[templates.fan]\nline0 = \"CHASSIS\"\n",
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("{fre}"));
         assert_eq!(cfg.templates.pool.line1, "{alloc}/{size} {cap}");
@@ -791,7 +836,13 @@ mod tests {
         let (cfg, _) = parse("[screens]\norder = [\"docker\", \"hdd\", \"docker\"]\n");
         assert_eq!(
             cfg.screens.effective_order(),
-            vec![Category::Docker, Category::Hdd, Category::Network, Category::Pools, Category::Temperature]
+            vec![
+                Category::Docker,
+                Category::Hdd,
+                Category::Network,
+                Category::Pools,
+                Category::Temperature
+            ]
         );
     }
 }

@@ -74,16 +74,32 @@ pub fn build(state: &AppState, fans: &[FanController], cfg: &Config) -> String {
     };
     let with_ip = hal::ip_by_iface();
     for iface in hal::physical_nics() {
-        let addr = with_ip.get(&iface).cloned().unwrap_or_else(|| hal::nic_link_text(&iface));
+        let addr = with_ip
+            .get(&iface)
+            .cloned()
+            .unwrap_or_else(|| hal::nic_link_text(&iface));
         let is_monitored = cfg.network.enabled && monitored.contains(&iface);
-        let link = if led::link_is_down(&iface) { "down" } else { "up" };
-        let tag = if is_monitored { "monitored" } else { "not monitored" };
+        let link = if led::link_is_down(&iface) {
+            "down"
+        } else {
+            "up"
+        };
+        let tag = if is_monitored {
+            "monitored"
+        } else {
+            "not monitored"
+        };
         out.push_str(&format!("  {iface:<10} {addr:<20} {tag}, link {link}\n"));
     }
     out.push('\n');
 
     out.push_str("-- Active override --\n");
-    out.push_str(&format!("  {}\n\n", state.override_summary().unwrap_or_else(|| "none".to_string())));
+    out.push_str(&format!(
+        "  {}\n\n",
+        state
+            .override_summary()
+            .unwrap_or_else(|| "none".to_string())
+    ));
 
     out.push_str("-- Overall status LED --\n");
     out.push_str(&format!(

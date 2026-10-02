@@ -79,7 +79,9 @@ fn parse_message(lines: &[String]) -> Option<SocketCommand> {
     let mut parts = first.split_whitespace();
 
     match parts.next()?.to_ascii_uppercase().as_str() {
-        "CLEAR" => Some(SocketCommand::Clear { bay: parse_bay(parts) }),
+        "CLEAR" => Some(SocketCommand::Clear {
+            bay: parse_bay(parts),
+        }),
         "SHOW" => {
             let level = Level::parse(parts.next()?);
             let ttl_secs = parts.next()?.parse().ok()?;
@@ -163,7 +165,10 @@ fn set_socket_perms(path: &str, group: &str) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
     // Best-effort chgrp; if the group doesn't exist yet, leave root:root and
     // let the operator create it (documented in the systemd unit / README).
-    let _ = std::process::Command::new("chgrp").arg(group).arg(path).status();
+    let _ = std::process::Command::new("chgrp")
+        .arg(group)
+        .arg(path)
+        .status();
 }
 
 #[cfg(test)]
@@ -178,7 +183,13 @@ mod tests {
     fn parses_show_critical() {
         let cmd = parse_message(&lines("SHOW critical 0\nDISK FAILURE\nCheck bay 3")).unwrap();
         match cmd {
-            SocketCommand::Show { level, ttl_secs, bay, line0, line1 } => {
+            SocketCommand::Show {
+                level,
+                ttl_secs,
+                bay,
+                line0,
+                line1,
+            } => {
                 assert_eq!(level, Level::Critical);
                 assert_eq!(ttl_secs, 0);
                 assert_eq!(bay, None);
@@ -222,7 +233,13 @@ mod tests {
     fn parses_bare_text_shorthand() {
         let cmd = parse_message(&lines("hello there\nsecond line")).unwrap();
         match cmd {
-            SocketCommand::Show { level, ttl_secs, bay, line0, line1 } => {
+            SocketCommand::Show {
+                level,
+                ttl_secs,
+                bay,
+                line0,
+                line1,
+            } => {
                 assert_eq!(level, Level::Info);
                 assert_eq!(ttl_secs, 5);
                 assert_eq!(bay, None);

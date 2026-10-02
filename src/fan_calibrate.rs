@@ -45,7 +45,10 @@ pub fn run(config_path: &Path) {
         println!("  {} pwm{} (chip at {})", c.chip_name, c.pwm_index, c.hwmon);
     }
     println!();
-    println!("About to sweep {} pwm output(s) to find which fans respond and their", candidates.len());
+    println!(
+        "About to sweep {} pwm output(s) to find which fans respond and their",
+        candidates.len()
+    );
     println!("real min-start/min-stop PWM. Each fan will briefly ramp through its full");
     println!("range (roughly 30-60s per output) -- normal, expected, not a malfunction.");
     println!();
@@ -58,7 +61,9 @@ pub fn run(config_path: &Path) {
     let daemon_was_active = systemctl_is_active("lcm-status.service");
     if daemon_was_active {
         println!("Stopping lcm-status.service for the duration of this sweep...");
-        let _ = std::process::Command::new("systemctl").args(["stop", "lcm-status.service"]).status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["stop", "lcm-status.service"])
+            .status();
     }
 
     let mut results = Vec::new();
@@ -71,7 +76,9 @@ pub fn run(config_path: &Path) {
     if daemon_was_active {
         println!();
         println!("Restarting lcm-status.service...");
-        let _ = std::process::Command::new("systemctl").args(["start", "lcm-status.service"]).status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["start", "lcm-status.service"])
+            .status();
     }
 
     println!();
@@ -79,7 +86,13 @@ pub fn run(config_path: &Path) {
     let mut found_any = false;
     for r in &results {
         match r {
-            CalibrationResult::Found { candidate, fan_index, min_start_pwm, min_stop_pwm, max_pwm_rpm } => {
+            CalibrationResult::Found {
+                candidate,
+                fan_index,
+                min_start_pwm,
+                min_stop_pwm,
+                max_pwm_rpm,
+            } => {
                 found_any = true;
                 println!(
                     "  {} pwm{} -> fan{}: min_start_pwm={min_start_pwm} min_stop_pwm={min_stop_pwm} (max ~{max_pwm_rpm:.0} RPM)",
@@ -87,7 +100,10 @@ pub fn run(config_path: &Path) {
                 );
             }
             CalibrationResult::NoFanDetected { candidate } => {
-                println!("  {} pwm{} -> no fan responded, skipping", candidate.chip_name, candidate.pwm_index);
+                println!(
+                    "  {} pwm{} -> no fan responded, skipping",
+                    candidate.chip_name, candidate.pwm_index
+                );
             }
         }
     }
@@ -102,7 +118,14 @@ pub fn run(config_path: &Path) {
     println!("== Proposed config (review before using -- see comments) ==");
     println!();
     for (i, r) in results.iter().enumerate() {
-        if let CalibrationResult::Found { candidate, fan_index, min_start_pwm, min_stop_pwm, .. } = r {
+        if let CalibrationResult::Found {
+            candidate,
+            fan_index,
+            min_start_pwm,
+            min_stop_pwm,
+            ..
+        } = r
+        {
             print_proposed_toml(i, candidate, *fan_index, *min_start_pwm, *min_stop_pwm);
         }
     }
@@ -111,7 +134,10 @@ pub fn run(config_path: &Path) {
     println!("# preferences. Pick `sensors` from the inventory printed above (chip name");
     println!("# is enough for most; add `label`/`input` to narrow a multi-sensor chip).");
     println!();
-    println!("Append the block(s) above to {} under `[[fans]]`,", config_path.display());
+    println!(
+        "Append the block(s) above to {} under `[[fans]]`,",
+        config_path.display()
+    );
     println!("or replace its existing `[[fans]]` entries, then restart lcm-status.service.");
 }
 
@@ -138,7 +164,9 @@ fn print_sensor_inventory() {
             match connected {
                 Some(t) => println!("  [connected]    {chip} {input}{label_str}: {t:.1}C"),
                 None => {
-                    let raw_str = raw.map(|r| format!("{:.1}C raw", r as f32 / 1000.0)).unwrap_or_else(|| "unreadable".to_string());
+                    let raw_str = raw
+                        .map(|r| format!("{:.1}C raw", r as f32 / 1000.0))
+                        .unwrap_or_else(|| "unreadable".to_string());
                     println!("  [unconnected]  {chip} {input}{label_str}: {raw_str} (fault flag set, or outside plausible range)");
                 }
             }
@@ -159,8 +187,16 @@ struct PwmCandidate {
 }
 
 enum CalibrationResult<'a> {
-    Found { candidate: &'a PwmCandidate, fan_index: u32, min_start_pwm: u8, min_stop_pwm: u8, max_pwm_rpm: f32 },
-    NoFanDetected { candidate: &'a PwmCandidate },
+    Found {
+        candidate: &'a PwmCandidate,
+        fan_index: u32,
+        min_start_pwm: u8,
+        min_stop_pwm: u8,
+        max_pwm_rpm: f32,
+    },
+    NoFanDetected {
+        candidate: &'a PwmCandidate,
+    },
 }
 
 fn find_pwm_candidates() -> Vec<PwmCandidate> {
@@ -170,7 +206,11 @@ fn find_pwm_candidates() -> Vec<PwmCandidate> {
             continue;
         }
         for idx in pwm_indices(&hwmon) {
-            out.push(PwmCandidate { hwmon: hwmon.clone(), chip_name: chip.clone(), pwm_index: idx });
+            out.push(PwmCandidate {
+                hwmon: hwmon.clone(),
+                chip_name: chip.clone(),
+                pwm_index: idx,
+            });
         }
     }
     out
@@ -228,7 +268,8 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
     let fans = fan_indices(&c.hwmon);
 
     // Save original state to restore afterward, whatever we find.
-    let orig_enable = std::fs::read_to_string(format!("{}/pwm{}_enable", c.hwmon, c.pwm_index)).ok();
+    let orig_enable =
+        std::fs::read_to_string(format!("{}/pwm{}_enable", c.hwmon, c.pwm_index)).ok();
     let orig_pwm = std::fs::read_to_string(format!("{}/pwm{}", c.hwmon, c.pwm_index)).ok();
     let restore = || {
         if let Some(v) = &orig_pwm {
@@ -240,7 +281,9 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
     };
 
     if fans.is_empty() {
-        println!("  no tachometer inputs on this chip at all -- can't confirm a fan responds, skipping");
+        println!(
+            "  no tachometer inputs on this chip at all -- can't confirm a fan responds, skipping"
+        );
         return CalibrationResult::NoFanDetected { candidate: c };
     }
 
@@ -259,17 +302,31 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
     println!("  probing for a real response (max -> low -> max, not just nonzero RPM)...");
     set_pwm(&c.hwmon, c.pwm_index, 255);
     sleep(Duration::from_secs(2));
-    let hi1: Vec<(u32, f32)> = fans.iter().map(|&i| (i, read_fan_rpm(&c.hwmon, i))).collect();
+    let hi1: Vec<(u32, f32)> = fans
+        .iter()
+        .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
+        .collect();
 
     set_pwm(&c.hwmon, c.pwm_index, 20);
     sleep(Duration::from_secs(3));
-    let lo: Vec<(u32, f32)> = fans.iter().map(|&i| (i, read_fan_rpm(&c.hwmon, i))).collect();
+    let lo: Vec<(u32, f32)> = fans
+        .iter()
+        .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
+        .collect();
 
     set_pwm(&c.hwmon, c.pwm_index, 255);
     sleep(Duration::from_secs(3));
-    let hi2: Vec<(u32, f32)> = fans.iter().map(|&i| (i, read_fan_rpm(&c.hwmon, i))).collect();
+    let hi2: Vec<(u32, f32)> = fans
+        .iter()
+        .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
+        .collect();
 
-    let get = |v: &[(u32, f32)], i: u32| v.iter().find(|(idx, _)| *idx == i).map(|&(_, v)| v).unwrap_or(0.0);
+    let get = |v: &[(u32, f32)], i: u32| {
+        v.iter()
+            .find(|(idx, _)| *idx == i)
+            .map(|&(_, v)| v)
+            .unwrap_or(0.0)
+    };
     let best = fans
         .iter()
         .filter_map(|&i| {
@@ -353,7 +410,9 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
         println!("  never stalled, even at pwm=0 -- this fan free-spins at any commanded");
         println!("  duty on this hardware. min_start_pwm isn't meaningful here; reporting");
         println!("  min_stop_pwm={min_stop_pwm} as a floor only -- sanity-check this against");
-        println!("  noise/stability at low speed, don't just take the empirical zero at face value.");
+        println!(
+            "  noise/stability at low speed, don't just take the empirical zero at face value."
+        );
     }
 
     restore();
@@ -366,8 +425,18 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
     }
 }
 
-fn print_proposed_toml(index: usize, c: &PwmCandidate, fan_index: u32, min_start_pwm: u8, min_stop_pwm: u8) {
-    let name = if index == 0 { "chassis".to_string() } else { format!("fan{index}") };
+fn print_proposed_toml(
+    index: usize,
+    c: &PwmCandidate,
+    fan_index: u32,
+    min_start_pwm: u8,
+    min_stop_pwm: u8,
+) {
+    let name = if index == 0 {
+        "chassis".to_string()
+    } else {
+        format!("fan{index}")
+    };
     println!("[[fans]]");
     println!("name = \"{name}\"");
     println!("pwm_chip = \"{}\"", c.chip_name);

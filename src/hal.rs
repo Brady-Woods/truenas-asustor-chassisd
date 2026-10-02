@@ -57,7 +57,11 @@ pub fn configured_nics() -> Vec<String> {
     out.lines()
         .filter_map(|line| {
             // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
-            let iface = line.split_whitespace().nth(1)?.trim_end_matches(':').to_string();
+            let iface = line
+                .split_whitespace()
+                .nth(1)?
+                .trim_end_matches(':')
+                .to_string();
             std::path::Path::new(&format!("/sys/class/net/{iface}/device"))
                 .exists()
                 .then_some(iface)
@@ -96,11 +100,17 @@ pub(crate) fn ip_by_iface() -> std::collections::HashMap<String, String> {
 /// (no carrier) for an interface with no address -- see `network()`'s doc
 /// comment for why that distinction is worth making at all.
 pub(crate) fn nic_link_text(iface: &str) -> String {
-    if carrier_up(iface) { "connected, no IP".to_string() } else { "disconnected".to_string() }
+    if carrier_up(iface) {
+        "connected, no IP".to_string()
+    } else {
+        "disconnected".to_string()
+    }
 }
 
 fn carrier_up(iface: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")).map(|s| s.trim() == "1").unwrap_or(false)
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// One screen per *every* physical NIC (`physical_nics()`, not just
@@ -120,10 +130,19 @@ pub fn network(tpl: &ScreenTemplate) -> Vec<Screen> {
         .map(|iface| {
             let ip = with_ip.get(&iface).map(String::as_str).unwrap_or("");
             let link = if carrier_up(&iface) { "up" } else { "down" };
-            let ip_or_status = if ip.is_empty() { nic_link_text(&iface) } else { ip.to_string() };
+            let ip_or_status = if ip.is_empty() {
+                nic_link_text(&iface)
+            } else {
+                ip.to_string()
+            };
             render(
                 tpl,
-                &[("iface", &iface), ("ip", ip), ("link", link), ("ip_or_status", &ip_or_status)],
+                &[
+                    ("iface", &iface),
+                    ("ip", ip),
+                    ("link", link),
+                    ("ip_or_status", &ip_or_status),
+                ],
             )
         })
         .collect();
@@ -184,7 +203,14 @@ pub fn pools(tpl: &ScreenTemplate) -> Vec<Screen> {
             let health = f.next().unwrap_or("?");
             render(
                 tpl,
-                &[("name", name), ("size", size), ("alloc", alloc), ("free", free), ("cap", cap), ("health", health)],
+                &[
+                    ("name", name),
+                    ("size", size),
+                    ("alloc", alloc),
+                    ("free", free),
+                    ("cap", cap),
+                    ("health", health),
+                ],
             )
         })
         .collect()
@@ -293,7 +319,13 @@ pub fn hdd(cfg: &Config) -> Vec<Screen> {
 
             render(
                 &cfg.templates.hdd,
-                &[("label", &label), ("bay", &bay), ("dev", d), ("status", &status), ("temp", &temp)],
+                &[
+                    ("label", &label),
+                    ("bay", &bay),
+                    ("dev", d),
+                    ("status", &status),
+                    ("temp", &temp),
+                ],
             )
         })
         .collect()
@@ -329,8 +361,19 @@ fn display_temp(celsius: f32, units: TempUnits) -> (f32, &'static str) {
 
 fn cpu_screen(celsius: f32, cfg: &Config) -> Screen {
     let (val, unit) = display_temp(celsius, cfg.temperature.units);
-    let warn = if celsius >= cfg.temperature.warn_threshold { " !" } else { "" };
-    render(&cfg.templates.cpu, &[("temp", &format!("{val:.0}")), ("unit", unit), ("warn", warn)])
+    let warn = if celsius >= cfg.temperature.warn_threshold {
+        " !"
+    } else {
+        ""
+    };
+    render(
+        &cfg.templates.cpu,
+        &[
+            ("temp", &format!("{val:.0}")),
+            ("unit", unit),
+            ("warn", warn),
+        ],
+    )
 }
 
 /// Resolves a block device to its physical bay number via
@@ -346,7 +389,10 @@ fn cpu_screen(celsius: f32, cfg: &Config) -> Screen {
 /// would silently shift if a second controller (e.g. a PCIe SATA card)
 /// were ever added.
 fn ata_port_for(dev_name: &str) -> Option<u32> {
-    let out = run("udevadm", &["info", "-q", "property", &format!("/dev/{dev_name}")])?;
+    let out = run(
+        "udevadm",
+        &["info", "-q", "property", &format!("/dev/{dev_name}")],
+    )?;
     let devpath = out.lines().find(|l| l.starts_with("DEVPATH="))?;
     let ata_node = devpath.split('/').find(|seg| seg.starts_with("ata"))?;
     std::fs::read_to_string(format!("/sys/class/ata_port/{ata_node}/port_no"))
@@ -360,7 +406,10 @@ fn ata_port_for(dev_name: &str) -> Option<u32> {
 /// controller ("nvme0") via the hwmon's `device` symlink target.
 fn nvme_temp_for(dev_name: &str) -> Option<f32> {
     // "nvme0n1" -> "nvme0" (split at the last 'n', which introduces the namespace number)
-    let controller = dev_name.rsplit_once('n').map(|(ctrl, _ns)| ctrl).unwrap_or(dev_name);
+    let controller = dev_name
+        .rsplit_once('n')
+        .map(|(ctrl, _ns)| ctrl)
+        .unwrap_or(dev_name);
     for hwmon in glob_hwmon("nvme")? {
         let device_link = std::fs::read_link(format!("{hwmon}/device")).ok()?;
         let link_name = device_link.file_name()?.to_string_lossy().to_string();
@@ -443,7 +492,8 @@ pub(crate) fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> 
         };
         for input in inputs {
             if let Some(wanted_label) = &sel.label {
-                let label = std::fs::read_to_string(format!("{hwmon}/{input}_label")).unwrap_or_default();
+                let label =
+                    std::fs::read_to_string(format!("{hwmon}/{input}_label")).unwrap_or_default();
                 if !label.contains(wanted_label.as_str()) {
                     continue;
                 }
@@ -470,7 +520,10 @@ pub(crate) fn all_hwmon() -> Vec<(String, String)> {
         .flatten()
         .filter_map(|e| {
             let path = e.path().to_string_lossy().to_string();
-            let name = std::fs::read_to_string(format!("{path}/name")).ok()?.trim().to_string();
+            let name = std::fs::read_to_string(format!("{path}/name"))
+                .ok()?
+                .trim()
+                .to_string();
             (!name.is_empty()).then_some((path, name))
         })
         .collect();
@@ -611,7 +664,8 @@ pub fn docker_issues(ignore: &[String], tpl: &ScreenTemplate) -> Vec<Screen> {
             if ignore.iter().any(|i| i == name) {
                 return None;
             }
-            let ok = status.contains("(healthy)") || (status.starts_with("Up") && !status.contains('('));
+            let ok =
+                status.contains("(healthy)") || (status.starts_with("Up") && !status.contains('('));
             if ok {
                 None
             } else {

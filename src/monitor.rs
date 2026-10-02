@@ -95,7 +95,9 @@ impl HealthMonitor {
                 )),
                 _ => {
                     if prev.is_some() {
-                        crate::syslog::notice(&format!("{label}: back to {temp_c:.1}C, below warning threshold"));
+                        crate::syslog::notice(&format!(
+                            "{label}: back to {temp_c:.1}C, below warning threshold"
+                        ));
                     }
                 }
             }
@@ -107,7 +109,11 @@ impl HealthMonitor {
     /// transition-gated like the logging above (the LED always reflects
     /// "right now", syslog is specifically for "something changed").
     pub fn worst_temp_level(&self) -> Level {
-        self.temp_levels.values().copied().max().unwrap_or(Level::Info)
+        self.temp_levels
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(Level::Info)
     }
 
     /// Whether any bay currently reports a confirmed SMART failure --
@@ -157,10 +163,14 @@ impl HealthMonitor {
                 continue;
             }
             match state {
-                BayState::Failed => crate::syslog::critical(&format!("bay {bay}: SMART reports FAILED")),
+                BayState::Failed => {
+                    crate::syslog::critical(&format!("bay {bay}: SMART reports FAILED"))
+                }
                 _ => {
                     if prev == Some(BayState::Failed) {
-                        crate::syslog::notice(&format!("bay {bay}: SMART no longer reports FAILED"));
+                        crate::syslog::notice(&format!(
+                            "bay {bay}: SMART no longer reports FAILED"
+                        ));
                     }
                 }
             }

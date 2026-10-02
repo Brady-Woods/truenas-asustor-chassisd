@@ -6,8 +6,8 @@
 
 use crate::config::{Category, Config};
 use crate::hal::{self, Screen};
-use crate::protocol::Key;
 use crate::led;
+use crate::protocol::Key;
 use crate::socket::{Level, SocketCommand};
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,10 @@ enum Mode {
     /// Normal operation: paging/rotating through gathered screens.
     Status,
     /// ENTER was pressed from Status; choosing an action.
-    ActionMenu { options: Vec<Action>, selection: usize },
+    ActionMenu {
+        options: Vec<Action>,
+        selection: usize,
+    },
     /// An action was selected; awaiting confirm/cancel.
     Confirm { action: Action, deadline: Instant },
 }
@@ -68,7 +71,9 @@ struct CategoryCache {
 
 impl CategoryCache {
     fn stale(&self, floor: Duration) -> bool {
-        self.last_refresh.map(|t| t.elapsed() >= floor).unwrap_or(true)
+        self.last_refresh
+            .map(|t| t.elapsed() >= floor)
+            .unwrap_or(true)
     }
 }
 
@@ -192,7 +197,12 @@ impl AppState {
     /// after `update_health_leds` runs (which would otherwise clobber it
     /// with the plain health-derived state for that bay).
     fn reapply_bay_alert(&self) {
-        if let Some(bay) = self.over.as_ref().filter(|o| o.level.always_visible()).and_then(|o| o.bay) {
+        if let Some(bay) = self
+            .over
+            .as_ref()
+            .filter(|o| o.level.always_visible())
+            .and_then(|o| o.bay)
+        {
             led::set_bay(bay, led::BayState::Alert);
         }
     }
@@ -201,7 +211,11 @@ impl AppState {
     /// bay's alert flash (a cheap, single-bay write -- not a full SMART
     /// re-scan) and recomputes the status LED to match.
     fn sync_leds_to_override(&mut self) {
-        let want = self.over.as_ref().filter(|o| o.level.always_visible()).and_then(|o| o.bay);
+        let want = self
+            .over
+            .as_ref()
+            .filter(|o| o.level.always_visible())
+            .and_then(|o| o.bay);
         if self.alert_bay != want {
             if let Some(old) = self.alert_bay {
                 led::set_bay(old, led::BayState::Normal);
@@ -243,8 +257,9 @@ impl AppState {
 
         let pool_healths = hal::pool_healths();
         let pool_degraded = pool_healths.iter().any(|(_, h)| h == "DEGRADED");
-        let pool_faulted =
-            pool_healths.iter().any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
+        let pool_faulted = pool_healths
+            .iter()
+            .any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
         let bay_failed = self.monitor.any_bay_failed();
         let temp_level = self.monitor.worst_temp_level();
         let network_level = self.network_health_level();
@@ -255,10 +270,19 @@ impl AppState {
         // bay is a confirmed SMART failure (Error -- a failed drive is
         // serious, same tier as a solid-red pool fault, even though it
         // doesn't necessarily mean the pool itself has degraded yet).
-        let general = [self.fan_health, temp_level, network_level, if bay_failed { Level::Error } else { Level::Info }]
-            .into_iter()
-            .max()
-            .unwrap_or(Level::Info);
+        let general = [
+            self.fan_health,
+            temp_level,
+            network_level,
+            if bay_failed {
+                Level::Error
+            } else {
+                Level::Info
+            },
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(Level::Info);
 
         let pattern = if general == Level::Critical {
             StatusPattern::CriticalFlashing
@@ -310,8 +334,11 @@ impl AppState {
         if !net.enabled {
             return Level::Info;
         }
-        let monitored: Vec<String> =
-            if net.monitored_nics.is_empty() { hal::configured_nics() } else { net.monitored_nics.clone() };
+        let monitored: Vec<String> = if net.monitored_nics.is_empty() {
+            hal::configured_nics()
+        } else {
+            net.monitored_nics.clone()
+        };
         if monitored.is_empty() {
             return Level::Info; // nothing configured/in-service to check
         }
@@ -363,7 +390,11 @@ impl AppState {
         let r = &self.cfg.refresh;
         let mut pools_or_hdd_changed = false;
 
-        if self.cfg.screens.network && self.network_cache.stale(Duration::from_secs(r.network_min_secs)) {
+        if self.cfg.screens.network
+            && self
+                .network_cache
+                .stale(Duration::from_secs(r.network_min_secs))
+        {
             self.network_cache.screens = hal::network(&self.cfg.templates.network);
             self.network_cache.last_refresh = Some(Instant::now());
         }
@@ -372,7 +403,10 @@ impl AppState {
         // gate the *display* screen, populated separately below. Alerting
         // has no business being silently disabled because someone turned
         // off an LCD screen.
-        if self.pools_cache.stale(Duration::from_secs(r.pools_min_secs)) {
+        if self
+            .pools_cache
+            .stale(Duration::from_secs(r.pools_min_secs))
+        {
             self.monitor.check_pools(&hal::pool_healths());
             if self.cfg.screens.pools {
                 self.pools_cache.screens = hal::pools(&self.cfg.templates.pool);
@@ -388,7 +422,9 @@ impl AppState {
             pools_or_hdd_changed = true;
         }
         if self.cfg.screens.temperature
-            && self.temperature_cache.stale(Duration::from_secs(r.temperature_min_secs))
+            && self
+                .temperature_cache
+                .stale(Duration::from_secs(r.temperature_min_secs))
         {
             self.temperature_cache.screens = hal::cpu_and_fan(&self.cfg);
             self.temperature_cache.last_refresh = Some(Instant::now());
@@ -396,8 +432,13 @@ impl AppState {
         // Independent of the temperature screen/cache above -- see
         // HealthMonitor::maybe_check_temps.
         self.monitor.maybe_check_temps(&self.cfg);
-        if self.cfg.screens.docker && self.docker_cache.stale(Duration::from_secs(r.docker_min_secs)) {
-            self.docker_cache.screens = hal::docker_issues(&self.cfg.docker.ignore, &self.cfg.templates.docker);
+        if self.cfg.screens.docker
+            && self
+                .docker_cache
+                .stale(Duration::from_secs(r.docker_min_secs))
+        {
+            self.docker_cache.screens =
+                hal::docker_issues(&self.cfg.docker.ignore, &self.cfg.templates.docker);
             self.docker_cache.last_refresh = Some(Instant::now());
         }
 
@@ -468,7 +509,10 @@ impl AppState {
                     if self.eject_available {
                         options.push(Action::Eject);
                     }
-                    self.mode = Mode::ActionMenu { options, selection: 0 };
+                    self.mode = Mode::ActionMenu {
+                        options,
+                        selection: 0,
+                    };
                     Effect::None
                 }
                 _ => Effect::None,
@@ -486,7 +530,8 @@ impl AppState {
                     let action = options[*selection];
                     self.mode = Mode::Confirm {
                         action,
-                        deadline: Instant::now() + Duration::from_secs(self.cfg.menu.confirm_timeout_secs),
+                        deadline: Instant::now()
+                            + Duration::from_secs(self.cfg.menu.confirm_timeout_secs),
                     };
                     Effect::None
                 }
@@ -522,7 +567,8 @@ impl AppState {
         let new = (self.index as isize + delta).rem_euclid(len);
         self.index = new as usize;
         self.auto_rotate = false;
-        self.resume_at = Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
+        self.resume_at =
+            Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
         self.last_dwell = Instant::now();
         self.reset_scroll();
     }
@@ -543,7 +589,13 @@ impl AppState {
                     self.sync_leds_to_override();
                 }
             }
-            SocketCommand::Show { level, ttl_secs, bay, line0, line1 } => {
+            SocketCommand::Show {
+                level,
+                ttl_secs,
+                bay,
+                line0,
+                line1,
+            } => {
                 // error/critical are meant to always be seen: force them to
                 // persist regardless of whatever ttl the caller passed.
                 let expires_at = if level.always_visible() || ttl_secs == 0 {
@@ -551,7 +603,13 @@ impl AppState {
                 } else {
                     Some(Instant::now() + Duration::from_secs(ttl_secs))
                 };
-                let ov = Override { level, expires_at, bay, line0, line1 };
+                let ov = Override {
+                    level,
+                    expires_at,
+                    bay,
+                    line0,
+                    line1,
+                };
 
                 if matches!(self.mode, Mode::Status) {
                     // A higher (or equal) level can replace what's showing;
@@ -712,9 +770,10 @@ impl AppState {
                     "UP/DN ENTER BACK".to_string(),
                 )
             }
-            Mode::Confirm { action, .. } => {
-                (format!("CONFIRM {}?", action.label()), "ENTER=yes BACK=no".to_string())
-            }
+            Mode::Confirm { action, .. } => (
+                format!("CONFIRM {}?", action.label()),
+                "ENTER=yes BACK=no".to_string(),
+            ),
         };
 
         let cap = self.cfg.display.scroll_max_chars;
@@ -725,7 +784,11 @@ impl AppState {
 
     fn scroll_step(&mut self, which: u8, text: String) -> String {
         let cfg = &self.cfg.display;
-        let scroll = if which == 0 { &mut self.scroll0 } else { &mut self.scroll1 };
+        let scroll = if which == 0 {
+            &mut self.scroll0
+        } else {
+            &mut self.scroll1
+        };
 
         if scroll.text != text {
             *scroll = Scroll {

@@ -88,7 +88,8 @@ impl Lcm {
         let fd = port.as_raw_fd();
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
-            tio.c_cflag = libc::B115200 | libc::CLOCAL as libc::tcflag_t
+            tio.c_cflag = libc::B115200
+                | libc::CLOCAL as libc::tcflag_t
                 | libc::CREAD as libc::tcflag_t
                 | libc::CS8 as libc::tcflag_t;
             tio.c_cc[libc::VMIN] = 1;
@@ -100,7 +101,11 @@ impl Lcm {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(Lcm { port, pending: Vec::new(), last_sent: [None, None] })
+        Ok(Lcm {
+            port,
+            pending: Vec::new(),
+            last_sent: [None, None],
+        })
     }
 
     pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
@@ -112,7 +117,10 @@ impl Lcm {
         .raw();
         let n = self.port.write(&frame)?;
         if n != frame.len() {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write to LCM"));
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to LCM",
+            ));
         }
         Ok(())
     }
@@ -133,7 +141,11 @@ impl Lcm {
                 revents: 0,
             };
             let rc = unsafe {
-                libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32)
+                libc::poll(
+                    &mut pfd,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
             };
             if rc <= 0 {
                 break;
@@ -176,7 +188,13 @@ impl Lcm {
     /// it's queued in `pending` and reading continues for our actual ACK
     /// within what's left of `timeout`. Call `take_pending` afterward to
     /// pick up anything that got queued this way.
-    pub fn send_and_ack(&mut self, opcode: u8, subcmd: u8, payload: &[u8], timeout: Duration) -> io::Result<bool> {
+    pub fn send_and_ack(
+        &mut self,
+        opcode: u8,
+        subcmd: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> io::Result<bool> {
         self.send(opcode, subcmd, payload)?;
         let deadline = Instant::now() + timeout;
         loop {
