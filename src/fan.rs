@@ -185,9 +185,6 @@ pub struct FanController {
     /// True while every sensor feeding this fan has stopped reading (and
     /// so the fan is being held at full speed instead).
     sensors_lost: bool,
-    /// `pwmN_enable` as found before this controller first took the fan
-    /// over, restored on exit (see `restore`).
-    original_enable: Option<String>,
 }
 
 impl FanController {
@@ -237,7 +234,6 @@ impl FanController {
             consecutive_stalls: 0,
             low_rpm_warned: false,
             sensors_lost: false,
-            original_enable: None,
         }
     }
 
@@ -271,11 +267,6 @@ impl FanController {
         let Some(hwmon) = self.hwmon.clone() else {
             return; // chip not loaded (yet) -- try again next tick
         };
-        if self.original_enable.is_none() {
-            self.original_enable = std::fs::read_to_string(self.enable_path(&hwmon))
-                .ok()
-                .map(|s| s.trim().to_string());
-        }
 
         let Some(sensor_target) = self.target_pwm_from_sensors() else {
             self.hold_full_speed_without_sensors(&hwmon);
@@ -304,27 +295,25 @@ impl FanController {
             .fan_index
             .and_then(|n| read_sysfs_raw_f32(&format!("{hwmon}/fan{n}_input")));
 
-        match self.plan(sensor_target, rpm) {
-            PwmCommand::Kick(pwm) => {
-                if self.write_pwm(&hwmon, pwm).is_ok() {
-                    self.last_pwm = Some(pwm);
-                    self.kick_until = Some(Instant::now() + Duration::from_secs(1));
-                } else {
-                    self.hwmon = None; // path went stale -- re-resolve next tick
-                }
-            }
-            PwmCommand::Set(pwm) => {
-                // Re-assert manual mode every tick, not just once: some
-                // firmware/hardware resets pwmN_enable back to automatic
-                // on its own, and fancontrol(8) defends against that the
-                // same way.
-                if self.ensure_manual_mode(&hwmon).is_err() || self.write_pwm(&hwmon, pwm).is_err()
-                {
-                    self.hwmon = None;
-                    return;
-                }
-                self.last_pwm = Some(pwm);
-            }
+        let cmd = self.plan(sensor_target, rpm);
+        self.apply(&hwmon, cmd);
+    }
+
+    /// Writes `cmd`, asserting manual mode first -- every time, for kicks
+    /// too. In automatic mode the driver rejects `pwmN` writes outright,
+    /// so a kick that skipped this could never take the fan over (and
+    /// would mistake the rejection for a stale hwmon path, forever). Some
+    /// firmware also resets `pwmN_enable` back to automatic on its own;
+    /// fancontrol(8) re-asserts it every tick for the same reason.
+    fn apply(&mut self, hwmon: &str, cmd: PwmCommand) {
+        let (PwmCommand::Set(pwm) | PwmCommand::Kick(pwm)) = cmd;
+        if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, pwm).is_err() {
+            self.hwmon = None; // path went stale -- re-resolve next tick
+            return;
+        }
+        self.last_pwm = Some(pwm);
+        if matches!(cmd, PwmCommand::Kick(_)) {
+            self.kick_until = Some(Instant::now() + Duration::from_secs(1));
         }
     }
 
@@ -473,12 +462,13 @@ impl FanController {
         self.last_pwm = Some(max);
     }
 
-    /// Hands the fan back on exit (clean shutdown, or unwinding from a
-    /// panic -- this runs from `Drop`), so it never sits at a stale manual
-    /// speed with nothing controlling it. Restores the original
-    /// `pwmN_enable` mode if that was automatic; if it was already manual
-    /// (e.g. left that way by a previous crash) or unknown, leaves it at
-    /// full speed instead, the same fail-safe fancontrol(8) uses.
+    /// Leaves the fan safe on exit (clean shutdown, or unwinding from a
+    /// panic -- this runs from `Drop`): manual mode at full speed. Not the
+    /// mode found at startup -- on this board's it8625, automatic mode
+    /// stops the fan outright (confirmed live: 0 RPM at `pwm1_enable=2`),
+    /// so "restoring" it would hand back a stopped fan with nothing
+    /// watching temperatures. Full speed is loud but always safe, and the
+    /// next daemon start takes it straight back over.
     fn restore(&mut self) {
         if self.last_pwm.is_none() {
             return; // never took control
@@ -486,16 +476,7 @@ impl FanController {
         let Some(hwmon) = self.hwmon.clone().or_else(|| self.resolve_hwmon()) else {
             return;
         };
-        if let Some(mode) = self.original_enable.as_deref().filter(|m| *m != "1")
-            && std::fs::write(self.enable_path(&hwmon), mode).is_ok()
-        {
-            crate::syslog::info(&format!(
-                "fan '{}' (pwm{}): restored pwm{}_enable={mode}",
-                self.profile.name, self.profile.pwm_index, self.profile.pwm_index
-            ));
-            return;
-        }
-        if self.write_pwm(&hwmon, u8::MAX).is_ok() {
+        if self.ensure_manual_mode(&hwmon).is_ok() && self.write_pwm(&hwmon, u8::MAX).is_ok() {
             crate::syslog::info(&format!(
                 "fan '{}' (pwm{}): left at full speed on exit",
                 self.profile.name, self.profile.pwm_index
@@ -705,25 +686,34 @@ mod tests {
     }
 
     #[test]
-    fn drop_restores_original_automatic_mode() {
-        let hw = FakeHwmon::new("restore-auto");
+    fn drop_leaves_the_fan_manual_at_full_speed() {
+        let hw = FakeHwmon::new("restore");
         let mut c = controller_on(&hw);
-        c.update(); // captures original_enable = "2"
         c.last_pwm = Some(100);
-        std::fs::write(hw.0.join("pwm1_enable"), "1").unwrap();
         drop(c);
-        assert_eq!(hw.read("pwm1_enable"), "2");
+        assert_eq!(hw.read("pwm1_enable"), "1");
+        assert_eq!(hw.read("pwm1"), "255");
     }
 
     #[test]
-    fn drop_leaves_fan_at_full_speed_if_it_was_already_manual() {
-        let hw = FakeHwmon::new("restore-manual");
-        std::fs::write(hw.0.join("pwm1_enable"), "1").unwrap();
+    fn drop_without_ever_taking_control_touches_nothing() {
+        let hw = FakeHwmon::new("never");
+        drop(controller_on(&hw));
+        assert_eq!(hw.read("pwm1_enable"), "2");
+        assert_eq!(hw.read("pwm1"), "120");
+    }
+
+    #[test]
+    fn kick_switches_to_manual_mode_before_writing() {
+        // FakeHwmon starts in automatic mode (pwm1_enable=2), where the
+        // real driver rejects pwm writes.
+        let hw = FakeHwmon::new("kick");
         let mut c = controller_on(&hw);
-        c.update(); // captures original_enable = "1"
-        c.last_pwm = Some(100);
-        drop(c);
-        assert_eq!(hw.read("pwm1"), "255");
+        c.apply(&hw.path(), PwmCommand::Kick(60));
+        assert_eq!(hw.read("pwm1_enable"), "1");
+        assert_eq!(hw.read("pwm1"), "60");
+        assert_eq!(c.last_pwm, Some(60));
+        assert!(c.kick_until.is_some());
     }
 
     fn plan_controller() -> FanController {
