@@ -72,9 +72,14 @@ TrueNAS-native boot task.
   status-LED decision logic (which pattern to show for which health
   state).
 - **`state.rs`** -- the actual state machine: status rotation, the
-  shutdown/restart action menu, socket overrides, locate, sleep. All the
+  shutdown/restart action menu, the scheduled-shutdown countdown, socket
+  overrides, locate, sleep. All the
   interactions between these live in one place (e.g. "a critical alert can
   preempt rotation but never a confirm screen").
+- **`power.rs`** -- the weekly power schedule (`[[power_schedule]]`):
+  fires scheduled shutdowns/restarts into `state.rs`'s countdown screen,
+  and keeps the RTC wake alarm set for the next scheduled power on. See
+  "Power schedule" below.
 - **`socket.rs`** -- the Unix socket other processes (an LED/status
   daemon, cron jobs, ad-hoc scripts) use to push text and drive LEDs
   without needing to know the wire protocol.
@@ -530,6 +535,89 @@ journalctl -u lcm-status -p warning   # warnings and above
 journalctl -u lcm-status -p crit      # critical only
 ```
 
+## Power schedule
+
+ADM's Control Panel -> Hardware -> Power -> Power Schedule, rebuilt for
+TrueNAS: weekly rules to power on, shut down or restart the NAS at set
+times. Configured as `[[power_schedule]]` blocks in `lcm-status.toml`:
+
+```toml
+[[power_schedule]]
+days = "weekdays"          # or ["mon", "wed"], "daily", "weekends", ...
+time = "07:30"             # 24h, local time
+action = "power_on"
+
+[[power_schedule]]
+days = "daily"
+time = "23:30"
+action = "shutdown"        # or "restart"; ADM's "power_off" also works
+countdown_secs = 120       # front-panel countdown first (default 60)
+```
+
+`days` takes `sun`..`sat` (or full names) plus the shorthands `daily`,
+`weekdays` (Mon-Fri) and `weekends`, as a list or a single string. A bad
+entry (unknown day or action, unparseable time) is reported at load
+(`lcm-status check-config`) and disabled; the rest of the schedule still
+applies. Combinations that won't do what was meant are reported but kept:
+a shutdown and a restart in the same minute (the shutdown wins), and a
+power on less than ~5 minutes plus the countdown after a shutdown (the
+alarm can go off before the NAS is actually off, and is then spent).
+
+**How ADM does it** (from `emboardmand`'s `Power_Service_Handler` thread
+and `libndal.so`/`hardware.js`): rules are `{type, days, hour, minute}`,
+`type` one of `power_on`/`power_off`/`restart`/`sleep`, days numbered
+0 = Sunday (stored as `[Power Schedule N]` sections in `emboard.conf`).
+Once a minute it compares the clock to every rule; a matching power
+off/restart happens immediately (skipped while an md array is reshaping),
+and the next power on is kept written into the RTC wake alarm. The
+semantics here match, except:
+
+- **Power on** is the RTC wake alarm, `/sys/class/rtc/rtc0/wakealarm`.
+  Whenever at least one `power_on` rule exists the daemon owns that alarm
+  and keeps it set to the next scheduled power on at all times -- set at
+  startup, re-checked every minute (so a manual `rtcwake` gets
+  overwritten), moved on as soon as one passes, after any clock jump,
+  right before any shutdown/restart it runs, and on exit. So **any**
+  shutdown -- scheduled, front-panel menu, TrueNAS UI, `poweroff` over SSH
+  -- wakes at the next scheduled time. With no `power_on` rule the alarm
+  is never touched. The alarm takes UTC epoch seconds regardless of
+  whether the RTC keeps UTC or local time; the daemon finds the next
+  matching *local* minute with libc's `localtime_r`, so DST is handled: a
+  time that doesn't exist on a spring-forward day is skipped that day, and
+  one that happens twice on a fall-back day only counts the first time.
+- **Shutdown/restart** go through the same `systemctl poweroff`/`reboot`
+  as the front-panel menu, after an LCD countdown (`SHUTDOWN IN 0:42` /
+  `ANY KEY: CANCEL`) that any button cancels. The countdown wakes the
+  panel from night mode and takes over from the action menu; socket
+  alerts that arrive meanwhile are held, like during a confirm screen.
+  Everything is logged to syslog (due, cancelled, executed).
+- **Firing is edge-triggered**: a rule fires when its minute boundary is
+  crossed while the daemon is running, never because the current minute
+  matches. A daemon that starts (or restarts) inside or after a scheduled
+  minute doesn't fire it, so a restart rule can't reboot-loop on a fast
+  boot and a crash-restart can't shut down twice. A clock step of more
+  than 5 minutes either way (NTP fixing a bad clock) fires nothing it
+  skipped over; a small step back doesn't refire what already ran.
+- No `sleep` rule type (TrueNAS doesn't suspend), and no "skip while the
+  array is rebuilding" -- a ZFS resilver or scrub resumes after a reboot.
+
+**Caveats**, from the hardware rather than this daemon:
+
+- **BIOS ErP/EuP must be off** (ADM tracks this as `EuPMode` in
+  `emboard.conf`). With it on, the board cuts standby power in soft-off
+  and nothing -- RTC alarm or Wake-on-LAN -- can wake it.
+- A power on only works from **soft-off (S5)**: a normal shutdown. After
+  an AC power loss the board isn't waiting on its RTC alarm; what happens
+  when power returns is the BIOS's restore-on-AC-loss setting.
+- `rtc0` must support alarms a week ahead. This box's does (`cat
+  /proc/driver/rtc` shows an alarm date, not just a time); one that only
+  takes 24h alarms makes setting it fail with "Invalid argument", which is
+  logged.
+
+The next scheduled power on/off (and what the RTC alarm is actually set
+to) shows in `lcm-status status` and, computed fresh, in `lcm-status
+check-config`.
+
 ## The socket protocol
 
 `/run/lcm-status.sock` (configurable), a Unix socket owned `root:lcm-status`
@@ -563,8 +651,9 @@ LOCATE off [bay=N]
 - `line0`/`line1`: each truncated to `[display].scroll_max_chars`
   (default 64) and auto-scrolled if over 16 characters, at
   `[display].scroll_step_ms` per character-step.
-- An active override **never** interrupts the button-driven action menu
-  or a shutdown/restart confirm screen -- it's queued (keeping the most
+- An active override **never** interrupts the button-driven action menu,
+  a shutdown/restart confirm screen, or a power-schedule countdown --
+  it's queued (keeping the most
   severe if several arrive) and applied the instant the user backs out or
   confirms, subject to the same rule that a lower level never replaces a
   more severe active alert.
@@ -671,7 +760,9 @@ accumulated stall/low-RPM health only the running process knows, not
 something a brand-new invocation could reconstruct), fresh `hal::` reads
 for every connected temp sensor (with its resolved threshold and current
 level), every pool, every drive bay's SMART state, and every physical
-NIC's link/monitoring status and Wake-on-LAN state, plus the active
+NIC's link/monitoring status and Wake-on-LAN state, plus the power
+schedule's next events and RTC wake alarm (and a running shutdown
+countdown, if any), and the active
 socket override if any:
 
 ```
@@ -702,6 +793,11 @@ socket override if any:
   enp3s0     d      (supports pumbg)
   enp9s0     g      (supports pg)
 
+-- Power schedule --
+  next power on:   Mon 2026-10-05 07:30 (in 2d 14h 55m, #1 power on weekdays 07:30)
+  next power off:  Fri 2026-10-02 23:30 (in 6h 55m, #3 shutdown daily 23:30)
+  RTC wake alarm:  set for Mon 2026-10-05 07:30
+
 -- Active override --
   none
 
@@ -727,9 +823,10 @@ receive the reply.
 
 `/etc/lcm-status.toml`, hand-edited, every field defaulted -- see
 `lcm-status.example.toml` for the full annotated reference (scroll
-speed/limits, per-category refresh floors, sleep schedule, which screens
-are enabled and in what order, NIC LED mode, Wake-on-LAN, Docker
-containers to ignore, temperature units/warning threshold).
+speed/limits, per-category refresh floors, sleep schedule, power
+schedule, which screens are enabled and in what order, NIC LED mode,
+Wake-on-LAN, Docker containers to ignore, temperature units/warning
+threshold).
 
 The text on each status screen comes from `[templates.*]`: `{variable}`
 templates per screen kind (`network`, `pool`, `hdd`, `cpu`, `fan`,
@@ -797,7 +894,8 @@ lcm-status settext 0 "HELLO"       # write up to 16 chars to line 0 or 1
 lcm-status listen 60               # print every unsolicited frame (button
                                     # presses, MCU version reports) for 60s
 lcm-status hal-test [path]         # dump every screen, rendered with that config's templates
-lcm-status check-config [path]     # parse and print a config file
+lcm-status check-config [path]     # parse and print a config file, and
+                                    # when its power schedule next fires
 lcm-status --help                  # usage
 ```
 
