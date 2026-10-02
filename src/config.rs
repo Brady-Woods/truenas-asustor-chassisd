@@ -777,30 +777,170 @@ pub fn default_fans() -> Vec<FanProfile> {
 }
 
 impl Config {
+    /// Loads `path`, printing any diagnostics to stderr. Never fails: a
+    /// missing or unparseable file means defaults, and individual bad
+    /// settings fall back as described in `validate`.
     pub fn load(path: &Path) -> Config {
+        let (cfg, diagnostics) = Config::load_with_diagnostics(path);
+        for d in diagnostics {
+            eprintln!("{}: {d}", path.display());
+        }
+        cfg
+    }
+
+    /// `load`, returning the diagnostics instead of printing them (for
+    /// `check-config`, which exits non-zero if there are any).
+    pub fn load_with_diagnostics(path: &Path) -> (Config, Vec<String>) {
         match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(mut cfg) => {
-                    for e in cfg.templates.validate() {
-                        eprintln!("{}: {e}", path.display());
-                    }
-                    cfg
-                }
-                Err(e) => {
-                    eprintln!("failed to parse {}: {e}, using defaults", path.display());
-                    Config::default()
-                }
-            },
+            Ok(text) => Config::parse(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("{} not found, using defaults", path.display());
-                Config::default()
+                (Config::default(), vec!["not found, using defaults".into()])
             }
-            Err(e) => {
-                eprintln!("failed to read {}: {e}, using defaults", path.display());
-                Config::default()
-            }
+            Err(e) => (
+                Config::default(),
+                vec![format!("failed to read ({e}), using defaults")],
+            ),
         }
     }
+
+    /// Parses and validates config text. Unknown keys (typically a typo,
+    /// e.g. `enable` for `enabled`) are reported and ignored rather than
+    /// rejected: rejecting would throw the whole file away for defaults.
+    pub fn parse(text: &str) -> (Config, Vec<String>) {
+        let mut diagnostics = Vec::new();
+        let parsed = serde_ignored::deserialize(toml::Deserializer::new(text), |key| {
+            diagnostics.push(format!("unknown setting `{key}`, ignored"));
+        });
+        match parsed {
+            Ok(mut cfg) => {
+                diagnostics.extend(Config::validate(&mut cfg));
+                (cfg, diagnostics)
+            }
+            Err(e) => (
+                Config::default(),
+                vec![format!("failed to parse ({e}), using defaults")],
+            ),
+        }
+    }
+
+    /// Checks settings serde can't, returning one message per problem.
+    /// Each problem disables or reverts only the affected piece -- the
+    /// rest of the config still applies:
+    /// - a bad template falls back to that screen's default;
+    /// - an unparseable `[sleep]` time disables night mode;
+    /// - a fan profile with an inconsistent curve is disabled, leaving
+    ///   that fan in its BIOS/driver mode rather than driving it from a
+    ///   curve that makes no sense;
+    /// - inverted temperature thresholds are reported only.
+    fn validate(&mut self) -> Vec<String> {
+        let mut errors = self.templates.validate();
+
+        if self.sleep.enabled {
+            for (key, value) in [("start", &self.sleep.start), ("end", &self.sleep.end)] {
+                if parse_hhmm(value).is_none() {
+                    errors.push(format!(
+                        "[sleep].{key} = \"{value}\" is not a 24h HH:MM time; night mode disabled"
+                    ));
+                }
+            }
+            if parse_hhmm(&self.sleep.start).is_none() || parse_hhmm(&self.sleep.end).is_none() {
+                self.sleep.enabled = false;
+            }
+        }
+
+        for fan in self.fans.iter_mut().filter(|f| f.enabled) {
+            let problems = fan.problems();
+            if !problems.is_empty() {
+                errors.push(format!(
+                    "[[fans]] '{}': {}; fan control disabled for it",
+                    fan.name,
+                    problems.join(", ")
+                ));
+                fan.enabled = false;
+            }
+        }
+
+        let t = &self.temperature;
+        if t.warn_threshold >= t.critical_threshold {
+            errors.push(format!(
+                "[temperature] warn_threshold ({}) should be below critical_threshold ({})",
+                t.warn_threshold, t.critical_threshold
+            ));
+        }
+        for o in &t.thresholds {
+            if o.chip.is_empty() {
+                errors.push("[[temperature.thresholds]] entry has no `chip`".into());
+            } else if o.warn_threshold >= o.critical_threshold {
+                errors.push(format!(
+                    "[[temperature.thresholds]] '{}': warn_threshold ({}) should be below critical_threshold ({})",
+                    o.chip, o.warn_threshold, o.critical_threshold
+                ));
+            }
+        }
+
+        errors
+    }
+}
+
+impl FanProfile {
+    /// Inconsistencies that make this profile's curve meaningless.
+    fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.pwm_chip.is_empty() {
+            out.push("no pwm_chip".to_string());
+        }
+        if self.min_temp_c >= self.max_temp_c {
+            out.push(format!(
+                "min_temp_c ({}) must be below max_temp_c ({})",
+                self.min_temp_c, self.max_temp_c
+            ));
+        }
+        if self.min_pwm > self.max_pwm || self.min_stop_pwm > self.max_pwm {
+            out.push(format!(
+                "min_pwm ({}) and min_stop_pwm ({}) must not exceed max_pwm ({})",
+                self.min_pwm, self.min_stop_pwm, self.max_pwm
+            ));
+        }
+        for sel in &self.sensors {
+            if sel.chip.is_empty() {
+                out.push("a sensor with no chip".to_string());
+            }
+            let min_t = sel.min_temp_c.unwrap_or(self.min_temp_c);
+            let max_t = sel.max_temp_c.unwrap_or(self.max_temp_c);
+            if min_t >= max_t {
+                out.push(format!(
+                    "sensor '{}': min_temp_c ({min_t}) must be below max_temp_c ({max_t})",
+                    sel.chip
+                ));
+            }
+        }
+        out
+    }
+}
+
+impl SleepConfig {
+    /// Whether local time `now` (hour, minute) falls in the sleep window.
+    /// `end` is exclusive, and a window whose end is before its start
+    /// wraps past midnight. False if either bound doesn't parse (`validate`
+    /// has already reported and disabled that case).
+    pub fn contains(&self, now: (u32, u32)) -> bool {
+        let (Some(start), Some(end)) = (parse_hhmm(&self.start), parse_hhmm(&self.end)) else {
+            return false;
+        };
+        let now = now.0 * 60 + now.1;
+        if start <= end {
+            (start..end).contains(&now)
+        } else {
+            now >= start || now < end
+        }
+    }
+}
+
+/// "HH:MM" (24h) as minutes since midnight.
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
 #[cfg(test)]
@@ -808,9 +948,7 @@ mod tests {
     use super::*;
 
     fn parse(text: &str) -> (Config, Vec<String>) {
-        let mut cfg: Config = toml::from_str(text).unwrap();
-        let errors = cfg.templates.validate();
-        (cfg, errors)
+        Config::parse(text)
     }
 
     #[test]
@@ -852,5 +990,66 @@ mod tests {
                 Category::Temperature
             ]
         );
+    }
+
+    #[test]
+    fn example_config_parses_cleanly() {
+        let (_, diagnostics) = parse(include_str!("../lcm-status.example.toml"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_but_the_rest_still_applies() {
+        let (cfg, diagnostics) = parse("[sleep]\nenable = true\nstart = \"21:00\"\n");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("sleep.enable"), "{diagnostics:?}");
+        assert_eq!(cfg.sleep.start, "21:00");
+    }
+
+    #[test]
+    fn bad_sleep_time_disables_night_mode() {
+        let (cfg, diagnostics) = parse("[sleep]\nenabled = true\nstart = \"25:00\"\n");
+        assert!(!cfg.sleep.enabled);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn inconsistent_fan_curve_disables_only_that_fan() {
+        let (cfg, diagnostics) = parse(
+            "[[fans]]\nname = \"bad\"\npwm_chip = \"it8625\"\nmin_temp_c = 90.0\nmax_temp_c = 45.0\n\
+             [[fans]]\nname = \"good\"\npwm_chip = \"it8625\"\npwm_index = 2\n",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(!cfg.fans[0].enabled);
+        assert!(cfg.fans[1].enabled);
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(Config::default().validate().is_empty());
+    }
+
+    #[test]
+    fn sleep_window() {
+        let window = |start: &str, end: &str| SleepConfig {
+            enabled: true,
+            start: start.into(),
+            end: end.into(),
+        };
+        let night = window("22:00", "06:00");
+        assert!(night.contains((23, 30)));
+        assert!(night.contains((0, 0)));
+        assert!(night.contains((5, 59)));
+        assert!(!night.contains((6, 0)));
+        assert!(!night.contains((21, 59)));
+        assert!(night.contains((22, 0)));
+
+        let day = window("09:00", "17:00");
+        assert!(day.contains((12, 0)));
+        assert!(!day.contains((17, 0)));
+        assert!(!day.contains((8, 59)));
+
+        assert!(!window("22:00", "nope").contains((23, 0)));
+        assert!(!window("10:00", "10:00").contains((10, 0)));
     }
 }
