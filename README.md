@@ -271,6 +271,24 @@ Three ways this goes further than upstream fancontrol:
   temp input that chip has, relying on this filtering rather than needing
   you to already know which specific inputs are real.
 
+Failure handling, all of it aimed at never leaving a fan stopped or
+frozen with nothing watching temperatures:
+
+- Fan control runs on its own thread, so a slow or hung `zpool`/`smartctl`
+  on the main loop can't stall it (and every external command is killed
+  after 10s anyway).
+- If every sensor feeding a fan stops reading after the daemon has taken
+  it over, the fan is held at `max_pwm` until a reading comes back.
+- `pwmN_enable` is set to manual before *every* write. In automatic mode
+  the it87 driver rejects pwm writes, and on this board automatic mode
+  stops the fan entirely (0 RPM).
+- On exit (SIGTERM, `systemctl stop`, a panic) each controlled fan is
+  left in manual mode at full speed, not handed back to automatic -- see
+  the previous point. The next start takes it straight back over.
+- `min_pwm = 0` is allowed: the fan stops below `min_temp_c` and is kicked
+  with `min_start_pwm` when the curve next wants it spinning. Only a fan
+  that was commanded to spin but whose tach reads 0 counts as stalled.
+
 ### Discovering what's actually connected: `lcm-status fan-profile`
 
 ```sh
