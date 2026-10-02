@@ -476,19 +476,9 @@ impl AppState {
             // though the schedule still wants it asleep, so a groggy 2am
             // glance doesn't get plunged back into darkness mid-read.
             //
-            // Mirrors tick()'s schedule-driven wake below: without this,
-            // a button-triggered wake only restored the status/bay LEDs
-            // (an incidental side effect of refresh_all()'s health
-            // recompute) while the Power LED and LAN LED rail -- only
-            // ever restored by exit_night_mode -- stayed dark.
-            self.sleeping = false;
             self.awake_override_until =
                 Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
-            led::exit_night_mode(&hal::physical_nics());
-            for iface in hal::physical_nics() {
-                led::set_nic_mode(&iface, self.cfg.led.nic_mode);
-            }
-            self.refresh_all();
+            self.wake();
             return self.render();
         }
 
@@ -610,29 +600,20 @@ impl AppState {
                 };
 
                 if matches!(self.mode, Mode::Status) {
-                    // A higher (or equal) level can replace what's showing;
-                    // a lower one never steps on a more severe active alert.
-                    let blocked = self.over.as_ref().is_some_and(|o| level < o.level);
-                    if !blocked {
-                        if self.sleeping && !level.always_visible() {
-                            // Non-urgent messages are dropped while asleep
-                            // rather than waking the panel for something
-                            // routine.
-                        } else {
-                            self.sleeping = false;
-                            self.over = Some(ov);
-                            self.reset_scroll();
-                            self.sync_leds_to_override();
-                        }
-                    }
-                } else {
-                    // Never interrupt the action menu / confirm flow.
+                    self.show_override(ov);
+                } else if self
+                    .pending_over
+                    .as_ref()
+                    .is_none_or(|p| ov.level >= p.level)
+                {
+                    // Never interrupt the action menu / confirm flow; hold
+                    // the most severe message until it closes.
                     self.pending_over = Some(ov);
                 }
             }
-            // Handled directly in main.rs's loop (needs `fans`, which
-            // lives outside AppState) before a command ever reaches here
-            // -- never actually matched at runtime, just keeps this
+            // Handled directly in main.rs's loop (needs the fan status,
+            // which lives outside AppState) before a command ever reaches
+            // here -- never actually matched at runtime, just keeps this
             // exhaustive.
             SocketCommand::StatusRequest(_) => {}
         }
@@ -640,10 +621,43 @@ impl AppState {
 
     fn apply_pending_override(&mut self) {
         if let Some(ov) = self.pending_over.take() {
-            self.over = Some(ov);
-            self.reset_scroll();
-            self.sync_leds_to_override();
+            self.show_override(ov);
         }
+    }
+
+    /// The one place an override becomes active, so every path (socket,
+    /// or a message held while the menu was open) obeys the same rules: a
+    /// higher (or equal) level can replace what's showing, a lower one
+    /// never steps on a more severe active alert; while asleep, routine
+    /// messages are dropped and error/critical wake the panel.
+    fn show_override(&mut self, ov: Override) {
+        if self.over.as_ref().is_some_and(|o| ov.level < o.level) {
+            return;
+        }
+        if self.sleeping {
+            if !ov.level.always_visible() {
+                return;
+            }
+            self.wake();
+        }
+        self.over = Some(ov);
+        self.reset_scroll();
+        self.sync_leds_to_override();
+    }
+
+    /// Leaves night mode: every LED night mode darkened (Power LED, LAN
+    /// rail, NIC ports, bays, status) is restored, and the screens are
+    /// re-fetched since they may be hours stale. Shared by every way the
+    /// panel wakes -- schedule, button, and an urgent socket alert -- so
+    /// none of them can restore only some of the LEDs.
+    fn wake(&mut self) {
+        self.sleeping = false;
+        let nics = hal::physical_nics();
+        led::exit_night_mode(&nics);
+        for iface in &nics {
+            led::set_nic_mode(iface, self.cfg.led.nic_mode);
+        }
+        self.refresh_all();
     }
 
     /// Called on every event-loop wakeup. Returns what to do and, for the
@@ -677,12 +691,7 @@ impl AppState {
             return Effect::Render(String::new(), String::new());
         }
         if !self.schedule_wants_sleep && self.sleeping {
-            self.sleeping = false;
-            led::exit_night_mode(&hal::physical_nics());
-            for iface in hal::physical_nics() {
-                led::set_nic_mode(&iface, self.cfg.led.nic_mode);
-            }
-            self.refresh_all();
+            self.wake();
             return self.render();
         }
         if self.sleeping {
@@ -837,4 +846,96 @@ impl AppState {
 
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::led::test_writes;
+
+    fn state() -> AppState {
+        AppState::new(Config::default())
+    }
+
+    fn show(state: &mut AppState, level: Level, text: &str) {
+        state.apply_socket_command(SocketCommand::Show {
+            level,
+            ttl_secs: 0,
+            bay: None,
+            line0: text.to_string(),
+            line1: String::new(),
+        });
+    }
+
+    fn active(state: &AppState) -> Option<(Level, &str)> {
+        state.over.as_ref().map(|o| (o.level, o.line0.as_str()))
+    }
+
+    #[test]
+    fn lower_level_never_replaces_a_more_severe_alert() {
+        let mut s = state();
+        show(&mut s, Level::Critical, "FIRE");
+        show(&mut s, Level::Info, "hello");
+        assert_eq!(active(&s), Some((Level::Critical, "FIRE")));
+        show(&mut s, Level::Critical, "FIRE 2");
+        assert_eq!(active(&s), Some((Level::Critical, "FIRE 2")));
+    }
+
+    #[test]
+    fn message_held_during_menu_cannot_replace_a_more_severe_alert() {
+        let mut s = state();
+        show(&mut s, Level::Critical, "FIRE");
+        s.handle_key(Key::Enter); // open the action menu
+        show(&mut s, Level::Info, "hello");
+        s.handle_key(Key::Back); // close it; held message is applied
+        assert_eq!(active(&s), Some((Level::Critical, "FIRE")));
+    }
+
+    #[test]
+    fn menu_holds_the_most_severe_message_not_the_latest() {
+        let mut s = state();
+        s.handle_key(Key::Enter);
+        show(&mut s, Level::Error, "DISK");
+        show(&mut s, Level::Info, "hello");
+        assert!(active(&s).is_none(), "menu must not be interrupted");
+        s.handle_key(Key::Back);
+        assert_eq!(active(&s), Some((Level::Error, "DISK")));
+    }
+
+    #[test]
+    fn urgent_alert_while_asleep_fully_exits_night_mode() {
+        let mut s = state();
+        s.sleeping = true;
+        test_writes::take();
+        show(&mut s, Level::Critical, "FIRE");
+        assert!(!s.sleeping);
+        assert_eq!(active(&s), Some((Level::Critical, "FIRE")));
+        assert!(test_writes::wrote("blue:power", "brightness", "1"));
+        assert!(test_writes::wrote("blue:lan", "brightness", "1"));
+    }
+
+    #[test]
+    fn routine_message_while_asleep_is_dropped() {
+        let mut s = state();
+        s.sleeping = true;
+        test_writes::take();
+        show(&mut s, Level::Warn, "meh");
+        assert!(s.sleeping);
+        assert!(active(&s).is_none());
+        assert!(!test_writes::wrote("blue:power", "brightness", "1"));
+    }
+
+    #[test]
+    fn button_wake_exits_night_mode_without_acting_on_the_key() {
+        let mut s = state();
+        s.sleeping = true;
+        test_writes::take();
+        s.handle_key(Key::Enter);
+        assert!(!s.sleeping);
+        assert!(
+            matches!(s.mode, Mode::Status),
+            "wake key must not open the menu"
+        );
+        assert!(test_writes::wrote("blue:power", "brightness", "1"));
+    }
 }
