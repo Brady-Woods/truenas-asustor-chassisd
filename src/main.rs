@@ -4,6 +4,7 @@ mod fan_calibrate;
 mod hal;
 mod led;
 mod monitor;
+mod power;
 mod protocol;
 mod report;
 mod shutdown;
@@ -116,6 +117,12 @@ fn main() -> ExitCode {
         Cli::CheckConfig(path) => {
             let (cfg, diagnostics) = Config::load_with_diagnostics(&path);
             println!("{cfg:#?}");
+            println!("\npower schedule (as of now, this machine's timezone):");
+            for line in
+                power::Scheduler::new(&cfg.power_schedule).describe(power::now_epoch(), false)
+            {
+                println!("  {line}");
+            }
             for d in &diagnostics {
                 eprintln!("{}: {d}", path.display());
             }
@@ -249,13 +256,27 @@ fn run_daemon(cfg_path: &Path) {
     state.init_leds();
     state.set_fan_health(fans.status().health);
 
+    // Its first poll (top of the event loop) arms the RTC wake alarm; it
+    // never fires anything scheduled before that first poll.
+    let mut power = power::Scheduler::new(&cfg.power_schedule);
+    if !power.rules().is_empty() {
+        syslog::info(&format!(
+            "power schedule: {} rule(s); {}",
+            power.rules().len(),
+            power.describe(power::now_epoch(), false).join("; ")
+        ));
+    }
+
     // A panic in the event loop is caught only long enough to hand the
     // fans back before it propagates; the process still exits non-zero
     // and systemd restarts it.
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        event_loop(&mut state, &mut lcm, &cfg, &fans, &rx)
+        event_loop(&mut state, &mut lcm, &cfg, &fans, &mut power, &rx)
     }));
     fans.shutdown();
+    // Usually already right; makes sure of it when this exit is part of
+    // the system going down.
+    power.sync_rtc(power::now_epoch());
     match outcome {
         Ok(Ok(())) => syslog::info("stopping: signal received, fans handed back"),
         Ok(Err(e)) => {
@@ -273,6 +294,7 @@ fn event_loop(
     lcm: &mut Lcm,
     cfg: &Config,
     fans: &fan::FanService,
+    power: &mut power::Scheduler,
     rx: &mpsc::Receiver<socket::SocketCommand>,
 ) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
@@ -281,10 +303,11 @@ fn event_loop(
         // Drain any socket commands that arrived since the last wakeup.
         // STATUS is handled here rather than forwarded into
         // `apply_socket_command`: building the report needs the fan
-        // status too, which lives out here alongside `state`, not inside it.
+        // status and power schedule too, which live out here alongside
+        // `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
-                let _ = resp_tx.send(report::build(state, &fans.status(), cfg));
+                let _ = resp_tx.send(report::build(state, &fans.status(), power, cfg));
                 continue;
             }
             state.apply_socket_command(cmd);
@@ -294,14 +317,28 @@ fn event_loop(
             state.set_schedule_sleep_wanted(cfg.sleep.contains(now_hhmm()));
         }
 
+        if let Some(due) = power.poll(power::now_epoch()) {
+            syslog::warning(&format!(
+                "power schedule: {} due; {} in {}s unless a front-panel button is pressed",
+                due.label,
+                if due.action == Action::Shutdown {
+                    "powering off"
+                } else {
+                    "restarting"
+                },
+                due.countdown_secs
+            ));
+            state.start_countdown(due.action, due.countdown_secs, &due.label);
+        }
+
         if fans.has_died() {
             return Err("fan control thread died");
         }
         state.set_fan_health(fans.status().health);
 
         let effect = state.tick();
-        apply_effect(effect, lcm);
-        drain_pending_keys(state, lcm);
+        apply_effect(effect, lcm, power);
+        drain_pending_keys(state, lcm, power);
 
         // Wait for the next thing that could matter: a serial byte, or the
         // next timer deadline (scroll step / dwell / confirm timeout).
@@ -325,8 +362,8 @@ fn event_loop(
             }
             if let Some(key) = frame.key() {
                 let effect = state.handle_key(key);
-                apply_effect(effect, lcm);
-                drain_pending_keys(state, lcm);
+                apply_effect(effect, lcm, power);
+                drain_pending_keys(state, lcm, power);
             }
         }
     }
@@ -338,38 +375,43 @@ fn event_loop(
 /// `set_text` call was mid-flight waiting on its own ACK. Feeds each one
 /// through `state.handle_key` exactly like the top-level `poll()` path does,
 /// so it isn't lost until the MCU gets around to resending it.
-fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm) {
+fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, power: &mut power::Scheduler) {
     for frame in lcm.take_pending() {
         if let Some(key) = frame.key() {
             let effect = state.handle_key(key);
-            apply_effect(effect, lcm);
+            apply_effect(effect, lcm, power);
         }
     }
 }
 
-fn apply_effect(effect: Effect, lcm: &mut Lcm) {
+fn apply_effect(effect: Effect, lcm: &mut Lcm, power: &mut power::Scheduler) {
     match effect {
         Effect::Render(line0, line1) => {
             let _ = lcm.set_text(0, &line0, 0);
             let _ = lcm.set_text(1, &line1, 0);
         }
-        Effect::RunAction(action) => run_action(action),
+        Effect::RunAction(action) => {
+            // The wake alarm is normally already right; this closes the
+            // window right after a power on time passes (the alarm went
+            // off while running, the next one not set yet).
+            power.sync_rtc(power::now_epoch());
+            run_action(action);
+        }
         Effect::None => {}
     }
 }
 
+/// Shutdown/restart, from the panel menu or the power schedule. The same
+/// path TrueNAS's own UI ends up at (systemd), so nothing is skipped.
 fn run_action(action: Action) {
-    match action {
-        Action::Shutdown => {
-            let _ = std::process::Command::new("systemctl")
-                .arg("poweroff")
-                .status();
-        }
-        Action::Restart => {
-            let _ = std::process::Command::new("systemctl")
-                .arg("reboot")
-                .status();
-        }
+    let verb = match action {
+        Action::Shutdown => "poweroff",
+        Action::Restart => "reboot",
+    };
+    match std::process::Command::new("systemctl").arg(verb).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => syslog::critical(&format!("systemctl {verb} failed ({status})")),
+        Err(e) => syslog::critical(&format!("systemctl {verb} failed to run: {e}")),
     }
 }
 
