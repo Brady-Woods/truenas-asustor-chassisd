@@ -1,19 +1,20 @@
 //! Assembles the human-readable report for the `STATUS` socket request
 //! (`lcm-status status`, see `socket.rs`/`main.rs`). Ties together
 //! `AppState::health_summary()` (the same computation that drives the
-//! status LED), live fan status lines, and `hal::` reads for
-//! temps/bays/network -- all in one place, so this and the LED itself can
-//! never disagree about what's currently true.
+//! status LED), live fan status lines, the power schedule's next events,
+//! and `hal::` reads for temps/bays/network -- all in one place, so this
+//! and the LED itself can never disagree about what's currently true.
 
 // `write!` to a `String` can't fail, so its `fmt::Result` is ignored below.
 
 use crate::config::Config;
 use crate::fan::FanStatus;
 use crate::hal;
+use crate::power::{self, Scheduler};
 use crate::state::AppState;
 use std::fmt::Write;
 
-pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
+pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config) -> String {
     let mut out = String::new();
 
     out.push_str("=== lcm-status report ===\n\n");
@@ -99,6 +100,15 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     nics.sort();
     for iface in nics {
         let _ = writeln!(out, "  {}", crate::wol::describe(&iface, &cfg.wol));
+    }
+    out.push('\n');
+
+    out.push_str("-- Power schedule --\n");
+    if let Some(countdown) = state.countdown_summary() {
+        let _ = writeln!(out, "  COUNTING DOWN: {countdown}");
+    }
+    for line in power.describe(power::now_epoch(), true) {
+        let _ = writeln!(out, "  {line}");
     }
     out.push('\n');
 

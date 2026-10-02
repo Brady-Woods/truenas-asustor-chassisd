@@ -20,6 +20,48 @@ enabled = true
 start = "22:00"
 end = "06:00"
 
+# Weekly power schedule, like ADM's Control Panel -> Hardware -> Power ->
+# Power Schedule. One [[power_schedule]] block per rule; none (the
+# default) means no schedule. Commented out here because deploy.sh
+# installs this file as the live config -- uncomment and edit to use.
+#
+#   days    list of "sun".."sat" (or full names), and/or the shorthands
+#           "daily", "weekdays" (mon-fri), "weekends" (sat+sun). A single
+#           string works too: days = "weekdays".
+#   time    24h "HH:MM", local time (DST handled).
+#   action  "power_on"  -- wake from soft-off via the RTC alarm. The daemon
+#                          keeps the alarm set for the next power_on at all
+#                          times, so the NAS wakes on schedule however it
+#                          was shut down (schedule, front panel, TrueNAS UI).
+#                          Needs BIOS ErP/EuP off; can't wake the box after
+#                          an AC power loss.
+#           "shutdown"  -- (ADM's "power_off" also accepted)
+#           "restart"
+#   countdown_secs  shutdown/restart only: front-panel countdown before it
+#           happens; any button cancels it. Default 60, 0 = immediately,
+#           max 3600.
+#   enabled  default true.
+#
+# A shutdown/restart only fires if the daemon is running as its minute
+# arrives -- never retroactively at startup -- so a restart rule can't
+# reboot-loop. `lcm-status check-config` and `lcm-status status` show the
+# next scheduled events.
+#[[power_schedule]]
+#days = "weekdays"
+#time = "07:30"
+#action = "power_on"
+#
+#[[power_schedule]]
+#days = ["sat", "sun"]
+#time = "09:00"
+#action = "power_on"
+#
+#[[power_schedule]]
+#days = "daily"
+#time = "23:30"
+#action = "shutdown"
+#countdown_secs = 120
+
 [socket]
 path = "/run/lcm-status.sock"
 group = "lcm-status"

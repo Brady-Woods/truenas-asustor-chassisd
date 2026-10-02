@@ -2,7 +2,7 @@
 //! /etc/lcm-status.toml by default. Every field has a sensible default so
 //! the daemon runs fine with no config file at all.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/lcm-status.toml";
@@ -31,6 +31,10 @@ pub struct Config {
     /// `/etc/fancontrol` wholesale, not field-by-field).
     #[serde(default = "default_fans")]
     pub fans: Vec<FanProfile>,
+    /// Weekly power on / shutdown / restart rules, ADM-style -- see
+    /// `PowerRule` and `power.rs`. Empty (default) = no schedule, and the
+    /// RTC wake alarm is never touched.
+    pub power_schedule: Vec<PowerRule>,
 }
 
 impl Default for Config {
@@ -50,6 +54,7 @@ impl Default for Config {
             wol: WolConfig::default(),
             templates: TemplatesConfig::default(),
             fans: default_fans(),
+            power_schedule: Vec::new(),
         }
     }
 }
@@ -217,6 +222,55 @@ impl Default for SleepConfig {
             end: "07:00".to_string(),
         }
     }
+}
+
+/// One `[[power_schedule]]` entry: do `action` at `time` on each of
+/// `days`. Mirrors ADM's power schedule rules (type, days of week, hour,
+/// minute). Kept as plain strings here and checked by `Config::validate`
+/// (via `power::Rule::parse`), so one bad entry is reported and disabled
+/// rather than failing the whole file the way a bad enum value would.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct PowerRule {
+    pub enabled: bool,
+    /// Day names ("mon", "monday", ...) and/or "daily", "weekdays",
+    /// "weekends". A single string is accepted as a one-item list.
+    #[serde(deserialize_with = "one_or_many")]
+    pub days: Vec<String>,
+    /// 24h "HH:MM" local time.
+    pub time: String,
+    /// "`power_on`" (RTC wake from soft-off), "shutdown" or "restart".
+    /// ADM's "`power_off`" is accepted for "shutdown".
+    pub action: String,
+    /// shutdown/restart only: how long the front panel counts down (any
+    /// button cancels) before it happens. 0 = immediately.
+    pub countdown_secs: u64,
+}
+
+impl Default for PowerRule {
+    fn default() -> Self {
+        PowerRule {
+            enabled: true,
+            days: Vec::new(),
+            time: String::new(),
+            action: String::new(),
+            countdown_secs: 60,
+        }
+    }
+}
+
+/// A string or a list of strings, as a list.
+fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -861,7 +915,9 @@ impl Config {
     ///   that fan in its BIOS/driver mode rather than driving it from a
     ///   curve that makes no sense;
     /// - an unparseable `[wol] mode` leaves WOL untouched;
-    /// - inverted temperature thresholds are reported only.
+    /// - inverted temperature thresholds are reported only;
+    /// - a malformed `[[power_schedule]]` entry is disabled; rules that
+    ///   are fine alone but clash (see `power::lint`) are reported only.
     fn validate(&mut self) -> Vec<String> {
         let mut errors = self.templates.validate();
 
@@ -905,6 +961,21 @@ impl Config {
             ));
             self.wol.nics.clear();
         }
+
+        for (i, rule) in self.power_schedule.iter_mut().enumerate() {
+            if rule.enabled
+                && let Err(e) = crate::power::Rule::parse(i, rule)
+            {
+                errors.push(format!(
+                    "[[power_schedule]] #{}: {e}; entry disabled",
+                    i + 1
+                ));
+                rule.enabled = false;
+            }
+        }
+        errors.extend(crate::power::lint(&crate::power::parse_rules(
+            &self.power_schedule,
+        )));
 
         let t = &self.temperature;
         if t.warn_threshold >= t.critical_threshold {
@@ -999,7 +1070,7 @@ impl SleepConfig {
 }
 
 /// "HH:MM" (24h) as minutes since midnight.
-fn parse_hhmm(s: &str) -> Option<u32> {
+pub fn parse_hhmm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
     let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
     (h < 24 && m < 60).then_some(h * 60 + m)
@@ -1056,8 +1127,28 @@ mod tests {
 
     #[test]
     fn example_config_parses_cleanly() {
-        let (_, diagnostics) = parse(include_str!("../lcm-status.example.toml"));
+        let (cfg, diagnostics) = parse(include_str!("../lcm-status.example.toml"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(cfg.power_schedule.is_empty(), "must ship commented out");
+    }
+
+    #[test]
+    fn example_power_schedule_parses_cleanly_once_uncommented() {
+        // Commented-out settings are the lines with no space after `#`.
+        let uncommented: String = include_str!("../lcm-status.example.toml")
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_lowercase() || c == '[') => {
+                    rest
+                }
+                _ => l,
+            })
+            .flat_map(|l| [l, "\n"])
+            .collect();
+        let (cfg, diagnostics) = parse(&uncommented);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(cfg.power_schedule.len(), 3);
+        assert_eq!(crate::power::parse_rules(&cfg.power_schedule).len(), 3);
     }
 
     #[test]
@@ -1127,6 +1218,22 @@ mod tests {
         let (cfg, diagnostics) = fan("fixed_pwm = 120");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(cfg.fans[0].enabled);
+    }
+
+    #[test]
+    fn bad_power_schedule_entry_is_disabled_not_fatal() {
+        let (cfg, diagnostics) = parse(
+            "[[power_schedule]]\ndays = \"weekdays\"\ntime = \"07:30\"\naction = \"power_on\"\n\
+             [[power_schedule]]\ndays = [\"mon\", \"funday\"]\ntime = \"23:00\"\naction = \"shutdown\"\n\
+             [sleep]\nstart = \"21:00\"\n",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("#2") && diagnostics[0].contains("funday"));
+        assert!(cfg.power_schedule[0].enabled);
+        assert_eq!(cfg.power_schedule[0].days, ["weekdays"]);
+        assert!(!cfg.power_schedule[1].enabled);
+        // The rest of the file still applies.
+        assert_eq!(cfg.sleep.start, "21:00");
     }
 
     #[test]
