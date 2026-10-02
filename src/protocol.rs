@@ -9,19 +9,45 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 pub const LCM_DEVICE: &str = "/dev/ttyS1";
+
+/// Opcode of a frame that initiates something: a host command, or an
+/// unsolicited MCU report (key press, version).
+pub const OP_COMMAND: u8 = 0xF0;
+/// Opcode of an acknowledgement; its subcmd echoes the frame it answers.
+pub const OP_ACK: u8 = 0xF1;
+/// MCU report: a front-panel key press, `payload[0]` = key code.
+pub const SUB_KEY: u8 = 0x80;
+/// MCU report: firmware version, `payload` = major, minor, patch.
+pub const SUB_VERSION: u8 = 0x13;
+/// Host command: write one 16-char line of text.
+const SUB_SET_TEXT: u8 = 0x27;
+/// Host commands making up the power-on sequence the stock firmware sends.
+const SUB_INIT_1: u8 = 0x11;
+const SUB_INIT_2: u8 = 0x22;
+
+/// Longest frame on the wire: header (3) + payload + checksum (1).
 const FRAME_MAX: usize = 22;
+const PAYLOAD_MAX: usize = FRAME_MAX - 4;
+/// Characters per display line.
+const LINE_WIDTH: usize = 16;
+/// How long to wait for the MCU to ACK a command.
+const ACK_TIMEOUT: Duration = Duration::from_millis(300);
+/// Settle time the MCU needs after ACKing one command before it will
+/// accept the next.
+const SETTLE: Duration = Duration::from_millis(15);
 
 pub struct Lcm {
     port: File,
-    /// Unsolicited `0xF0` frames (button presses, version reports) that
+    /// Unsolicited frames (button presses, version reports) that
     /// `send_and_ack` ran into -- and had to ACK -- while it was waiting
     /// for its own ACK. Drained by `take_pending` so the caller can still
     /// dispatch them instead of losing them.
-    pending: Vec<(u8, Vec<u8>)>,
+    pending: Vec<Frame>,
     /// Text last *confirmed* written to each line (index 0/1) -- only set
     /// on a successful ACK, see `set_text`. Lets repeated calls with
     /// unchanged text skip the wire entirely, while a call that failed
@@ -30,55 +56,74 @@ pub struct Lcm {
     last_sent: [Option<String>; 2],
 }
 
-#[derive(Debug, Clone)]
+/// One received frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub opcode: u8,
     pub subcmd: u8,
     pub payload: Vec<u8>,
+    pub checksum_ok: bool,
 }
 
 impl Frame {
-    fn raw(&self) -> Vec<u8> {
-        let n = self.payload.len().min(18) as u8;
-        let mut buf = vec![0u8; n as usize + 4];
-        buf[0] = self.opcode;
-        buf[1] = n;
-        buf[2] = self.subcmd;
-        buf[3..3 + n as usize].copy_from_slice(&self.payload[..n as usize]);
-        let cksum = checksum(&buf);
-        let last = buf.len() - 1;
-        buf[last] = cksum;
-        buf
+    /// True for a valid unsolicited MCU frame, which must be ACKed.
+    pub fn is_unsolicited(&self) -> bool {
+        self.checksum_ok && self.opcode == OP_COMMAND
+    }
+
+    /// The key, if this is a valid key-press report.
+    pub fn key(&self) -> Option<Key> {
+        (self.is_unsolicited() && self.subcmd == SUB_KEY)
+            .then(|| self.payload.first().copied().map(Key::from))
+            .flatten()
     }
 }
 
-fn checksum(buf: &[u8]) -> u8 {
-    let n = buf[1] as usize + 3;
-    buf[..n].iter().fold(0u8, |acc, b| acc.wrapping_add(*b))
+/// Serializes a frame; payloads beyond the protocol maximum are truncated.
+fn encode(opcode: u8, subcmd: u8, payload: &[u8]) -> Vec<u8> {
+    let payload = &payload[..payload.len().min(PAYLOAD_MAX)];
+    let mut buf = Vec::with_capacity(payload.len() + 4);
+    buf.push(opcode);
+    buf.push(u8::try_from(payload.len()).expect("payload is at most PAYLOAD_MAX bytes"));
+    buf.push(subcmd);
+    buf.extend_from_slice(payload);
+    buf.push(checksum(&buf));
+    buf
 }
 
-/// Parses a raw fixed-size reply buffer into (opcode, subcmd, payload, checksum_ok).
-fn parse_reply(buf: &[u8], len: usize) -> Option<(u8, u8, Vec<u8>, bool)> {
-    if len < 4 {
+/// 8-bit sum of a frame's header and payload.
+fn checksum(header_and_payload: &[u8]) -> u8 {
+    header_and_payload
+        .iter()
+        .fold(0u8, |acc, b| acc.wrapping_add(*b))
+}
+
+/// Parses the bytes of one received frame. `None` if too short to even
+/// have a header; a frame that's truncated or fails its checksum is still
+/// returned, with `checksum_ok` false.
+fn decode(buf: &[u8]) -> Option<Frame> {
+    if buf.len() < 4 {
         return None;
     }
-    let opcode = buf[0];
-    let n = buf[1] as usize;
-    let subcmd = buf[2];
+    let n = usize::from(buf[1]);
     let cksum_idx = n + 3;
-    let ok = cksum_idx < len && checksum(buf) == buf[cksum_idx];
-    let payload_end = (3 + n).min(len);
-    let payload = buf[3..payload_end].to_vec();
-    Some((opcode, subcmd, payload, ok))
+    let checksum_ok = cksum_idx < buf.len() && checksum(&buf[..cksum_idx]) == buf[cksum_idx];
+    Some(Frame {
+        opcode: buf[0],
+        subcmd: buf[2],
+        payload: buf[3..(3 + n).min(buf.len())].to_vec(),
+        checksum_ok,
+    })
+}
+
+impl AsRawFd for Lcm {
+    fn as_raw_fd(&self) -> RawFd {
+        self.port.as_raw_fd()
+    }
 }
 
 impl Lcm {
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.port.as_raw_fd()
-    }
-
     pub fn open(path: &str) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         let port = OpenOptions::new()
             .read(true)
             .write(true)
@@ -86,18 +131,18 @@ impl Lcm {
             .open(path)?;
 
         let fd = port.as_raw_fd();
+        // SAFETY: `termios` is plain data for which all-zeroes is valid,
+        // every pointer passed is to that local, and `fd` stays open for
+        // the duration (owned by `port`).
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
-            tio.c_cflag = libc::B115200
-                | libc::CLOCAL as libc::tcflag_t
-                | libc::CREAD as libc::tcflag_t
-                | libc::CS8 as libc::tcflag_t;
+            tio.c_cflag = libc::B115200 | libc::CLOCAL | libc::CREAD | libc::CS8;
             tio.c_cc[libc::VMIN] = 1;
             tio.c_cc[libc::VTIME] = 0;
-            libc::cfsetispeed(&mut tio, libc::B115200);
-            libc::cfsetospeed(&mut tio, libc::B115200);
+            libc::cfsetispeed(&raw mut tio, libc::B115200);
+            libc::cfsetospeed(&raw mut tio, libc::B115200);
             libc::tcflush(fd, libc::TCIFLUSH);
-            if libc::tcsetattr(fd, libc::TCSANOW, &tio) != 0 {
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw const tio) != 0 {
                 return Err(io::Error::last_os_error());
             }
         }
@@ -108,26 +153,23 @@ impl Lcm {
         })
     }
 
-    pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
-        let frame = Frame {
-            opcode,
-            subcmd,
-            payload: payload.to_vec(),
-        }
-        .raw();
-        let n = self.port.write(&frame)?;
-        if n != frame.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short write to LCM",
-            ));
-        }
-        Ok(())
+    /// Sends the stock firmware's power-on sequence. Returns whether each
+    /// of its two steps was ACKed.
+    pub fn init(&mut self) -> io::Result<(bool, bool)> {
+        let first = self.send_and_ack(OP_COMMAND, SUB_INIT_1, &[0x01], ACK_TIMEOUT)?;
+        std::thread::sleep(SETTLE);
+        let second = self.send_and_ack(OP_COMMAND, SUB_INIT_2, &[0x00], ACK_TIMEOUT)?;
+        Ok((first, second))
     }
 
-    /// Reads one fixed-size (up to 22-byte) frame with a timeout, byte at a time,
-    /// same approach the original firmware uses. Returns None on timeout.
-    pub fn read_frame(&mut self, timeout: Duration) -> io::Result<Option<(u8, u8, Vec<u8>, bool)>> {
+    pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
+        self.port.write_all(&encode(opcode, subcmd, payload))
+    }
+
+    /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
+    /// time, the same approach the original firmware uses. `None` on
+    /// timeout with nothing received.
+    pub fn read_frame(&mut self, timeout: Duration) -> io::Result<Option<Frame>> {
         let fd = self.port.as_raw_fd();
         let mut buf = [0u8; FRAME_MAX];
         let mut got = 0usize;
@@ -140,13 +182,10 @@ impl Lcm {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let rc = unsafe {
-                libc::poll(
-                    &mut pfd,
-                    1,
-                    remaining.as_millis().min(i32::MAX as u128) as i32,
-                )
-            };
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: `pfd` is a valid pollfd for the duration of the call,
+            // and the count (1) matches.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
             if rc <= 0 {
                 break;
             }
@@ -163,31 +202,38 @@ impl Lcm {
                     // reply, which widened the window for an unsolicited
                     // button frame to land mid-`send_and_ack` and get lost.
                     if got >= 2 {
-                        let expected = buf[1] as usize + 4;
+                        let expected = usize::from(buf[1]) + 4;
                         if expected <= FRAME_MAX && got >= expected {
                             break;
                         }
                     }
                 }
-                _ => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                // EOF or a real error: poll() would keep reporting the fd
+                // ready, so retrying would just spin until the timeout.
+                _ => break,
             }
         }
 
         if got == 0 {
             return Ok(None);
         }
-        Ok(parse_reply(&buf, got))
+        Ok(decode(&buf[..got]))
     }
 
-    /// Sends a frame and waits for the corresponding ACK (opcode `0xF1`,
-    /// echoing `subcmd`). The MCU can interleave an unsolicited `0xF0`
-    /// frame of its own (a button press, a version report) at any time,
-    /// including while we're sitting here waiting for our own ACK -- that
-    /// frame still has to be ACKed immediately (or the MCU will keep
-    /// resending it, see the module doc) rather than silently dropped, so
-    /// it's queued in `pending` and reading continues for our actual ACK
-    /// within what's left of `timeout`. Call `take_pending` afterward to
-    /// pick up anything that got queued this way.
+    /// Sends a frame and waits for the corresponding ACK (`OP_ACK`,
+    /// echoing `subcmd`). The MCU can interleave an unsolicited frame of
+    /// its own (a button press, a version report) at any time, including
+    /// while we're sitting here waiting for our own ACK -- that frame
+    /// still has to be ACKed immediately (or the MCU will keep resending
+    /// it) rather than silently dropped, so it's queued in `pending` and
+    /// reading continues for our actual ACK within what's left of
+    /// `timeout`. Call `take_pending` afterward to pick up anything that
+    /// got queued this way.
     pub fn send_and_ack(
         &mut self,
         opcode: u8,
@@ -203,12 +249,12 @@ impl Lcm {
                 return Ok(false);
             }
             match self.read_frame(remaining)? {
-                Some((op, sc, pl, ok)) if ok && op == 0xF1 && sc == subcmd => {
-                    return Ok(pl.first() == Some(&0));
+                Some(f) if f.checksum_ok && f.opcode == OP_ACK && f.subcmd == subcmd => {
+                    return Ok(f.payload.first() == Some(&0));
                 }
-                Some((op, sc, pl, ok)) if ok && op == 0xF0 => {
-                    let _ = self.ack(sc);
-                    self.pending.push((sc, pl));
+                Some(f) if f.is_unsolicited() => {
+                    let _ = self.ack(f.subcmd);
+                    self.pending.push(f);
                 }
                 Some(_) => {
                     // Mismatched or checksum-bad frame -- not our ACK,
@@ -221,39 +267,35 @@ impl Lcm {
 
     /// Drains unsolicited MCU frames `send_and_ack` had to queue instead of
     /// discarding (see its doc). Callers should check this after any `Lcm`
-    /// call that goes through `send_and_ack` (`set_text`, the init
-    /// sequence) so a button press that arrived mid-write isn't missed
-    /// until the MCU eventually resends it.
-    pub fn take_pending(&mut self) -> Vec<(u8, Vec<u8>)> {
+    /// call that goes through `send_and_ack` (`set_text`, `init`) so a
+    /// button press that arrived mid-write isn't missed until the MCU
+    /// eventually resends it.
+    pub fn take_pending(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.pending)
     }
 
-    /// Sets up to 16 ASCII chars on the given line (0 or 1), space-padded/truncated.
-    /// A no-op (no wire traffic) if `text` is already confirmed showing on
-    /// that line -- see `last_sent`.
+    /// Sets the given line (0 or 1) to `text`, space-padded or truncated to
+    /// 16 characters. The panel is ASCII-only; anything else is shown as
+    /// `?`. A no-op (no wire traffic) if `text` is already confirmed
+    /// showing on that line -- see `last_sent`.
     pub fn set_text(&mut self, line: u8, text: &str, flag: u8) -> io::Result<bool> {
-        let idx = (line & 1) as usize;
+        let idx = usize::from(line & 1);
         if self.last_sent[idx].as_deref() == Some(text) {
             return Ok(true);
         }
 
         let mut payload = vec![line, flag];
-        let bytes = text.as_bytes();
-        let take = bytes.len().min(16);
-        payload.extend_from_slice(&bytes[..take]);
-        payload.extend(std::iter::repeat(b' ').take(16 - take));
+        payload.extend(line_bytes(text));
 
-        // The MCU needs a brief settle time after ACKing one command
-        // before it'll accept the next -- same reason the power-on init
-        // sequence sleeps 15ms between its two steps. Two of these calls
-        // fire back-to-back every render (one per line); sent immediately
-        // after each other the second one reliably gets NACKed, so retry
-        // with that same gap rather than leaving that line stale.
+        // Two of these calls fire back-to-back every render (one per
+        // line), and sent immediately after each other the second one
+        // reliably gets NACKed (see `SETTLE`) -- so retry with that gap
+        // rather than leaving that line stale.
         for attempt in 0..3 {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(15));
+                std::thread::sleep(SETTLE);
             }
-            if self.send_and_ack(0xF0, 0x27, &payload, Duration::from_millis(300))? {
+            if self.send_and_ack(OP_COMMAND, SUB_SET_TEXT, &payload, ACK_TIMEOUT)? {
                 self.last_sent[idx] = Some(text.to_string());
                 return Ok(true);
             }
@@ -267,11 +309,25 @@ impl Lcm {
 
     /// Replies to an unsolicited MCU frame the way lcmd does: ACK with status 0.
     pub fn ack(&mut self, subcmd: u8) -> io::Result<()> {
-        self.send(0xF1, subcmd, &[0x00])
+        self.send(OP_ACK, subcmd, &[0x00])
     }
 }
 
-/// Key codes reported by the MCU (subcmd 0x80 unsolicited frames), empirically
+/// Exactly `LINE_WIDTH` printable-ASCII bytes for one display line.
+fn line_bytes(text: &str) -> impl Iterator<Item = u8> + '_ {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c as u8
+            } else {
+                b'?'
+            }
+        })
+        .chain(std::iter::repeat(b' '))
+        .take(LINE_WIDTH)
+}
+
+/// Key codes reported by the MCU (`SUB_KEY` unsolicited frames), empirically
 /// confirmed against real hardware on 2026-09-22.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -293,5 +349,72 @@ impl From<u8> for Key {
             5 => Key::Wake,
             other => Key::Unknown(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_then_decode_round_trips() {
+        let wire = encode(OP_COMMAND, SUB_SET_TEXT, &[0, 0, b'H', b'I']);
+        assert_eq!(wire.len(), 4 + 4);
+        assert_eq!(
+            decode(&wire),
+            Some(Frame {
+                opcode: OP_COMMAND,
+                subcmd: SUB_SET_TEXT,
+                payload: vec![0, 0, b'H', b'I'],
+                checksum_ok: true,
+            })
+        );
+    }
+
+    #[test]
+    fn checksum_matches_a_captured_ack() {
+        // F1 01 27 00 -> 0xF1 + 0x01 + 0x27 + 0x00 = 0x119 -> 0x19
+        assert_eq!(
+            encode(OP_ACK, SUB_SET_TEXT, &[0]),
+            vec![0xF1, 0x01, 0x27, 0x00, 0x19]
+        );
+    }
+
+    #[test]
+    fn corrupt_or_truncated_frames_fail_the_checksum() {
+        let mut wire = encode(OP_COMMAND, SUB_KEY, &[1]);
+        *wire.last_mut().unwrap() ^= 0xFF;
+        assert!(!decode(&wire).unwrap().checksum_ok);
+
+        let wire = encode(OP_COMMAND, SUB_KEY, &[1]);
+        assert!(!decode(&wire[..wire.len() - 1]).unwrap().checksum_ok);
+        assert_eq!(decode(&wire[..3]), None);
+    }
+
+    #[test]
+    fn key_is_only_reported_for_valid_key_frames() {
+        let key = decode(&encode(OP_COMMAND, SUB_KEY, &[4])).unwrap();
+        assert_eq!(key.key(), Some(Key::Enter));
+        let version = decode(&encode(OP_COMMAND, SUB_VERSION, &[1, 2, 3])).unwrap();
+        assert_eq!(version.key(), None);
+        let ack = decode(&encode(OP_ACK, SUB_KEY, &[4])).unwrap();
+        assert_eq!(ack.key(), None);
+    }
+
+    #[test]
+    fn oversized_payload_is_truncated_to_the_protocol_maximum() {
+        let wire = encode(OP_COMMAND, SUB_SET_TEXT, &[b'x'; 40]);
+        assert_eq!(wire.len(), FRAME_MAX);
+        assert!(decode(&wire).unwrap().checksum_ok);
+    }
+
+    #[test]
+    fn line_bytes_pads_truncates_and_replaces_non_ascii() {
+        let pad: Vec<u8> = line_bytes("OK").collect();
+        assert_eq!(pad, b"OK              ");
+        let long: Vec<u8> = line_bytes("0123456789abcdefXYZ").collect();
+        assert_eq!(long, b"0123456789abcdef");
+        let utf8: Vec<u8> = line_bytes("40\u{b0}C").collect();
+        assert_eq!(utf8, b"40?C            ");
     }
 }
