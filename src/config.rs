@@ -1086,13 +1086,13 @@ mod tests {
 
     #[test]
     fn default_templates_are_valid() {
-        assert!(TemplatesConfig::default().validate().is_empty());
+        assert_eq!(TemplatesConfig::default().validate(), Vec::<String>::new());
     }
 
     #[test]
     fn omitted_line_is_blank() {
         let (cfg, errors) = parse("[templates.pool]\nline1 = \"{free} free\"\n");
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<String>::new());
         assert_eq!(cfg.templates.pool.line0, "");
         assert_eq!(cfg.templates.pool.line1, "{free} free");
         // Blocks not mentioned at all keep their defaults.
@@ -1238,7 +1238,7 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        assert!(Config::default().validate().is_empty());
+        assert_eq!(Config::default().validate(), Vec::<String>::new());
     }
 
     #[test]
