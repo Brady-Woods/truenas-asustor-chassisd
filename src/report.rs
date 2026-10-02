@@ -28,27 +28,7 @@ pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config
     }
     out.push('\n');
 
-    out.push_str("-- Temperatures --\n");
-    let mut temps = hal::all_connected_temps();
-    temps.sort_by(|a, b| a.1.cmp(&b.1));
-    if temps.is_empty() {
-        out.push_str("  (no connected sensors found)\n");
-    }
-    for (chip, label, temp_c) in temps {
-        let (warn, crit) = crate::config::resolve_temp_threshold(&cfg.temperature, &chip);
-        let level = if temp_c >= crit {
-            "CRITICAL"
-        } else if temp_c >= warn {
-            "WARNING"
-        } else {
-            "ok"
-        };
-        let _ = writeln!(
-            out,
-            "  {label:<40} {temp_c:>6.1}C  [{level:<8}] (warn {warn:.1}C / crit {crit:.1}C)"
-        );
-    }
-    out.push('\n');
+    temperatures_section(&mut out, cfg);
 
     let summary = state.health_summary();
 
@@ -71,37 +51,7 @@ pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config
     }
     out.push('\n');
 
-    out.push_str("-- Network --\n");
-    let monitored = hal::monitored_nics(&cfg.network);
-    let with_ip = hal::ip_by_iface();
-    for iface in hal::physical_nics() {
-        let addr = with_ip
-            .get(&iface)
-            .cloned()
-            .unwrap_or_else(|| hal::nic_link_text(&iface));
-        let link = if hal::link_is_down(&iface) {
-            "down"
-        } else {
-            "up"
-        };
-        let tag = if cfg.network.enabled && monitored.contains(&iface) {
-            "monitored"
-        } else {
-            "not monitored"
-        };
-        let _ = writeln!(out, "  {iface:<10} {addr:<20} {tag}, link {link}");
-    }
-    out.push('\n');
-
-    // Fresh ioctl reads for every physical NIC, configured or not, so a
-    // NIC's WOL can be checked before deciding to add it to `[wol] nics`.
-    out.push_str("-- Wake-on-LAN --\n");
-    let mut nics = hal::physical_nics();
-    nics.sort();
-    for iface in nics {
-        let _ = writeln!(out, "  {}", crate::wol::describe(&iface, &cfg.wol));
-    }
-    out.push('\n');
+    network_section(&mut out, cfg);
 
     out.push_str("-- Power schedule --\n");
     if let Some(countdown) = state.countdown_summary() {
@@ -135,4 +85,62 @@ pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config
     );
 
     out
+}
+
+fn temperatures_section(out: &mut String, cfg: &Config) {
+    out.push_str("-- Temperatures --\n");
+    let mut temps = hal::all_connected_temps();
+    temps.sort_by(|a, b| a.1.cmp(&b.1));
+    if temps.is_empty() {
+        out.push_str("  (no connected sensors found)\n");
+    }
+    for (chip, label, temp_c) in temps {
+        let (warn, crit) = crate::config::resolve_temp_threshold(&cfg.temperature, &chip);
+        let level = if temp_c >= crit {
+            "CRITICAL"
+        } else if temp_c >= warn {
+            "WARNING"
+        } else {
+            "ok"
+        };
+        let _ = writeln!(
+            out,
+            "  {label:<40} {temp_c:>6.1}C  [{level:<8}] (warn {warn:.1}C / crit {crit:.1}C)"
+        );
+    }
+    out.push('\n');
+}
+
+fn network_section(out: &mut String, cfg: &Config) {
+    out.push_str("-- Network --\n");
+    let monitored = hal::monitored_nics(&cfg.network);
+    let with_ip = hal::ip_by_iface();
+    for iface in hal::physical_nics() {
+        let addr = with_ip
+            .get(&iface)
+            .cloned()
+            .unwrap_or_else(|| hal::nic_link_text(&iface));
+        let link = if hal::link_is_down(&iface) {
+            "down"
+        } else {
+            "up"
+        };
+        let tag = if cfg.network.enabled && monitored.contains(&iface) {
+            "monitored"
+        } else {
+            "not monitored"
+        };
+        let _ = writeln!(out, "  {iface:<10} {addr:<20} {tag}, link {link}");
+    }
+    out.push('\n');
+
+    // Fresh ioctl reads for every physical NIC, configured or not, so a
+    // NIC's WOL can be checked before deciding to add it to `[wol] nics`.
+    out.push_str("-- Wake-on-LAN --\n");
+    let mut nics = hal::physical_nics();
+    nics.sort();
+    for iface in nics {
+        let _ = writeln!(out, "  {}", crate::wol::describe(&iface, &cfg.wol));
+    }
+    out.push('\n');
 }
