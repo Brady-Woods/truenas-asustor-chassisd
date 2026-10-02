@@ -30,6 +30,9 @@ const POLL_INTERVAL_MS: i32 = 100;
 const USAGE: &str = "\
 usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/lcm-status.toml)
        lcm-status status [CONFIG]         print the running daemon's health report
+       lcm-status locate [BAY] [--ttl SECS] [--off] [CONFIG]
+                                          blink a bay's LEDs (or, with no BAY, the
+                                          chassis') to find it; --ttl 0 = until --off
        lcm-status check-config [CONFIG]   parse and print a config file
        lcm-status hal-test [CONFIG]       print every screen rendered with that config
        lcm-status fan-profile [-y] [CONFIG]
@@ -43,6 +46,14 @@ usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/l
 enum Cli {
     Daemon(PathBuf),
     Status(PathBuf),
+    /// `locate`: sends a `LOCATE` to the running daemon. `ttl_secs: None`
+    /// leaves the TTL to the daemon's default.
+    Locate {
+        config: PathBuf,
+        bay: Option<u32>,
+        ttl_secs: Option<u64>,
+        off: bool,
+    },
     CheckConfig(PathBuf),
     HalTest(PathBuf),
     FanProfile {
@@ -62,17 +73,11 @@ enum Cli {
 /// `lcm-status /path/to/config.toml`, recognized by looking like a path.
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    let config_arg = |args: &[&str]| -> Result<PathBuf, String> {
-        match args {
-            [] => Ok(PathBuf::from(config::DEFAULT_CONFIG_PATH)),
-            [path] if !path.starts_with('-') => Ok(PathBuf::from(path)),
-            _ => Err(format!("unexpected arguments: {}", args.join(" "))),
-        }
-    };
     match rest.as_slice() {
         [] => config_arg(&[]).map(Cli::Daemon),
         ["daemon", tail @ ..] => config_arg(tail).map(Cli::Daemon),
         ["status", tail @ ..] => config_arg(tail).map(Cli::Status),
+        ["locate", tail @ ..] => parse_locate_args(tail),
         ["check-config", tail @ ..] => config_arg(tail).map(Cli::CheckConfig),
         ["hal-test", tail @ ..] => config_arg(tail).map(Cli::HalTest),
         ["fan-profile", tail @ ..] => {
@@ -99,6 +104,51 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         }
         [cmd, ..] => Err(format!("unknown command '{cmd}'")),
     }
+}
+
+/// A subcommand's optional trailing config path.
+fn config_arg(args: &[&str]) -> Result<PathBuf, String> {
+    match args {
+        [] => Ok(PathBuf::from(config::DEFAULT_CONFIG_PATH)),
+        [path] if !path.starts_with('-') => Ok(PathBuf::from(path)),
+        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+    }
+}
+
+/// `locate [BAY] [--ttl SECS] [--off] [CONFIG]`, flags in any order. A
+/// bare number is the bay; anything else positional is the config path.
+fn parse_locate_args(args: &[&str]) -> Result<Cli, String> {
+    let (mut bay, mut ttl_secs, mut off) = (None, None, false);
+    let mut positional = Vec::new();
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        match arg {
+            "--off" => off = true,
+            "--ttl" => {
+                let value = args.next().ok_or("--ttl needs a number of seconds")?;
+                let secs = value
+                    .parse()
+                    .map_err(|_| format!("--ttl: '{value}' is not a number of seconds"))?;
+                ttl_secs = Some(secs);
+            }
+            _ if bay.is_none() && arg.parse::<u32>().is_ok() => {
+                bay = arg.parse().ok().filter(|&b| b > 0);
+                if bay.is_none() {
+                    return Err("bays are numbered from 1".into());
+                }
+            }
+            _ => positional.push(arg),
+        }
+    }
+    if off && ttl_secs.is_some() {
+        return Err("--ttl makes no sense with --off".into());
+    }
+    Ok(Cli::Locate {
+        config: config_arg(&positional)?,
+        bay,
+        ttl_secs,
+        off,
+    })
 }
 
 fn main() -> ExitCode {
@@ -143,18 +193,36 @@ fn main() -> ExitCode {
         }
         Cli::Probe(cmd) => run_probe_command(&cmd, &args),
         Cli::FanProfile { config, assume_yes } => fan_calibrate::run(&config, assume_yes),
-        Cli::Status(path) => request_status(&Config::load(&path).socket.path),
+        Cli::Status(path) => {
+            print!(
+                "{}",
+                socket_request(&Config::load(&path).socket.path, "STATUS")
+            );
+        }
+        Cli::Locate {
+            config,
+            bay,
+            ttl_secs,
+            off,
+        } => {
+            let request = socket::locate_request(bay, ttl_secs, off);
+            socket_request(&Config::load(&config).socket.path, &request);
+            println!("sent: {request}");
+        }
         Cli::Daemon(path) => run_daemon(&path),
     }
     ExitCode::SUCCESS
 }
 
-/// Client side of the `STATUS` request: connect to the running daemon's
-/// own socket, ask for a report, print it, exit. Talks to whatever's
-/// actually running -- not a fresh one-shot snapshot the way `hal-test`
-/// is -- so it reflects live accumulated state (a fan's stall history, an
-/// active override) a brand new process invocation couldn't know about.
-fn request_status(socket_path: &str) {
+/// Client side of the socket protocol, for `status` and `locate`: connect
+/// to the running daemon's own socket, send one request line, and return
+/// whatever it writes back (a `STATUS` report; nothing, for the
+/// fire-and-forget commands). Exits the process on any error. `STATUS`
+/// talks to whatever's actually running -- not a fresh one-shot snapshot
+/// the way `hal-test` is -- so it reflects live accumulated state (a fan's
+/// stall history, an active override) a brand new process invocation
+/// couldn't know about.
+fn socket_request(socket_path: &str, request: &str) -> String {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -165,7 +233,7 @@ fn request_status(socket_path: &str) {
             std::process::exit(1);
         }
     };
-    if let Err(e) = stream.write_all(b"STATUS\n") {
+    if let Err(e) = stream.write_all(format!("{request}\n").as_bytes()) {
         eprintln!("failed to send request: {e}");
         std::process::exit(1);
     }
@@ -179,7 +247,7 @@ fn request_status(socket_path: &str) {
         eprintln!("failed to read response: {e}");
         std::process::exit(1);
     }
-    print!("{response}");
+    response
 }
 
 fn run_daemon(cfg_path: &Path) {
@@ -488,6 +556,44 @@ mod tests {
             Ok(Cli::CheckConfig("a.toml".into()))
         );
         assert!(parse(&["status", "a.toml", "extra"]).is_err());
+    }
+
+    fn locate(config: PathBuf, bay: Option<u32>, ttl_secs: Option<u64>, off: bool) -> Cli {
+        Cli::Locate {
+            config,
+            bay,
+            ttl_secs,
+            off,
+        }
+    }
+
+    #[test]
+    fn locate_forms() {
+        assert_eq!(
+            parse(&["locate"]),
+            Ok(locate(default_path(), None, None, false))
+        );
+        assert_eq!(
+            parse(&["locate", "2", "--ttl", "300"]),
+            Ok(locate(default_path(), Some(2), Some(300), false))
+        );
+        assert_eq!(
+            parse(&["locate", "--off", "3", "/tmp/c.toml"]),
+            Ok(locate("/tmp/c.toml".into(), Some(3), None, true))
+        );
+        assert_eq!(
+            parse(&["locate", "--ttl", "0"]),
+            Ok(locate(default_path(), None, Some(0), false))
+        );
+    }
+
+    #[test]
+    fn bad_locate_arguments_are_rejected() {
+        assert!(parse(&["locate", "0"]).is_err());
+        assert!(parse(&["locate", "--ttl"]).is_err());
+        assert!(parse(&["locate", "--ttl", "soon"]).is_err());
+        assert!(parse(&["locate", "2", "--off", "--ttl", "5"]).is_err());
+        assert!(parse(&["locate", "2", "--bogus"]).is_err());
     }
 
     #[test]

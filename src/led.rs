@@ -65,8 +65,34 @@ fn set_blink(led: &str, on_ms: u32, off_ms: u32) {
     write_attr(led, "delay_off", &off_ms.to_string());
 }
 
-/// The five documented status-LED patterns, worst-first so callers can just
-/// pick the single most severe condition currently true.
+/// How fast a `LOCATE` blinks, both on and off, everywhere it blinks
+/// anything: bay green+red, status green+red, and the blue power LED.
+///
+/// Locate has to be unmistakable at a glance against every other front-panel
+/// state, so it differs from all of them on two axes at once:
+///
+/// - **Colour.** It's the only bay state that ever lights green *and* red
+///   together (amber) -- `Failed`/`Alert` are red-only, `Standby` and
+///   `Normal` are green-only. On the status LED the only other amber is the
+///   *solid* `Warning`.
+/// - **Rate.** 250/250 is 2x the factory `Degraded` 500/500, 4x the
+///   `Alert`/`CriticalFlashing` 1000/1000, and a 50% duty cycle unlike
+///   `Standby`'s 250/9750 blip. It stays clear of the 125/125 that was
+///   found too fast to read as blinking at all (see `CriticalFlashing`).
+///
+/// Strict green/red *alternation* would be prettier but can't be done
+/// reliably: the red LEDs are blinked by `ledtrig-timer` (a software timer
+/// per LED, restarted from scratch by every `delay_on`/`delay_off` write),
+/// and nothing lets userspace set one timer's phase relative to another's.
+/// Writing both back to back instead starts them within the same jiffy, so
+/// they flash together -- and if one of them did turn out to be blinked by
+/// hardware with its own clock, the result is an irregular green/red/amber
+/// flicker, which is still unlike any other state.
+pub const LOCATE_BLINK_MS: u32 = 250;
+
+/// Every status-LED pattern: the five documented health patterns, worst
+/// last, plus two that aren't health verdicts at all (`Locate`, `Off`) --
+/// `state::recompute_status_led` picks between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPattern {
     /// Solid green.
@@ -84,6 +110,11 @@ pub enum StatusPattern {
     Failed,
     /// Red flashing 1000/1000, green off -- a `critical` condition.
     CriticalFlashing,
+    /// Green and red flashing together at `LOCATE_BLINK_MS` (amber flash)
+    /// -- a chassis `LOCATE` is active.
+    Locate,
+    /// Both dark -- night mode.
+    Off,
 }
 
 pub fn set_status(pattern: StatusPattern) {
@@ -113,7 +144,37 @@ pub fn set_status(pattern: StatusPattern) {
             // full-off cycle instead.
             set_blink("red:status", 1000, 1000);
         }
+        StatusPattern::Locate => {
+            set_blink("green:status", LOCATE_BLINK_MS, LOCATE_BLINK_MS);
+            set_blink("red:status", LOCATE_BLINK_MS, LOCATE_BLINK_MS);
+        }
+        StatusPattern::Off => {
+            set_solid("green:status", false);
+            set_solid("red:status", false);
+        }
     }
+}
+
+/// The front "Power" LED (bi-color blue/red, GPIO-driven -- per
+/// mafredri/asustor-platform-driver's CLAUDE.md), a separate device from
+/// the status LED. Only night mode and a chassis `LOCATE` ever change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerPattern {
+    /// Solid blue: awake.
+    On,
+    /// Dark: night mode.
+    Off,
+    /// Blue flashing at `LOCATE_BLINK_MS` -- nothing else ever blinks it.
+    Locate,
+}
+
+pub fn set_power(pattern: PowerPattern) {
+    match pattern {
+        PowerPattern::On => set_solid("blue:power", true),
+        PowerPattern::Off => set_solid("blue:power", false),
+        PowerPattern::Locate => set_blink("blue:power", LOCATE_BLINK_MS, LOCATE_BLINK_MS),
+    }
+    set_solid("red:power", false);
 }
 
 /// Maps a socket-pushed severity level directly to a status pattern, for
@@ -138,6 +199,11 @@ pub enum BayState {
     /// clearly urgent, matching the status LED's critical flash rate.
     Alert,
     Standby,
+    /// A `LOCATE bay=N` is active: green and red flashing together at
+    /// `LOCATE_BLINK_MS` -- see that constant for why this pattern. Never
+    /// a health verdict (`hal::bay_led_states` doesn't produce it); it's
+    /// layered on top of one by `state::AppState::bay_led_state`.
+    Locate,
 }
 
 /// Bay LEDs: red on for a failed drive; green slow-flash for standby/spun
@@ -145,26 +211,35 @@ pub enum BayState {
 /// trigger rather than leaving our last override in place forever.
 pub fn set_bay(bay: u32, state: BayState) {
     let green = format!("sata{bay}:green:disk");
+    match state {
+        BayState::Normal => write_attr(&green, "trigger", &format!("asustor-sata{bay}")),
+        BayState::Failed | BayState::Alert => set_solid(&green, false),
+        BayState::Standby => set_blink(&green, 250, 9750),
+        BayState::Locate => set_blink(&green, LOCATE_BLINK_MS, LOCATE_BLINK_MS),
+    }
+    set_bay_red(bay, state);
+}
+
+/// `set_bay` as night mode leaves a bay: green dark, red still showing
+/// `Failed`/`Alert` (night mode never darkens red bay LEDs, see
+/// `enter_night_mode`). `Locate` is the exception and lights in full even
+/// at night -- finding a drive is the whole point of it.
+pub fn set_bay_night(bay: u32, state: BayState) {
+    if state == BayState::Locate {
+        set_bay(bay, state);
+        return;
+    }
+    set_solid(&format!("sata{bay}:green:disk"), false);
+    set_bay_red(bay, state);
+}
+
+fn set_bay_red(bay: u32, state: BayState) {
     let red = format!("sata{bay}:red:disk");
     match state {
-        BayState::Normal => {
-            write_attr(&green, "trigger", &format!("asustor-sata{bay}"));
-            set_solid(&red, false);
-        }
-        BayState::Failed => {
-            write_attr(&green, "trigger", "none");
-            set_solid(&green, false);
-            set_solid(&red, true);
-        }
-        BayState::Alert => {
-            write_attr(&green, "trigger", "none");
-            set_solid(&green, false);
-            set_blink(&red, 1000, 1000);
-        }
-        BayState::Standby => {
-            set_blink(&green, 250, 9750);
-            set_solid(&red, false);
-        }
+        BayState::Normal | BayState::Standby => set_solid(&red, false),
+        BayState::Failed => set_solid(&red, true),
+        BayState::Alert => set_blink(&red, 1000, 1000),
+        BayState::Locate => set_blink(&red, LOCATE_BLINK_MS, LOCATE_BLINK_MS),
     }
 }
 
@@ -173,17 +248,8 @@ pub fn set_bay(bay: u32, state: BayState) {
 /// shows even while "asleep", same principle as a critical alert waking
 /// the LCD.
 pub fn enter_night_mode(nic_ifaces: &[String]) {
-    write_attr("green:status", "trigger", "none");
-    set_solid("green:status", false);
-    write_attr("red:status", "trigger", "none");
-    set_solid("red:status", false);
-
-    // The physical front "Power" LED (bi-color blue/red, GPIO-driven --
-    // per mafredri/asustor-platform-driver's CLAUDE.md) is a separate
-    // device from the status LED above; nothing else in this codebase
-    // touches it.
-    set_solid("blue:power", false);
-    set_solid("red:power", false);
+    set_status(StatusPattern::Off);
+    set_power(PowerPattern::Off);
 
     for bay in 1..=4 {
         write_attr(&format!("sata{bay}:green:disk"), "trigger", "none");
@@ -216,8 +282,7 @@ pub fn exit_night_mode(nic_ifaces: &[String]) {
     write_attr("red:status", "trigger", "panic");
     set_solid("red:status", false);
 
-    set_solid("blue:power", true);
-    set_solid("red:power", false);
+    set_power(PowerPattern::On);
 
     for bay in 1..=4 {
         write_attr(
