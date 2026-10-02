@@ -125,6 +125,9 @@ ignore = []                # container names to exclude from health checks
 
 [led]
 nic_mode = "link"          # "link" (solid while connected) or "activity" (dark, flashes on traffic)
+# Applies to every NIC with r8169 front LEDs (both RTL8125s here). Needs
+# the ledtrig-netdev kernel module, which the daemon loads at startup; if
+# it can't be applied, a WARNING is logged once (journalctl -u lcm-status).
 # Front LEDs share [sleep]'s schedule for night mode -- one schedule for
 # both the LCD backlight and the LEDs, not two. Red bay LEDs are always
 # left alone by night mode so a real drive failure still shows.

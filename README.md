@@ -214,6 +214,41 @@ triggers use):
 | `Alert` | an `error`/`critical` socket message named this bay (`bay=N`) but it isn't a confirmed SMART failure -- 1000ms/1000ms red flash, same rate as the status LED |
 | `Standby` | drive is spun down -- green flashes slowly (250ms/9750ms) |
 
+**Front LAN LEDs** (`[led] nic_mode`) aren't GPIOs at all: they're driven
+by the RTL8125 PHYs themselves, exposed by `r8169` as
+`enpXs0-{0..3}::lan` and configured through the kernel's
+hardware-offloaded `netdev` trigger. Channels `-0` (2.5G link) and `-1`
+(10/100/1000 link) are OR'd onto each port's front LED; `-2`/`-3`
+(presumably the rear RJ45) are left alone. Applied to every NIC that has
+these LEDs -- both RTL8125s (`enp2s0`, `enp3s0`), not the AQC113:
+
+| `nic_mode` | `-0` | `-1` | Looks like |
+|---|---|---|---|
+| `link` (default) | `link_2500` | `link_10 link_100 link_1000` | solid on link at any speed (factory) |
+| `activity` | `rx tx` | all off | dark at idle, flickers on traffic |
+| *(night mode)* | all off | all off | dark (the `blue:lan` rail is off too) |
+
+Wake from night mode restores the configured `nic_mode`, not a fixed
+"link". Things that bit this before:
+
+- **`ledtrig-netdev` isn't loaded by default on TrueNAS** (nor is
+  `ledtrig-timer`, which every blink pattern needs). Without it `netdev`
+  can't be selected, none of its attributes exist, and every write
+  failed silently -- the LEDs just stayed in whatever the PHY had from
+  boot. The daemon now `modprobe`s both at startup (as does `deploy.sh`),
+  and checks the result by reading back each attribute plus `offloaded`
+  (1 = the PHY really is driving the LED in that mode), logging a syslog
+  WARNING once per distinct failure (and a notice when it clears) instead
+  of ignoring it.
+- **r8169 can only offload `rx` and `tx` together.** Changing one alone
+  is an unsupported mode: the kernel rejects that write with EOPNOTSUPP
+  (keeping the bit, so the matching write completes a valid mode) and
+  r8169 switches the LED off for that instant. So `rx` and `tx` are
+  always written back to back, after the link bits, never with anything
+  in between, and success is judged by the read-back, not by each write.
+  Attributes already at the wanted value aren't rewritten, so re-applying
+  a mode doesn't blip the LED.
+
 ## Fan control
 
 Drives one or more pwm outputs from temperature -- see `src/fan.rs` (the
