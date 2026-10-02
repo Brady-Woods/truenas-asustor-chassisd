@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 pub enum Action {
     Shutdown,
     Restart,
-    Eject,
 }
 
 impl Action {
@@ -23,7 +22,6 @@ impl Action {
         match self {
             Action::Shutdown => "SHUTDOWN",
             Action::Restart => "RESTART",
-            Action::Eject => "EJECT USB",
         }
     }
 }
@@ -101,7 +99,6 @@ pub struct AppState {
     awake_override_until: Option<Instant>,
     scroll0: Scroll,
     scroll1: Scroll,
-    eject_available: bool,
     monitor: crate::monitor::HealthMonitor,
     /// Worst current fan health across every configured fan -- pushed in
     /// each tick from main.rs, which reads it from `fan::FanService` (fan
@@ -117,10 +114,8 @@ pub struct AppState {
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
-/// see `AppState::health_summary`. `pub(crate)` since this is an
-/// implementation detail shared with `report.rs`, not part of the crate's
-/// (nonexistent) public API.
-pub(crate) struct HealthSummary {
+/// see `AppState::health_summary`.
+pub struct HealthSummary {
     pub pool_healths: Vec<(String, String)>,
     pub pool_degraded: bool,
     pub pool_faulted: bool,
@@ -162,7 +157,6 @@ impl AppState {
             awake_override_until: None,
             scroll0: Scroll::default(),
             scroll1: Scroll::default(),
-            eject_available: false,
             monitor: crate::monitor::HealthMonitor::new(),
             fan_health: Level::Info,
             pools: None,
@@ -271,7 +265,7 @@ impl AppState {
     /// `recompute_status_led` does -- an override is what's currently
     /// being *shown*, this is the health computation underneath it,
     /// which the report labels separately (see `override_summary`).
-    pub(crate) fn health_summary(&self) -> HealthSummary {
+    pub fn health_summary(&self) -> HealthSummary {
         use led::StatusPattern;
 
         let pool_healths = self.pool_healths();
@@ -335,7 +329,7 @@ impl AppState {
     /// Human-readable description of the active socket override, if any --
     /// for the `status` report. `None` when nothing's overriding the
     /// health-derived display.
-    pub(crate) fn override_summary(&self) -> Option<String> {
+    pub fn override_summary(&self) -> Option<String> {
         self.over.as_ref().map(|o| {
             let bay = o.bay.map(|b| format!(" bay={b}")).unwrap_or_default();
             format!("{:?}{bay}: {} / {}", o.level, o.line0, o.line1)
@@ -367,10 +361,6 @@ impl AppState {
         }
     }
 
-    pub fn set_eject_available(&mut self, available: bool) {
-        self.eject_available = available;
-    }
-
     /// Tells the state machine what the sleep schedule currently wants.
     /// Called every tick from `main`; actual sleep/wake transitions happen
     /// inside `tick()`, which also accounts for a recent manual wake and
@@ -379,9 +369,6 @@ impl AppState {
         self.schedule_wants_sleep = wanted;
     }
 
-    /// Rebuilds the flattened screen list from fresh HAL data. Called by
-    /// the event loop right before a category is about to be (re)displayed,
-    /// per the refresh-on-display design -- never on a background timer.
     /// Re-fetches every category regardless of its refresh floor -- used
     /// only when data must be guaranteed fresh right now (startup, waking
     /// from sleep). Everything else should go through `refresh_stale`.
@@ -514,10 +501,7 @@ impl AppState {
                     Effect::None
                 }
                 Key::Enter => {
-                    let mut options = vec![Action::Shutdown, Action::Restart];
-                    if self.eject_available {
-                        options.push(Action::Eject);
-                    }
+                    let options = vec![Action::Shutdown, Action::Restart];
                     self.mode = Mode::ActionMenu {
                         options,
                         selection: 0,
@@ -681,8 +665,7 @@ impl AppState {
         self.refresh_all();
     }
 
-    /// Called on every event-loop wakeup. Returns what to do and, for the
-    /// caller's poll() timeout, `next_deadline()` should be consulted too.
+    /// Called on every event-loop wakeup; returns what to display or do.
     pub fn tick(&mut self) -> Effect {
         // Sleep/wake transitions take priority over everything else, but
         // never fire mid-menu-interaction, never re-sleep through an active

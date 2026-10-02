@@ -1,14 +1,17 @@
 //! Assembles the human-readable report for the `STATUS` socket request
 //! (`lcm-status status`, see `socket.rs`/`main.rs`). Ties together
 //! `AppState::health_summary()` (the same computation that drives the
-//! status LED), live `FanController` status lines, and fresh `hal::`
-//! reads for temps/bays/network -- all in one place, so this and the LED
-//! itself can never disagree about what's currently true.
+//! status LED), live fan status lines, and `hal::` reads for
+//! temps/bays/network -- all in one place, so this and the LED itself can
+//! never disagree about what's currently true.
+
+// `write!` to a `String` can't fail, so its `fmt::Result` is ignored below.
 
 use crate::config::Config;
 use crate::fan::FanStatus;
 use crate::hal;
 use crate::state::AppState;
+use std::fmt::Write;
 
 pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     let mut out = String::new();
@@ -20,7 +23,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
         out.push_str("  (none configured)\n");
     }
     for line in &fans.lines {
-        out.push_str(&format!("  {line}\n"));
+        let _ = writeln!(out, "  {line}");
     }
     out.push('\n');
 
@@ -39,9 +42,10 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
         } else {
             "ok"
         };
-        out.push_str(&format!(
-            "  {label:<40} {temp_c:>6.1}C  [{level:<8}] (warn {warn:.1}C / crit {crit:.1}C)\n"
-        ));
+        let _ = writeln!(
+            out,
+            "  {label:<40} {temp_c:>6.1}C  [{level:<8}] (warn {warn:.1}C / crit {crit:.1}C)"
+        );
     }
     out.push('\n');
 
@@ -52,7 +56,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
         out.push_str("  (none found)\n");
     }
     for (name, health) in &summary.pool_healths {
-        out.push_str(&format!("  {name:<16} {health}\n"));
+        let _ = writeln!(out, "  {name:<16} {health}");
     }
     out.push('\n');
 
@@ -62,7 +66,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
         out.push_str("  (none found)\n");
     }
     for (bay, bay_state) in bays {
-        out.push_str(&format!("  bay {bay}: {bay_state:?}\n"));
+        let _ = writeln!(out, "  bay {bay}: {bay_state:?}");
     }
     out.push('\n');
 
@@ -74,33 +78,29 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
             .get(&iface)
             .cloned()
             .unwrap_or_else(|| hal::nic_link_text(&iface));
-        let is_monitored = cfg.network.enabled && monitored.contains(&iface);
         let link = if hal::link_is_down(&iface) {
             "down"
         } else {
             "up"
         };
-        let tag = if is_monitored {
+        let tag = if cfg.network.enabled && monitored.contains(&iface) {
             "monitored"
         } else {
             "not monitored"
         };
-        out.push_str(&format!("  {iface:<10} {addr:<20} {tag}, link {link}\n"));
+        let _ = writeln!(out, "  {iface:<10} {addr:<20} {tag}, link {link}");
     }
     out.push('\n');
 
     out.push_str("-- Active override --\n");
-    out.push_str(&format!(
-        "  {}\n\n",
-        state
-            .override_summary()
-            .unwrap_or_else(|| "none".to_string())
-    ));
+    let active = state.override_summary();
+    let _ = writeln!(out, "  {}\n", active.as_deref().unwrap_or("none"));
 
     out.push_str("-- Overall status LED --\n");
-    out.push_str(&format!(
-        "  pattern: {:?}\n  severity: {:?}  (fan={:?} temp={:?} network={:?} pool_degraded={} pool_faulted={} bay_failed={})\n",
-        summary.pattern,
+    let _ = writeln!(out, "  pattern: {:?}", summary.pattern);
+    let _ = writeln!(
+        out,
+        "  severity: {:?}  (fan={:?} temp={:?} network={:?} pool_degraded={} pool_faulted={} bay_failed={})",
         summary.overall,
         summary.fan_health,
         summary.temp_level,
@@ -108,7 +108,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
         summary.pool_degraded,
         summary.pool_faulted,
         summary.bay_failed,
-    ));
+    );
 
     out
 }

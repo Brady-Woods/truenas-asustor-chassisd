@@ -72,7 +72,7 @@ TrueNAS-native boot task.
   status-LED decision logic (which pattern to show for which health
   state).
 - **`state.rs`** -- the actual state machine: status rotation, the
-  shutdown/restart/eject action menu, socket overrides, sleep. All the
+  shutdown/restart action menu, socket overrides, sleep. All the
   interactions between these live in one place (e.g. "a critical alert can
   preempt rotation but never a confirm screen").
 - **`socket.rs`** -- the Unix socket other processes (an LED/status
@@ -428,8 +428,10 @@ CLEAR [bay=N]
   (default 64) and auto-scrolled if over 16 characters, at
   `[display].scroll_step_ms` per character-step.
 - An active override **never** interrupts the button-driven action menu
-  or a shutdown/restart/eject confirm screen -- it's queued and applied
-  the instant the user backs out or confirms.
+  or a shutdown/restart confirm screen -- it's queued (keeping the most
+  severe if several arrive) and applied the instant the user backs out or
+  confirms, subject to the same rule that a lower level never replaces a
+  more severe active alert.
 
 **Bare text shorthand** -- a message with no `SHOW`/`CLEAR` header is
 `SHOW info 5` with the first line as `line0` and the second (if any) as

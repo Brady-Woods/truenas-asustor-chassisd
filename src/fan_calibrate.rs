@@ -529,6 +529,7 @@ fn print_proposed_toml(
 // --- small utilities --------------------------------------------------
 
 fn running_as_root() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
 

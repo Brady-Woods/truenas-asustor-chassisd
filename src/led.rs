@@ -11,6 +11,7 @@ use crate::socket::Level;
 use serde::Deserialize;
 use std::path::Path;
 
+#[cfg_attr(test, allow(dead_code))]
 const LEDS: &str = "/sys/class/leds";
 
 fn write_attr(led: &str, attr: &str, value: &str) {
@@ -68,7 +69,8 @@ fn set_blink(led: &str, on_ms: u32, off_ms: u32) {
 /// pick the single most severe condition currently true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPattern {
-    Ok, // solid green
+    /// Solid green.
+    Ok,
     /// Solid amber (green+red both on) -- "our addition" per the doc, not a
     /// factory pattern. Originally just "network down"; now the generic
     /// non-critical warning indicator (some monitored NICs down, a temp/fan
@@ -76,9 +78,12 @@ pub enum StatusPattern {
     /// coarse: which specific thing tripped it is on the LCD/syslog, not
     /// encoded in the LED color.
     Warning,
-    Degraded,         // green solid, red flashing 500/500 -- factory RAID-degraded pattern
-    Failed,           // solid red -- factory "malfunction"
-    CriticalFlashing, // red flashing 500/500, green off -- socket-driven `critical` level
+    /// Green solid, red flashing 500/500 -- factory RAID-degraded pattern.
+    Degraded,
+    /// Solid red -- factory "malfunction".
+    Failed,
+    /// Red flashing 1000/1000, green off -- a `critical` condition.
+    CriticalFlashing,
 }
 
 pub fn set_status(pattern: StatusPattern) {

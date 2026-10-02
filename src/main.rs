@@ -22,6 +22,11 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Upper bound on how long the event loop sleeps waiting for a panel
+/// frame. A fixed 100ms keeps scroll steps and timers responsive without
+/// per-state deadline math; one wakeup per 100ms at idle is negligible.
+const POLL_INTERVAL_MS: i32 = 100;
+
 const USAGE: &str = "\
 usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/lcm-status.toml)
        lcm-status status [CONFIG]         print the running daemon's health report
@@ -290,21 +295,22 @@ fn event_loop(
         state.set_fan_health(fans.status().health);
 
         let effect = state.tick();
-        apply_effect(effect, lcm, cfg);
-        drain_pending_keys(state, lcm, cfg);
+        apply_effect(effect, lcm);
+        drain_pending_keys(state, lcm);
 
         // Wait for the next thing that could matter: a serial byte, or the
         // next timer deadline (scroll step / dwell / confirm timeout).
         // A conservative fixed ceiling keeps this simple while still being
         // effectively event-driven -- most of the time nothing is scrolling
         // and this sleeps the full interval.
-        let timeout_ms = next_wake_ms(cfg);
         let mut pfd = libc::pollfd {
             fd: serial_fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call,
+        // and the count (1) matches.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, POLL_INTERVAL_MS) };
         if rc > 0 && pfd.revents & libc::POLLIN != 0 {
             if let Ok(Some(frame)) = lcm.read_frame(Duration::from_millis(50)) {
                 if frame.is_unsolicited() {
@@ -312,8 +318,8 @@ fn event_loop(
                 }
                 if let Some(key) = frame.key() {
                     let effect = state.handle_key(key);
-                    apply_effect(effect, lcm, cfg);
-                    drain_pending_keys(state, lcm, cfg);
+                    apply_effect(effect, lcm);
+                    drain_pending_keys(state, lcm);
                 }
             }
         }
@@ -326,27 +332,27 @@ fn event_loop(
 /// `set_text` call was mid-flight waiting on its own ACK. Feeds each one
 /// through `state.handle_key` exactly like the top-level poll() path does,
 /// so it isn't lost until the MCU gets around to resending it.
-fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, cfg: &Config) {
+fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm) {
     for frame in lcm.take_pending() {
         if let Some(key) = frame.key() {
             let effect = state.handle_key(key);
-            apply_effect(effect, lcm, cfg);
+            apply_effect(effect, lcm);
         }
     }
 }
 
-fn apply_effect(effect: Effect, lcm: &mut Lcm, cfg: &Config) {
+fn apply_effect(effect: Effect, lcm: &mut Lcm) {
     match effect {
         Effect::Render(line0, line1) => {
             let _ = lcm.set_text(0, &line0, 0);
             let _ = lcm.set_text(1, &line1, 0);
         }
-        Effect::RunAction(action) => run_action(action, cfg),
+        Effect::RunAction(action) => run_action(action),
         Effect::None => {}
     }
 }
 
-fn run_action(action: Action, _cfg: &Config) {
+fn run_action(action: Action) {
     match action {
         Action::Shutdown => {
             let _ = std::process::Command::new("systemctl")
@@ -358,12 +364,6 @@ fn run_action(action: Action, _cfg: &Config) {
                 .arg("reboot")
                 .status();
         }
-        Action::Eject => {
-            // Placeholder: real implementation unmounts + powers down the
-            // specific front-port device (PCI 00:14.0, root-hub port 2)
-            // rather than any USB device system-wide.
-            eprintln!("eject requested -- not yet wired to the actual front-port device");
-        }
     }
 }
 
@@ -374,20 +374,18 @@ fn run_action(action: Action, _cfg: &Config) {
 /// hours early on a Pacific-time box) with no error or indication anything
 /// was wrong.
 fn now_hhmm() -> (u32, u32) {
-    unsafe {
+    // SAFETY: `time` accepts a null output pointer; `tm` is plain data for
+    // which all-zeroes is valid, and both pointers passed to the reentrant
+    // `localtime_r` are to locals that outlive the call.
+    let tm = unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        (tm.tm_hour as u32, tm.tm_min as u32)
-    }
-}
-
-fn next_wake_ms(_cfg: &Config) -> i32 {
-    // Deliberately short-and-simple: a fixed 100ms ceiling so scroll steps
-    // and timers stay responsive without needing per-state deadline math
-    // threaded through the poll() call. At idle (no scrolling, no pending
-    // timers) this is the only cost -- one wakeup per 100ms is negligible.
-    100
+        libc::localtime_r(&raw const t, &raw mut tm);
+        tm
+    };
+    // localtime_r yields 0-23 / 0-59; fall back to midnight if not.
+    let field = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
+    (field(tm.tm_hour), field(tm.tm_min))
 }
 
 fn run_probe_command(cmd: &str, args: &[String]) {

@@ -161,7 +161,7 @@ impl Default for RotationConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct MenuConfig {
-    /// Auto-cancel back to rotation if a confirm screen (shutdown/restart/eject)
+    /// Auto-cancel back to rotation if a confirm screen (shutdown/restart)
     /// gets no input for this many seconds.
     pub confirm_timeout_secs: u64,
 }
@@ -552,18 +552,12 @@ impl Default for TemperatureConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct DockerConfig {
     /// Container names to ignore entirely when checking health (e.g. known
     /// noisy/expected-unhealthy containers).
     pub ignore: Vec<String>,
-}
-
-impl Default for DockerConfig {
-    fn default() -> Self {
-        DockerConfig { ignore: Vec::new() }
-    }
 }
 
 /// One physical fan: which pwm output drives it, which sensors feed its
@@ -668,7 +662,7 @@ impl Default for FanProfile {
 /// which are unwired on this board -- see `min_resample_secs` note below
 /// on why that's handled by filtering, not by guessing which to list) or
 /// `coretemp`'s per-core inputs alongside its package input.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct SensorSelector {
     /// hwmon chip name, e.g. "coretemp", "drivetemp", "nvme", "it8625".
@@ -706,38 +700,17 @@ pub struct SensorSelector {
     pub max_temp_c: Option<f32>,
 }
 
-impl Default for SensorSelector {
-    fn default() -> Self {
-        SensorSelector {
-            chip: String::new(),
-            input: None,
-            label: None,
-            min_resample_secs: None,
-            min_temp_c: None,
-            max_temp_c: None,
-        }
-    }
-}
-
 /// This board's single real fan (AS6704T: `it8625` `pwm1`/`fan1`; fan2/3
 /// headers exist on the chip but nothing's physically connected -- see
 /// `hal::cpu_and_fan`'s doc comment). Used as `Config`'s default so the
 /// daemon needs no `[[fans]]` config at all to behave the way it always
 /// has; curve values match the `/etc/fancontrol` config this replaced.
 pub fn default_fans() -> Vec<FanProfile> {
+    // Curve values are `FanProfile::default()`'s, which are this board's.
     vec![FanProfile {
         name: "chassis".to_string(),
-        enabled: true,
         pwm_chip: "it8625".to_string(),
-        pwm_index: 1,
         fan_index: Some(1),
-        update_secs: 1,
-        min_temp_c: 45.0,
-        max_temp_c: 90.0,
-        min_start_pwm: 60,
-        min_stop_pwm: 55,
-        min_pwm: 50,
-        max_pwm: 255,
         sensors: vec![
             // CPU: no override -- shares this fan's own curve (45-90C),
             // the original hand-tuned values.
@@ -773,6 +746,7 @@ pub fn default_fans() -> Vec<FanProfile> {
         // (observed ~1300-2000 RPM day to day), so this only fires for a
         // genuinely underperforming fan, not routine low-load speeds.
         min_expected_rpm: Some(500),
+        ..FanProfile::default()
     }]
 }
 
