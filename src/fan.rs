@@ -172,6 +172,12 @@ pub struct FanController {
     /// Whether a `min_expected_rpm` warning is currently active, so the
     /// "back to normal" notice only fires once, on the actual transition.
     low_rpm_warned: bool,
+    /// True while every sensor feeding this fan has stopped reading (and
+    /// so the fan is being held at full speed instead).
+    sensors_lost: bool,
+    /// `pwmN_enable` as found before this controller first took the fan
+    /// over, restored on exit (see `restore`).
+    original_enable: Option<String>,
 }
 
 impl FanController {
@@ -202,7 +208,7 @@ impl FanController {
     pub fn health_level(&self) -> Level {
         if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS {
             Level::Critical
-        } else if self.consecutive_stalls > 0 || self.low_rpm_warned {
+        } else if self.consecutive_stalls > 0 || self.low_rpm_warned || self.sensors_lost {
             Level::Warn
         } else {
             Level::Info
@@ -221,6 +227,8 @@ impl FanController {
             ever_ran_normally: false,
             consecutive_stalls: 0,
             low_rpm_warned: false,
+            sensors_lost: false,
+            original_enable: None,
         }
     }
 
@@ -249,15 +257,28 @@ impl FanController {
         }
 
         if self.hwmon.is_none() {
-            self.hwmon = glob_hwmon(&self.profile.pwm_chip).and_then(|v| v.into_iter().next());
+            self.hwmon = self.resolve_hwmon();
         }
         let Some(hwmon) = self.hwmon.clone() else {
             return; // chip not loaded (yet) -- try again next tick
         };
+        if self.original_enable.is_none() {
+            self.original_enable = std::fs::read_to_string(self.enable_path(&hwmon))
+                .ok()
+                .map(|s| s.trim().to_string());
+        }
 
         let Some(sensor_target) = self.target_pwm_from_sensors() else {
-            return; // no connected sensor has a reading yet
+            self.hold_full_speed_without_sensors(&hwmon);
+            return;
         };
+        if self.sensors_lost {
+            self.sensors_lost = false;
+            crate::syslog::notice(&format!(
+                "fan '{}' (pwm{}): sensor readings back, resuming curve",
+                self.profile.name, self.profile.pwm_index
+            ));
+        }
 
         // Mid-kick: leave min_start_pwm in place until it's had time to
         // actually get the fan spinning, then fall through to a normal
@@ -389,8 +410,72 @@ impl FanController {
         target
     }
 
+    /// No sensor feeding this fan has a reading. Before this controller
+    /// has ever written the fan (e.g. sensors not loaded yet at startup)
+    /// it's left alone, in whatever mode the BIOS/driver set. Once it has
+    /// taken the fan over, losing every sensor (a module unloaded, a chip
+    /// renumbered) would otherwise freeze the fan at its last speed with
+    /// nothing watching temperatures -- so fail safe to `max_pwm` instead.
+    fn hold_full_speed_without_sensors(&mut self, hwmon: &str) {
+        if self.last_pwm.is_none() {
+            return;
+        }
+        if !self.sensors_lost {
+            self.sensors_lost = true;
+            crate::syslog::warning(&format!(
+                "fan '{}' (pwm{}): no sensor readings, holding at max_pwm",
+                self.profile.name, self.profile.pwm_index
+            ));
+        }
+        self.kick_until = None;
+        let max = self.profile.max_pwm;
+        if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, max).is_err() {
+            self.hwmon = None;
+            return;
+        }
+        self.last_pwm = Some(max);
+    }
+
+    /// Hands the fan back on exit (clean shutdown, or unwinding from a
+    /// panic -- this runs from `Drop`), so it never sits at a stale manual
+    /// speed with nothing controlling it. Restores the original
+    /// `pwmN_enable` mode if that was automatic; if it was already manual
+    /// (e.g. left that way by a previous crash) or unknown, leaves it at
+    /// full speed instead, the same fail-safe fancontrol(8) uses.
+    fn restore(&mut self) {
+        if self.last_pwm.is_none() {
+            return; // never took control
+        }
+        let Some(hwmon) = self.hwmon.clone().or_else(|| self.resolve_hwmon()) else {
+            return;
+        };
+        if let Some(mode) = self.original_enable.as_deref().filter(|m| *m != "1") {
+            if std::fs::write(self.enable_path(&hwmon), mode).is_ok() {
+                crate::syslog::info(&format!(
+                    "fan '{}' (pwm{}): restored pwm{}_enable={mode}",
+                    self.profile.name, self.profile.pwm_index, self.profile.pwm_index
+                ));
+                return;
+            }
+        }
+        if self.write_pwm(&hwmon, u8::MAX).is_ok() {
+            crate::syslog::info(&format!(
+                "fan '{}' (pwm{}): left at full speed on exit",
+                self.profile.name, self.profile.pwm_index
+            ));
+        }
+    }
+
+    fn resolve_hwmon(&self) -> Option<String> {
+        glob_hwmon(&self.profile.pwm_chip).and_then(|v| v.into_iter().next())
+    }
+
+    fn enable_path(&self, hwmon: &str) -> String {
+        format!("{hwmon}/pwm{}_enable", self.profile.pwm_index)
+    }
+
     fn ensure_manual_mode(&self, hwmon: &str) -> std::io::Result<()> {
-        std::fs::write(format!("{hwmon}/pwm{}_enable", self.profile.pwm_index), "1")
+        std::fs::write(self.enable_path(hwmon), "1")
     }
 
     fn write_pwm(&self, hwmon: &str, value: u8) -> std::io::Result<()> {
@@ -398,6 +483,12 @@ impl FanController {
             format!("{hwmon}/pwm{}", self.profile.pwm_index),
             value.to_string(),
         )
+    }
+}
+
+impl Drop for FanController {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -515,6 +606,90 @@ mod tests {
         let drive_max_t = 60.0; // drivetemp critical threshold
         assert_eq!(compute_pwm(60.0, drive_min_t, drive_max_t, &c), 255);
         assert_eq!(compute_pwm(70.0, drive_min_t, drive_max_t, &c), 255); // past its own max too
+    }
+
+    /// A scratch directory standing in for a hwmon device, seeded with
+    /// `pwm1`/`pwm1_enable`. Removed on drop.
+    struct FakeHwmon(std::path::PathBuf);
+
+    impl FakeHwmon {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("lcm-status-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pwm1"), "120").unwrap();
+            std::fs::write(dir.join("pwm1_enable"), "2").unwrap();
+            FakeHwmon(dir)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+
+        fn read(&self, file: &str) -> String {
+            std::fs::read_to_string(self.0.join(file)).unwrap()
+        }
+    }
+
+    impl Drop for FakeHwmon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A controller already pointed at `hw`, with no sensors configured
+    /// (so every `update` sees "no readings").
+    fn controller_on(hw: &FakeHwmon) -> FanController {
+        let mut c = FanController::new(FanProfile {
+            fan_index: None,
+            ..cfg()
+        });
+        c.hwmon = Some(hw.path());
+        c
+    }
+
+    #[test]
+    fn losing_all_sensors_after_taking_control_holds_max_pwm() {
+        let hw = FakeHwmon::new("lost");
+        let mut c = controller_on(&hw);
+        c.last_pwm = Some(100);
+        c.update();
+        assert_eq!(hw.read("pwm1"), "255");
+        assert_eq!(hw.read("pwm1_enable"), "1");
+        assert_eq!(c.health_level(), Level::Warn);
+    }
+
+    #[test]
+    fn no_sensors_before_taking_control_leaves_the_fan_alone() {
+        let hw = FakeHwmon::new("untouched");
+        let mut c = controller_on(&hw);
+        c.update();
+        assert_eq!(hw.read("pwm1"), "120");
+        assert_eq!(hw.read("pwm1_enable"), "2");
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn drop_restores_original_automatic_mode() {
+        let hw = FakeHwmon::new("restore-auto");
+        let mut c = controller_on(&hw);
+        c.update(); // captures original_enable = "2"
+        c.last_pwm = Some(100);
+        std::fs::write(hw.0.join("pwm1_enable"), "1").unwrap();
+        drop(c);
+        assert_eq!(hw.read("pwm1_enable"), "2");
+    }
+
+    #[test]
+    fn drop_leaves_fan_at_full_speed_if_it_was_already_manual() {
+        let hw = FakeHwmon::new("restore-manual");
+        std::fs::write(hw.0.join("pwm1_enable"), "1").unwrap();
+        let mut c = controller_on(&hw);
+        c.update(); // captures original_enable = "1"
+        c.last_pwm = Some(100);
+        drop(c);
+        assert_eq!(hw.read("pwm1"), "255");
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod led;
 mod monitor;
 mod protocol;
 mod report;
+mod shutdown;
 mod socket;
 mod state;
 mod syslog;
@@ -14,6 +15,7 @@ mod template;
 use config::Config;
 use protocol::{Key, Lcm, LCM_DEVICE};
 use state::{Action, AppState, Effect};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -117,6 +119,7 @@ fn request_status(socket_path: &str) {
 
 fn run_daemon(args: &[String]) {
     syslog::init();
+    shutdown::install();
 
     let cfg_path = args
         .get(1)
@@ -183,16 +186,42 @@ fn run_daemon(args: &[String]) {
     state.init_leds();
     state.set_fan_health(fans.status().health);
 
+    // A panic in the event loop is caught only long enough to hand the
+    // fans back before it propagates; the process still exits non-zero
+    // and systemd restarts it.
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        event_loop(&mut state, &mut lcm, &cfg, &fans, &rx)
+    }));
+    fans.shutdown();
+    match outcome {
+        Ok(Ok(())) => syslog::info("stopping: signal received, fans handed back"),
+        Ok(Err(e)) => {
+            syslog::critical(&format!("{e}; exiting so systemd restarts the daemon"));
+            std::process::exit(1);
+        }
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+/// Runs until SIGTERM/SIGINT (`Ok`) or until fan control can no longer be
+/// trusted (`Err`).
+fn event_loop(
+    state: &mut AppState,
+    lcm: &mut Lcm,
+    cfg: &Config,
+    fans: &fan::FanService,
+    rx: &mpsc::Receiver<socket::SocketCommand>,
+) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
 
-    loop {
+    while !shutdown::requested() {
         // Drain any socket commands that arrived since the last wakeup.
         // STATUS is handled here rather than forwarded into
         // `apply_socket_command`: building the report needs the fan
         // status too, which lives out here alongside `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
-                let _ = resp_tx.send(report::build(&state, &fans.status(), &cfg));
+                let _ = resp_tx.send(report::build(state, &fans.status(), cfg));
                 continue;
             }
             state.apply_socket_command(cmd);
@@ -207,21 +236,20 @@ fn run_daemon(args: &[String]) {
         }
 
         if fans.has_died() {
-            syslog::critical("fan control thread died; exiting so systemd restarts the daemon");
-            std::process::exit(1);
+            return Err("fan control thread died");
         }
         state.set_fan_health(fans.status().health);
 
         let effect = state.tick();
-        apply_effect(effect, &mut lcm, &cfg);
-        drain_pending_keys(&mut state, &mut lcm, &cfg);
+        apply_effect(effect, lcm, cfg);
+        drain_pending_keys(state, lcm, cfg);
 
         // Wait for the next thing that could matter: a serial byte, or the
         // next timer deadline (scroll step / dwell / confirm timeout).
         // A conservative fixed ceiling keeps this simple while still being
         // effectively event-driven -- most of the time nothing is scrolling
         // and this sleeps the full interval.
-        let timeout_ms = next_wake_ms(&cfg);
+        let timeout_ms = next_wake_ms(cfg);
         let mut pfd = libc::pollfd {
             fd: serial_fd,
             events: libc::POLLIN,
@@ -238,14 +266,15 @@ fn run_daemon(args: &[String]) {
                         if let Some(&code) = payload.first() {
                             let key: Key = code.into();
                             let effect = state.handle_key(key);
-                            apply_effect(effect, &mut lcm, &cfg);
-                            drain_pending_keys(&mut state, &mut lcm, &cfg);
+                            apply_effect(effect, lcm, cfg);
+                            drain_pending_keys(state, lcm, cfg);
                         }
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Dispatches button presses `Lcm::send_and_ack` had to queue (see its
