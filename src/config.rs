@@ -21,6 +21,7 @@ pub struct Config {
     pub docker: DockerConfig,
     pub led: LedConfig,
     pub network: NetworkConfig,
+    pub templates: TemplatesConfig,
     /// One entry per physical fan to control -- see `FanProfile`. Defaults
     /// to this board's single real fan (`default_fans()` below) so the
     /// daemon behaves the same with no config file at all; an explicit
@@ -45,6 +46,7 @@ impl Default for Config {
             docker: DockerConfig::default(),
             led: LedConfig::default(),
             network: NetworkConfig::default(),
+            templates: TemplatesConfig::default(),
             fans: default_fans(),
         }
     }
@@ -121,6 +123,9 @@ pub struct DisplayConfig {
     /// and again at the end before it loops, so a short-lived viewer isn't
     /// mid-scroll the whole time they glance at the panel.
     pub scroll_pause_ms: u64,
+    /// Blank characters between the end of a scrolling line and its start
+    /// coming back around.
+    pub scroll_gap: usize,
 }
 
 impl Default for DisplayConfig {
@@ -130,6 +135,7 @@ impl Default for DisplayConfig {
             scroll_step_ms: 300,
             scroll_max_chars: 64,
             scroll_pause_ms: 800,
+            scroll_gap: 4,
         }
     }
 }
@@ -230,6 +236,11 @@ pub struct ScreensConfig {
     pub hdd: bool,
     pub temperature: bool,
     pub docker: bool,
+    /// Rotation order of the screen categories. Any category left out is
+    /// appended in the default order, so listing just `["docker"]` means
+    /// "docker first, everything else as usual" -- whether a category is
+    /// shown at all is still the bool flags above, not this list.
+    pub order: Vec<Category>,
 }
 
 impl Default for ScreensConfig {
@@ -240,7 +251,123 @@ impl Default for ScreensConfig {
             hdd: true,
             temperature: true,
             docker: true,
+            order: Category::ALL.to_vec(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Category {
+    Network,
+    Pools,
+    Hdd,
+    Temperature,
+    Docker,
+}
+
+impl Category {
+    pub const ALL: [Category; 5] =
+        [Category::Network, Category::Pools, Category::Hdd, Category::Temperature, Category::Docker];
+}
+
+impl ScreensConfig {
+    /// `order` with duplicates dropped and missing categories appended.
+    pub fn effective_order(&self) -> Vec<Category> {
+        let mut out: Vec<Category> = Vec::new();
+        for c in self.order.iter().chain(Category::ALL.iter()) {
+            if !out.contains(c) {
+                out.push(*c);
+            }
+        }
+        out
+    }
+}
+
+/// Two-line text for one kind of status screen -- see `TemplatesConfig`.
+/// A block that sets only one line leaves the other blank; leaving the
+/// whole block out is what keeps the defaults.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct ScreenTemplate {
+    pub line0: String,
+    pub line1: String,
+}
+
+impl ScreenTemplate {
+    fn new(line0: &str, line1: &str) -> Self {
+        ScreenTemplate { line0: line0.to_string(), line1: line1.to_string() }
+    }
+}
+
+/// LCD text for each status screen, as `{var}` templates (see
+/// `template.rs`). Defaults reproduce the built-in text exactly. Each
+/// screen kind has its own fixed set of variables (`VARS` below); a
+/// template using anything else is rejected at load and that one screen
+/// falls back to its default. Fallback screens ("no disks found", ...),
+/// socket overrides, and the action menu aren't templated.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct TemplatesConfig {
+    pub network: ScreenTemplate,
+    pub pool: ScreenTemplate,
+    pub hdd: ScreenTemplate,
+    pub cpu: ScreenTemplate,
+    pub fan: ScreenTemplate,
+    pub docker: ScreenTemplate,
+}
+
+impl Default for TemplatesConfig {
+    fn default() -> Self {
+        TemplatesConfig {
+            network: ScreenTemplate::new("{iface}", "{ip_or_status}"),
+            pool: ScreenTemplate::new("{name}: {health}", "{alloc}/{size} {cap}"),
+            hdd: ScreenTemplate::new("{label}", "{status} {temp}"),
+            cpu: ScreenTemplate::new("CPU", "{temp}{unit}{warn}"),
+            fan: ScreenTemplate::new("FAN", "{rpm} RPM"),
+            docker: ScreenTemplate::new("DOCKER {name}", "{status}"),
+        }
+    }
+}
+
+impl TemplatesConfig {
+    /// Variables each screen kind provides -- must match what the
+    /// corresponding `hal.rs` function passes to `template::render`.
+    pub const NETWORK_VARS: &[&str] = &["iface", "ip", "link", "ip_or_status"];
+    pub const POOL_VARS: &[&str] = &["name", "size", "alloc", "free", "cap", "health"];
+    pub const HDD_VARS: &[&str] = &["label", "bay", "dev", "status", "temp"];
+    pub const CPU_VARS: &[&str] = &["temp", "unit", "warn"];
+    pub const FAN_VARS: &[&str] = &["rpm"];
+    pub const DOCKER_VARS: &[&str] = &["name", "status"];
+
+    /// Replaces any template that fails to parse or uses an unknown
+    /// variable with its default, returning one message per replacement.
+    /// Per-screen rather than all-or-nothing so one typo doesn't throw
+    /// away every other customization.
+    pub fn validate(&mut self) -> Vec<String> {
+        let defaults = TemplatesConfig::default();
+        let mut errors = Vec::new();
+        let mut check = |kind: &str, tpl: &mut ScreenTemplate, default: ScreenTemplate, vars: &[&str]| {
+            let problem = [&tpl.line0, &tpl.line1].into_iter().find_map(|line| {
+                match crate::template::placeholders(line) {
+                    Err(e) => Some(e),
+                    Ok(names) => names.into_iter().find(|n| !vars.contains(n)).map(|n| {
+                        format!("unknown variable {{{n}}} in \"{line}\" (available: {})", vars.join(", "))
+                    }),
+                }
+            });
+            if let Some(p) = problem {
+                errors.push(format!("[templates.{kind}]: {p}; using the default"));
+                *tpl = default;
+            }
+        };
+        check("network", &mut self.network, defaults.network, Self::NETWORK_VARS);
+        check("pool", &mut self.pool, defaults.pool, Self::POOL_VARS);
+        check("hdd", &mut self.hdd, defaults.hdd, Self::HDD_VARS);
+        check("cpu", &mut self.cpu, defaults.cpu, Self::CPU_VARS);
+        check("fan", &mut self.fan, defaults.fan, Self::FAN_VARS);
+        check("docker", &mut self.docker, defaults.docker, Self::DOCKER_VARS);
+        errors
     }
 }
 
@@ -278,7 +405,7 @@ pub struct TemperatureConfig {
     /// on the temperature screen, and log a syslog WARNING
     /// (`monitor::HealthMonitor`), for any currently-connected sensor at or
     /// above this. Always degrees C regardless of `units` (which only
-    /// affects the temperature *screen's* display, not this comparison).
+    /// affects the CPU and HDD *screens'* display, not this comparison).
     pub warn_threshold: f32,
     /// Fallback critical threshold -- log CRITICAL instead of WARNING for
     /// any sensor at or above this. Always degrees C.
@@ -607,8 +734,13 @@ pub fn default_fans() -> Vec<FanProfile> {
 impl Config {
     pub fn load(path: &Path) -> Config {
         match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(cfg) => cfg,
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(mut cfg) => {
+                    for e in cfg.templates.validate() {
+                        eprintln!("{}: {e}", path.display());
+                    }
+                    cfg
+                }
                 Err(e) => {
                     eprintln!("failed to parse {}: {e}, using defaults", path.display());
                     Config::default()
@@ -616,5 +748,50 @@ impl Config {
             },
             Err(_) => Config::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> (Config, Vec<String>) {
+        let mut cfg: Config = toml::from_str(text).unwrap();
+        let errors = cfg.templates.validate();
+        (cfg, errors)
+    }
+
+    #[test]
+    fn default_templates_are_valid() {
+        assert!(TemplatesConfig::default().validate().is_empty());
+    }
+
+    #[test]
+    fn omitted_line_is_blank() {
+        let (cfg, errors) = parse("[templates.pool]\nline1 = \"{free} free\"\n");
+        assert!(errors.is_empty());
+        assert_eq!(cfg.templates.pool.line0, "");
+        assert_eq!(cfg.templates.pool.line1, "{free} free");
+        // Blocks not mentioned at all keep their defaults.
+        assert_eq!(cfg.templates.fan.line1, "{rpm} RPM");
+    }
+
+    #[test]
+    fn unknown_variable_falls_back_per_screen() {
+        let (cfg, errors) =
+            parse("[templates.pool]\nline1 = \"{fre} free\"\n[templates.fan]\nline0 = \"CHASSIS\"\n");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("{fre}"));
+        assert_eq!(cfg.templates.pool.line1, "{alloc}/{size} {cap}");
+        assert_eq!(cfg.templates.fan.line0, "CHASSIS");
+    }
+
+    #[test]
+    fn partial_order_appends_the_rest() {
+        let (cfg, _) = parse("[screens]\norder = [\"docker\", \"hdd\", \"docker\"]\n");
+        assert_eq!(
+            cfg.screens.effective_order(),
+            vec![Category::Docker, Category::Hdd, Category::Network, Category::Pools, Category::Temperature]
+        );
     }
 }
