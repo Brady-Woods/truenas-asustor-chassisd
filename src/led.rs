@@ -14,7 +14,43 @@ use std::path::Path;
 const LEDS: &str = "/sys/class/leds";
 
 fn write_attr(led: &str, attr: &str, value: &str) {
+    #[cfg(not(test))]
     let _ = std::fs::write(format!("{LEDS}/{led}/{attr}"), value);
+    #[cfg(test)]
+    test_writes::record(led, attr, value);
+}
+
+/// Under `cfg(test)` LED writes never reach sysfs; they're recorded per
+/// test thread instead, so state-machine tests can assert on them (and
+/// can't flip a real front panel if run on the NAS itself).
+#[cfg(test)]
+pub mod test_writes {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static WRITES: RefCell<Vec<(String, String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record(led: &str, attr: &str, value: &str) {
+        WRITES.with(|w| {
+            w.borrow_mut()
+                .push((led.to_string(), attr.to_string(), value.to_string()));
+        });
+    }
+
+    /// Drains and returns every write recorded on this thread so far.
+    pub fn take() -> Vec<(String, String, String)> {
+        WRITES.with(|w| std::mem::take(&mut *w.borrow_mut()))
+    }
+
+    /// True if `led`'s `attr` was written as `value` since the last `take`.
+    pub fn wrote(led: &str, attr: &str, value: &str) -> bool {
+        WRITES.with(|w| {
+            w.borrow()
+                .iter()
+                .any(|(l, a, v)| l == led && a == attr && v == value)
+        })
+    }
 }
 
 fn set_solid(led: &str, on: bool) {
