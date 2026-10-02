@@ -96,6 +96,10 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     let active = state.override_summary();
     let _ = writeln!(out, "  {}\n", active.as_deref().unwrap_or("none"));
 
+    out.push_str("-- Locate --\n");
+    let locating = state.locate_summary();
+    let _ = writeln!(out, "  {}\n", locating.as_deref().unwrap_or("none"));
+
     out.push_str("-- Overall status LED --\n");
     let _ = writeln!(out, "  pattern: {:?}", summary.pattern);
     let _ = writeln!(

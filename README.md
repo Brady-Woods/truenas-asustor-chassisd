@@ -72,7 +72,7 @@ TrueNAS-native boot task.
   status-LED decision logic (which pattern to show for which health
   state).
 - **`state.rs`** -- the actual state machine: status rotation, the
-  shutdown/restart action menu, socket overrides, sleep. All the
+  shutdown/restart action menu, socket overrides, locate, sleep. All the
   interactions between these live in one place (e.g. "a critical alert can
   preempt rotation but never a confirm screen").
 - **`socket.rs`** -- the Unix socket other processes (an LED/status
@@ -191,6 +191,7 @@ meaningfully bigger action than a sysfs write, left as an operator-set
 | `Degraded` | solid | 500ms/500ms blink | a ZFS pool is `DEGRADED` (factory pattern) |
 | `Failed` | off | solid | a pool is `FAULTED`/`UNAVAIL`/`OFFLINE`, or `error`-level socket alert |
 | `CriticalFlashing` | off | 1000ms/1000ms blink | `critical`-level socket alert |
+| `Locate` | 250ms/250ms blink | 250ms/250ms blink (together = amber flash) | a chassis `LOCATE` (not a health state; wins over all of the above while it lasts) |
 
 `red:status` is **not** one of the IT8625E's hardware-blinkable LEDs (see
 `asustord`'s `LED-MODES.md`) -- it's software-timer-driven, so there's no
@@ -213,6 +214,14 @@ triggers use):
 | `Failed` | confirmed SMART failure -- solid red (factory pattern) |
 | `Alert` | an `error`/`critical` socket message named this bay (`bay=N`) but it isn't a confirmed SMART failure -- 1000ms/1000ms red flash, same rate as the status LED |
 | `Standby` | drive is spun down -- green flashes slowly (250ms/9750ms) |
+| `Locate` | a `LOCATE bay=N` is active -- green **and** red flashing together at 250ms/250ms (amber flash); see "`LOCATE`" below |
+
+**Precedence**, highest first: `Locate` > `Alert` > the SMART-derived
+state (`Failed`/`Standby`/`Normal`). It's recomputed from all three every
+time any one changes rather than remembered, so ending a locate or alert
+shows what the layers below it say *now* -- a SMART failure found mid-locate
+is solid red the moment the locate ends, not whatever the bay was showing
+when it started.
 
 ## Fan control
 
@@ -429,6 +438,9 @@ SHOW <level> <ttl_secs> [bay=N]
 <line1>
 
 CLEAR [bay=N]
+
+LOCATE [bay=N] [ttl_secs]
+LOCATE off [bay=N]
 ```
 
 - `level`: `info` | `warn` | `error` | `critical`. Ordered -- a higher
@@ -471,6 +483,65 @@ printf "SHOW critical 0 bay=2\nDRIVE FAILURE\nCheck bay 2\n" \
 ```sh
 printf "CLEAR\n" | nc -U /run/lcm-status.sock -q1
 ```
+
+### `LOCATE`: find a drive (or the box)
+
+The equivalent of ADM's "inspection LED": blink something distinctive so
+whoever is standing at the rack can find it.
+
+```sh
+sudo lcm-status locate 2              # bay 2, default 60s
+sudo lcm-status locate 2 --ttl 300    # bay 2, 5 minutes
+sudo lcm-status locate                # the whole chassis
+sudo lcm-status locate --ttl 0        # chassis, until turned off
+sudo lcm-status locate 2 --off        # stop bay 2
+sudo lcm-status locate --off          # stop every locate
+```
+
+(`[CONFIG]` can follow, as for `status`, to find a non-default socket
+path.) These just send `LOCATE [off] [bay=N] [ttl_secs]` over the socket,
+so `printf "LOCATE bay=2\n" | nc -U /run/lcm-status.sock -q1` is the same
+thing.
+
+- **`bay=N`**: both of that bay's LEDs flash together at 250ms/250ms --
+  amber, not red or green. No other bay state ever lights both colors at
+  once, and the rate is unlike all of them too (`Alert` is 1000/1000 red,
+  `Standby` is a 250/9750 green blip). Strict green/red *alternation*
+  isn't possible: each LED's `ledtrig-timer` blink is its own software
+  timer, restarted by every `delay_on`/`delay_off` write, with no way to
+  set one's phase against another's -- written back to back, they start
+  in step instead. Bays count from 1; an empty bay can be located too.
+- **No bay**: the whole chassis -- the blue power LED and both status LED
+  colors flash at the same 250/250, and the LCD shows the hostname over
+  `LOCATE 57s` (the time left). The power LED never blinks for anything
+  else.
+- **`ttl_secs`**: how long it lasts; default 60, `0` = until `LOCATE off`.
+  Sending `LOCATE` again for something already blinking restarts its TTL.
+- **`LOCATE off bay=N`** stops that bay; **`LOCATE off`** with no bay
+  stops *everything* being located, chassis and bays alike.
+- **`CLEAR` doesn't touch a locate**, in either direction: the two are
+  independent, so a script clearing its own alert can't cut someone's
+  locate short.
+
+While it lasts, a locate wins over everything else on the LEDs it uses,
+including a confirmed SMART failure (the drive you're hunting for is often
+the failed one -- which is why its pattern has to be distinguishable from
+`Failed`) and a `critical` override's status-LED flash and LCD text. When it
+ends, those LEDs (and the LCD) go back to whatever the daemon's state says
+they should show *at that moment* -- see "Precedence" under Front LEDs.
+The one exception: a chassis locate never interrupts the action menu or a
+shutdown/restart confirm screen on the LCD (it waits behind them, like an
+override) -- its LEDs still start at once.
+
+**At night**, a locate lights its LEDs anyway without waking the rest of
+the panel -- NIC/LAN/USB LEDs stay dark, and a chassis locate shows only
+its own screen on the otherwise-blank LCD. When it ends, its LEDs go back
+to the night state (bay green dark, red still showing a real failure;
+power and status dark), not the daytime one. If night mode starts or ends
+while a locate is running, the locate keeps blinking straight through.
+
+`lcm-status status` lists active locates and their time left under
+`-- Locate --`.
 
 ### `STATUS`: dump a live health report to the terminal
 
@@ -522,6 +593,9 @@ NIC's link/monitoring status, plus the active socket override if any:
 -- Active override --
   none
 
+-- Locate --
+  bay 2 (41s left)
+
 -- Overall status LED --
   pattern: Ok
   severity: Info  (fan=Info temp=Info network=Info pool_degraded=false pool_faulted=false bay_failed=false)
@@ -532,7 +606,7 @@ keeps a second cloned handle to the stream for writing the response after
 the `BufReader` has consumed the original for reading -- a Unix stream
 socket's two directions are independent, so this works even though a
 plain read loop would otherwise "consume" the connection. The client
-(`request_status` in `main.rs`) sends its request, then shuts down just
+(`socket_request` in `main.rs`) sends its request, then shuts down just
 its *write* half (`Shutdown::Write`) so the daemon's `.lines()` sees EOF
 and stops waiting for more input, while the read half stays open to
 receive the reply.
@@ -603,6 +677,9 @@ The binary doubles as a CLI for testing against the hardware directly
 
 ```sh
 lcm-status daemon [path]           # run the daemon (what the systemd unit does)
+lcm-status status [path]           # the running daemon's health report
+lcm-status locate [bay] [--ttl N] [--off] [path]
+                                    # blink a bay's (or the chassis') LEDs to find it
 lcm-status init                    # send the power-on sequence
 lcm-status settext 0 "HELLO"       # write up to 16 chars to line 0 or 1
 lcm-status listen 60               # print every unsolicited frame (button

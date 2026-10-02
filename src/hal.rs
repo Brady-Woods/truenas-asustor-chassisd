@@ -799,6 +799,23 @@ pub fn docker_issues(ignore: &[String], tpl: &ScreenTemplate) -> Vec<Screen> {
         .collect()
 }
 
+/// This machine's hostname, for the chassis `LOCATE` screen -- the thing
+/// that tells two identical boxes in a rack apart. `None` if it can't be
+/// read (or isn't set).
+pub fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes for the whole
+    // call; `gethostname` writes at most that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // Truncation may leave no terminator; take everything up to one if any.
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

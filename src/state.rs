@@ -1,5 +1,5 @@
 //! The daemon's state machine: status rotation, the action menu, confirm
-//! flow, socket overrides, and sleep -- all in one place so the
+//! flow, socket overrides, locate, and sleep -- all in one place so the
 //! interactions between them (e.g. "a critical alert can preempt rotation
 //! but not a confirm screen") are enforced in one spot, not scattered
 //! across the event loop.
@@ -9,6 +9,7 @@ use crate::hal::{self, Screen};
 use crate::led;
 use crate::protocol::Key;
 use crate::socket::{Level, SocketCommand};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,40 @@ struct Override {
     bay: Option<u32>,
     line0: String,
     line1: String,
+}
+
+/// A chassis-wide `LOCATE` (one with no bay): power and status LEDs
+/// flashing, and the hostname on the LCD, until `until` (`None`: until
+/// `LOCATE off`).
+#[derive(Debug)]
+struct ChassisLocate {
+    until: Option<Instant>,
+    /// Read once when the locate starts, not on every render.
+    hostname: String,
+}
+
+impl ChassisLocate {
+    /// The LCD text: the hostname -- the thing that tells two identical
+    /// boxes in a rack apart -- over "LOCATE" and the time left, if any.
+    fn screen(&self) -> (String, String) {
+        let line1 = match self.until {
+            Some(t) => format!("LOCATE {}s", secs_left(t)),
+            None => "LOCATE".to_string(),
+        };
+        let line0 = if self.hostname.is_empty() {
+            "LOCATE".to_string()
+        } else {
+            self.hostname.clone()
+        };
+        (line0, line1)
+    }
+}
+
+/// Whole seconds until `t`, rounded up so a countdown never shows 0s
+/// while it's still running.
+fn secs_left(t: Instant) -> u64 {
+    let left = t.saturating_duration_since(Instant::now());
+    left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
 #[derive(Debug)]
@@ -92,6 +127,13 @@ pub struct AppState {
     /// tracked separately from `over.bay` so we know which bay's LED to
     /// restore to Normal when the override changes or clears.
     alert_bay: Option<u32>,
+    /// Bays an active `LOCATE bay=N` is blinking, each with when it ends
+    /// (`None`: until `LOCATE off`). Layered over the health/alert state by
+    /// `bay_led_state` rather than replacing it, so a bay goes back to
+    /// whatever that state has become by the time its locate ends -- e.g.
+    /// a SMART failure found mid-locate shows the moment it's over.
+    locate_bays: BTreeMap<u32, Option<Instant>>,
+    locate_chassis: Option<ChassisLocate>,
     sleeping: bool,
     schedule_wants_sleep: bool,
     awake_override_until: Option<Instant>,
@@ -150,6 +192,8 @@ impl AppState {
             over: None,
             pending_over: None,
             alert_bay: None,
+            locate_bays: BTreeMap::new(),
+            locate_chassis: None,
             sleeping: false,
             schedule_wants_sleep: false,
             awake_override_until: None,
@@ -194,46 +238,67 @@ impl AppState {
 
     fn update_health_leds(&mut self) {
         let bay_states = self.bay_states();
-        for &(bay, bay_state) in &bay_states {
-            led::set_bay(bay, bay_state);
+        for &(bay, _) in &bay_states {
+            self.apply_bay_led(bay);
         }
         self.monitor.check_bays(&bay_states);
-        // An active override's bay alert takes precedence over whatever
-        // health-derived state that bay just got set to.
-        self.reapply_bay_alert();
         self.recompute_status_led();
     }
 
-    /// Re-asserts the currently active override's bay flash, if any. Needed
-    /// after `update_health_leds` runs (which would otherwise clobber it
-    /// with the plain health-derived state for that bay).
-    fn reapply_bay_alert(&self) {
-        if let Some(bay) = self
-            .over
-            .as_ref()
-            .filter(|o| o.level.always_visible())
-            .and_then(|o| o.bay)
-        {
-            led::set_bay(bay, led::BayState::Alert);
+    /// What a bay's LEDs should show right now, by precedence:
+    ///
+    /// 1. an active `LOCATE` -- temporary, and explicitly asked for by
+    ///    someone standing at the rack; the drive they're looking for is
+    ///    often the failed one, so it has to win over `Failed` too;
+    /// 2. an active error/critical override's `Alert` for this bay;
+    /// 3. the SMART-derived health state.
+    ///
+    /// Recomputed from all three every time rather than remembered, so
+    /// ending a layer exposes the *current* state of the ones below it,
+    /// never a stale snapshot from when it started.
+    fn bay_led_state(&self, bay: u32) -> led::BayState {
+        if self.locate_bays.contains_key(&bay) {
+            led::BayState::Locate
+        } else if self.alert_bay == Some(bay) {
+            led::BayState::Alert
+        } else {
+            self.bay_states()
+                .into_iter()
+                .find(|&(b, _)| b == bay)
+                .map_or(led::BayState::Normal, |(_, s)| s)
+        }
+    }
+
+    /// Writes `bay_led_state` to that bay's LEDs -- in its night-mode form
+    /// while asleep, so ending a locate at 3am goes back to dark, not to
+    /// daytime activity blinking.
+    fn apply_bay_led(&self, bay: u32) {
+        let state = self.bay_led_state(bay);
+        if self.sleeping {
+            led::set_bay_night(bay, state);
+        } else {
+            led::set_bay(bay, state);
         }
     }
 
     /// Called whenever the active override changes: starts/stops that
     /// bay's alert flash (a cheap, single-bay write -- not a full SMART
-    /// re-scan) and recomputes the status LED to match.
+    /// re-scan) and recomputes the status LED to match. A bay that stops
+    /// alerting goes back to whatever `bay_led_state` now says (its health
+    /// state, or a locate), not blindly to `Normal`.
     fn sync_leds_to_override(&mut self) {
         let want = self
             .over
             .as_ref()
             .filter(|o| o.level.always_visible())
             .and_then(|o| o.bay);
-        if self.alert_bay != want {
-            if let Some(old) = self.alert_bay {
-                led::set_bay(old, led::BayState::Normal);
-            }
-            self.alert_bay = want;
+        let previous = std::mem::replace(&mut self.alert_bay, want);
+        if let Some(old) = previous.filter(|&b| Some(b) != want) {
+            self.apply_bay_led(old);
         }
-        self.reapply_bay_alert();
+        if let Some(bay) = want {
+            self.apply_bay_led(bay);
+        }
         self.recompute_status_led();
     }
 
@@ -245,14 +310,126 @@ impl AppState {
     /// health + a too-broad network check, so it could show amber (or
     /// miss a real problem) while completely disconnected from what the
     /// rest of the daemon was actually observing.
+    ///
+    /// Two things sit above that verdict: a chassis `LOCATE` (for its
+    /// bounded TTL; the verdict is recomputed fresh the moment it ends) and
+    /// night mode, which keeps the LED dark (as `led::enter_night_mode`
+    /// left it) even when something like a `CLEAR` asks for a recompute.
     fn recompute_status_led(&self) {
-        if let Some(ov) = &self.over
+        if self.locate_chassis.is_some() {
+            led::set_status(led::StatusPattern::Locate);
+        } else if self.sleeping {
+            led::set_status(led::StatusPattern::Off);
+        } else if let Some(ov) = &self.over
             && let Some(pattern) = led::pattern_for_level(ov.level)
         {
             led::set_status(pattern);
-            return;
+        } else {
+            led::set_status(self.health_summary().pattern);
         }
-        led::set_status(self.health_summary().pattern);
+    }
+
+    /// The power LED: flashing during a chassis `LOCATE`, otherwise dark at
+    /// night and solid blue by day.
+    fn apply_power_led(&self) {
+        led::set_power(if self.locate_chassis.is_some() {
+            led::PowerPattern::Locate
+        } else if self.sleeping {
+            led::PowerPattern::Off
+        } else {
+            led::PowerPattern::On
+        });
+    }
+
+    /// Re-applies every LED an active locate owns. Entering and leaving
+    /// night mode both rewrite the front LEDs wholesale, and a locate is
+    /// meant to keep blinking straight through either.
+    fn reassert_locate_leds(&self) {
+        for &bay in self.locate_bays.keys() {
+            led::set_bay(bay, led::BayState::Locate);
+        }
+        if self.locate_chassis.is_some() {
+            led::set_power(led::PowerPattern::Locate);
+            led::set_status(led::StatusPattern::Locate);
+        }
+    }
+
+    /// Starts a locate, or restarts the TTL of one already running.
+    /// Deliberately exempt from the rules `show_override` enforces for
+    /// messages: it never wakes the panel from night mode (it lights its
+    /// own LEDs regardless, then hands them back to the night state), and
+    /// it isn't held back while the action menu is open -- its LEDs apply
+    /// at once, and the chassis screen just waits behind the menu in
+    /// `render`.
+    fn start_locate(&mut self, bay: Option<u32>, ttl_secs: u64) {
+        // A TTL too large to represent (checked_add -> None) is as good as
+        // "until LOCATE off" -- and must not panic the daemon.
+        let until = (ttl_secs > 0)
+            .then(|| Instant::now().checked_add(Duration::from_secs(ttl_secs)))
+            .flatten();
+        match bay {
+            Some(bay) => {
+                self.locate_bays.insert(bay, until);
+                self.apply_bay_led(bay);
+            }
+            None => {
+                self.locate_chassis = Some(ChassisLocate {
+                    until,
+                    hostname: hal::hostname().unwrap_or_default(),
+                });
+                self.reset_scroll();
+                self.apply_power_led();
+                self.recompute_status_led();
+            }
+        }
+    }
+
+    /// `LOCATE off`: ends the locate on `bay`, or with `None`, every
+    /// active locate, chassis included.
+    fn stop_locate(&mut self, bay: Option<u32>) {
+        match bay {
+            Some(bay) => self.end_bay_locate(bay),
+            None => {
+                let bays: Vec<u32> = self.locate_bays.keys().copied().collect();
+                for bay in bays {
+                    self.end_bay_locate(bay);
+                }
+                self.end_chassis_locate();
+            }
+        }
+    }
+
+    /// Ends every locate whose TTL has run out.
+    fn expire_locates(&mut self) {
+        let now = Instant::now();
+        let due = |until: Option<Instant>| until.is_some_and(|t| now >= t);
+        let expired: Vec<u32> = self
+            .locate_bays
+            .iter()
+            .filter(|&(_, &until)| due(until))
+            .map(|(&bay, _)| bay)
+            .collect();
+        for bay in expired {
+            self.end_bay_locate(bay);
+        }
+        if self.locate_chassis.as_ref().is_some_and(|c| due(c.until)) {
+            self.end_chassis_locate();
+        }
+    }
+
+    /// Hands a bay's LEDs back to whatever `bay_led_state` says now.
+    fn end_bay_locate(&mut self, bay: u32) {
+        if self.locate_bays.remove(&bay).is_some() {
+            self.apply_bay_led(bay);
+        }
+    }
+
+    fn end_chassis_locate(&mut self) {
+        if self.locate_chassis.take().is_some() {
+            self.reset_scroll();
+            self.apply_power_led();
+            self.recompute_status_led();
+        }
     }
 
     /// The same aggregate `recompute_status_led` turns into an LED
@@ -332,6 +509,27 @@ impl AppState {
             let bay = o.bay.map(|b| format!(" bay={b}")).unwrap_or_default();
             format!("{:?}{bay}: {} / {}", o.level, o.line0, o.line1)
         })
+    }
+
+    /// Every active locate and how long it has left, for the `status`
+    /// report. `None` when nothing is being located.
+    pub fn locate_summary(&self) -> Option<String> {
+        let left = |until: Option<Instant>| {
+            until.map_or_else(
+                || "until LOCATE off".to_string(),
+                |t| format!("{}s left", secs_left(t)),
+            )
+        };
+        let chassis = self
+            .locate_chassis
+            .iter()
+            .map(|c| format!("chassis ({})", left(c.until)));
+        let bays = self
+            .locate_bays
+            .iter()
+            .map(|(bay, &until)| format!("bay {bay} ({})", left(until)));
+        let all: Vec<String> = chassis.chain(bays).collect();
+        (!all.is_empty()).then(|| all.join(", "))
     }
 
     /// Network's contribution to the aggregate above -- see
@@ -618,6 +816,8 @@ impl AppState {
                     self.pending_over = Some(ov);
                 }
             }
+            SocketCommand::Locate { bay, ttl_secs } => self.start_locate(bay, ttl_secs),
+            SocketCommand::LocateOff { bay } => self.stop_locate(bay),
             // Handled directly in main.rs's loop (needs the fan status,
             // which lives outside AppState) before a command ever reaches
             // here -- never actually matched at runtime, just keeps this
@@ -665,10 +865,15 @@ impl AppState {
             led::set_nic_mode(iface, self.cfg.led.nic_mode);
         }
         self.refresh_all();
+        self.reassert_locate_leds();
     }
 
     /// Called on every event-loop wakeup; returns what to display or do.
     pub fn tick(&mut self) -> Effect {
+        // Ahead of the asleep early-returns below: a locate started at
+        // night still has to end on time.
+        self.expire_locates();
+
         // Sleep/wake transitions take priority over everything else, but
         // never fire mid-menu-interaction, never re-sleep through an active
         // override (e.g. a critical alert still showing), and respect the
@@ -688,19 +893,27 @@ impl AppState {
         {
             self.sleeping = true;
             led::enter_night_mode(&hal::physical_nics());
-            // Blanks the text but leaves the panel's own MCU powered --
-            // unlike cutting power:lcd, which also kills the MCU (and so,
-            // its ability to report a button press at all: confirmed live,
-            // zero serial frames arrive while power:lcd is 0). This is the
-            // whole point: night mode has to stay wakeable by a button.
-            return Effect::Render(String::new(), String::new());
+            // Night mode just darkened every LED wholesale; a locate in
+            // progress keeps blinking straight through it.
+            self.reassert_locate_leds();
         }
         if !self.schedule_wants_sleep && self.sleeping {
             self.wake();
             return self.render();
         }
         if self.sleeping {
-            return Effect::Render(String::new(), String::new());
+            // Blanks the text but leaves the panel's own MCU powered --
+            // unlike cutting power:lcd, which also kills the MCU (and so,
+            // its ability to report a button press at all: confirmed live,
+            // zero serial frames arrive while power:lcd is 0). This is the
+            // whole point: night mode has to stay wakeable by a button.
+            // A chassis locate is the one thing shown anyway, without
+            // waking the rest of the panel.
+            return if self.locate_chassis.is_some() {
+                self.render()
+            } else {
+                Effect::Render(String::new(), String::new())
+            };
         }
 
         self.refresh_stale();
@@ -736,6 +949,7 @@ impl AppState {
         // is currently scrolling (don't cut a scroll cycle short).
         if matches!(self.mode, Mode::Status)
             && self.over.is_none()
+            && self.locate_chassis.is_none()
             && self.auto_rotate
             && !self.screens.is_empty()
             && !self.is_scrolling()
@@ -758,13 +972,19 @@ impl AppState {
     }
 
     fn render(&mut self) -> Effect {
-        if self.sleeping {
+        if self.sleeping && self.locate_chassis.is_none() {
             return Effect::None;
         }
 
         let (raw0, raw1) = match &self.mode {
             Mode::Status => {
-                if let Some(ov) = &self.over {
+                // A chassis locate outranks even a critical override on
+                // the LCD, for the same bounded-TTL reason it does on the
+                // status LED -- the override is still there, untouched,
+                // and shows again the moment the locate ends.
+                if let Some(locate) = &self.locate_chassis {
+                    locate.screen()
+                } else if let Some(ov) = &self.over {
                     (ov.line0.clone(), ov.line1.clone())
                 } else if let Some(s) = self.screens.get(self.index) {
                     (s.line0.clone(), s.line1.clone())
@@ -924,6 +1144,278 @@ mod tests {
         assert!(s.sleeping);
         assert!(active(&s).is_none());
         assert!(!test_writes::wrote("blue:power", "brightness", "1"));
+    }
+
+    fn locate(state: &mut AppState, bay: Option<u32>, ttl_secs: u64) {
+        state.apply_socket_command(SocketCommand::Locate { bay, ttl_secs });
+    }
+
+    fn locate_off(state: &mut AppState, bay: Option<u32>) {
+        state.apply_socket_command(SocketCommand::LocateOff { bay });
+    }
+
+    /// Makes every active locate's TTL due, as if it had run out.
+    fn run_out_locates(state: &mut AppState) {
+        let now = Some(Instant::now());
+        for until in state.locate_bays.values_mut() {
+            *until = now;
+        }
+        if let Some(c) = &mut state.locate_chassis {
+            c.until = now;
+        }
+        state.expire_locates();
+    }
+
+    fn disk(bay: u32, smart: hal::SmartStatus) -> hal::Disk {
+        hal::Disk {
+            name: format!("sd{bay}"),
+            bay: Some(bay),
+            smart,
+        }
+    }
+
+    const LOCATE_MS: &str = "250";
+
+    fn bay_is_locating(bay: u32) -> bool {
+        [
+            format!("sata{bay}:green:disk"),
+            format!("sata{bay}:red:disk"),
+        ]
+        .iter()
+        .all(|led| {
+            test_writes::wrote(led, "trigger", "timer")
+                && test_writes::wrote(led, "delay_on", LOCATE_MS)
+                && test_writes::wrote(led, "delay_off", LOCATE_MS)
+        })
+    }
+
+    #[test]
+    fn locate_pattern_is_unlike_every_other_bay_state() {
+        let pattern = |state: led::BayState| {
+            test_writes::take();
+            led::set_bay(1, state);
+            test_writes::take()
+        };
+        let locate = pattern(led::BayState::Locate);
+        for other in [
+            led::BayState::Normal,
+            led::BayState::Failed,
+            led::BayState::Alert,
+            led::BayState::Standby,
+        ] {
+            assert_ne!(pattern(other), locate, "{other:?}");
+        }
+        assert_eq!(led::LOCATE_BLINK_MS.to_string(), LOCATE_MS);
+    }
+
+    #[test]
+    fn bay_locate_blinks_then_restores_health_state() {
+        let mut s = state();
+        s.disks = vec![disk(2, hal::SmartStatus::Standby)];
+        test_writes::take();
+        locate(&mut s, Some(2), 60);
+        assert!(bay_is_locating(2));
+
+        test_writes::take();
+        run_out_locates(&mut s);
+        assert!(s.locate_bays.is_empty());
+        // Back to Standby's slow green blip, red off.
+        assert!(test_writes::wrote("sata2:green:disk", "delay_off", "9750"));
+        assert!(test_writes::wrote("sata2:red:disk", "brightness", "0"));
+    }
+
+    #[test]
+    fn smart_failure_found_mid_locate_shows_once_it_ends() {
+        let mut s = state();
+        s.disks = vec![disk(3, hal::SmartStatus::Passed)];
+        locate(&mut s, Some(3), 0);
+
+        // A refresh finds the drive failed while it's being located: the
+        // locate keeps the LEDs...
+        s.disks = vec![disk(3, hal::SmartStatus::Failed)];
+        test_writes::take();
+        s.update_health_leds();
+        assert!(bay_is_locating(3));
+        assert!(!test_writes::wrote("sata3:red:disk", "brightness", "1"));
+
+        // ...and the failure is what's left when it ends.
+        test_writes::take();
+        locate_off(&mut s, Some(3));
+        assert!(test_writes::wrote("sata3:red:disk", "brightness", "1"));
+        assert!(test_writes::wrote("sata3:green:disk", "brightness", "0"));
+    }
+
+    #[test]
+    fn locate_outranks_an_override_alert_and_hands_back_to_it() {
+        let mut s = state();
+        s.apply_socket_command(SocketCommand::Show {
+            level: Level::Critical,
+            ttl_secs: 0,
+            bay: Some(1),
+            line0: "DISK".into(),
+            line1: String::new(),
+        });
+        test_writes::take();
+        locate(&mut s, Some(1), 60);
+        assert!(bay_is_locating(1));
+
+        // The override's own bookkeeping re-runs mid-locate (e.g. a newer
+        // critical message) without stealing the LEDs back.
+        test_writes::take();
+        s.sync_leds_to_override();
+        assert!(!test_writes::wrote("sata1:red:disk", "delay_on", "1000"));
+
+        test_writes::take();
+        run_out_locates(&mut s);
+        assert!(test_writes::wrote("sata1:red:disk", "delay_on", "1000"));
+    }
+
+    #[test]
+    fn locate_off_without_a_bay_stops_everything() {
+        let mut s = state();
+        locate(&mut s, Some(1), 0);
+        locate(&mut s, Some(4), 0);
+        locate(&mut s, None, 0);
+        locate_off(&mut s, None);
+        assert!(s.locate_bays.is_empty());
+        assert!(s.locate_chassis.is_none());
+    }
+
+    #[test]
+    fn locate_off_for_one_bay_leaves_the_rest() {
+        let mut s = state();
+        locate(&mut s, Some(1), 0);
+        locate(&mut s, Some(2), 0);
+        locate(&mut s, None, 0);
+        locate_off(&mut s, Some(1));
+        assert_eq!(s.locate_bays.keys().copied().collect::<Vec<_>>(), [2]);
+        assert!(s.locate_chassis.is_some());
+    }
+
+    #[test]
+    fn clear_does_not_cancel_a_locate() {
+        let mut s = state();
+        locate(&mut s, Some(2), 0);
+        locate(&mut s, None, 0);
+        s.apply_socket_command(SocketCommand::Clear { bay: None });
+        s.apply_socket_command(SocketCommand::Clear { bay: Some(2) });
+        assert!(s.locate_bays.contains_key(&2));
+        assert!(s.locate_chassis.is_some());
+    }
+
+    #[test]
+    fn absurd_locate_ttl_does_not_panic() {
+        let mut s = state();
+        locate(&mut s, Some(1), u64::MAX);
+        assert_eq!(s.locate_bays.get(&1), Some(&None));
+    }
+
+    #[test]
+    fn repeating_a_locate_restarts_its_ttl() {
+        let mut s = state();
+        locate(&mut s, Some(2), 5);
+        locate(&mut s, Some(2), 0);
+        assert_eq!(s.locate_bays.get(&2), Some(&None));
+    }
+
+    #[test]
+    fn chassis_locate_shows_on_lcd_and_leds_then_restores() {
+        let mut s = state();
+        show(&mut s, Level::Critical, "FIRE");
+        test_writes::take();
+        locate(&mut s, None, 30);
+        assert!(test_writes::wrote("blue:power", "delay_on", LOCATE_MS));
+        assert!(test_writes::wrote("green:status", "delay_on", LOCATE_MS));
+        assert!(test_writes::wrote("red:status", "delay_on", LOCATE_MS));
+        let Effect::Render(_, line1) = s.render() else {
+            panic!("expected a render");
+        };
+        assert_eq!(line1, "LOCATE 30s");
+
+        test_writes::take();
+        run_out_locates(&mut s);
+        assert!(test_writes::wrote("blue:power", "brightness", "1"));
+        // The critical override was underneath all along.
+        assert!(test_writes::wrote("red:status", "delay_on", "1000"));
+        let Effect::Render(line0, _) = s.render() else {
+            panic!("expected a render");
+        };
+        assert_eq!(line0, "FIRE");
+    }
+
+    #[test]
+    fn chassis_locate_never_interrupts_the_action_menu() {
+        let mut s = state();
+        s.handle_key(Key::Enter);
+        locate(&mut s, None, 0);
+        let Effect::Render(line0, _) = s.render() else {
+            panic!("expected a render");
+        };
+        assert_eq!(line0, ">SHUTDOWN");
+    }
+
+    #[test]
+    fn locate_at_night_lights_without_waking_then_goes_dark_again() {
+        let mut s = state();
+        s.sleeping = true;
+        s.schedule_wants_sleep = true;
+        s.disks = vec![disk(2, hal::SmartStatus::Passed)];
+        test_writes::take();
+        locate(&mut s, Some(2), 0);
+        locate(&mut s, None, 0);
+        assert!(s.sleeping, "a locate must not wake the panel");
+        assert!(bay_is_locating(2));
+        assert!(test_writes::wrote("blue:power", "delay_on", LOCATE_MS));
+        assert!(!test_writes::wrote("blue:lan", "brightness", "1"));
+        // The LCD shows the locate screen, nothing else.
+        let Effect::Render(_, line1) = s.tick() else {
+            panic!("expected a render");
+        };
+        assert_eq!(line1, "LOCATE");
+
+        test_writes::take();
+        locate_off(&mut s, None);
+        // Night state, not daytime: green dark (no activity trigger),
+        // power and status dark.
+        assert!(test_writes::wrote("sata2:green:disk", "brightness", "0"));
+        assert!(!test_writes::wrote(
+            "sata2:green:disk",
+            "trigger",
+            "asustor-sata2"
+        ));
+        assert!(test_writes::wrote("blue:power", "brightness", "0"));
+        assert!(test_writes::wrote("green:status", "brightness", "0"));
+        assert!(matches!(s.tick(), Effect::Render(a, b) if a.is_empty() && b.is_empty()));
+    }
+
+    #[test]
+    fn entering_night_mode_keeps_a_locate_blinking() {
+        let mut s = state();
+        locate(&mut s, Some(1), 0);
+        s.set_schedule_sleep_wanted(true);
+        test_writes::take();
+        s.tick();
+        assert!(s.sleeping);
+        // Night mode darkened sata1's green; the locate put it straight back.
+        let writes = test_writes::take();
+        let last_green_trigger = writes
+            .iter()
+            .rev()
+            .find(|(l, a, _)| l == "sata1:green:disk" && a == "trigger")
+            .map(|(_, _, v)| v.as_str());
+        assert_eq!(last_green_trigger, Some("timer"));
+    }
+
+    #[test]
+    fn locate_summary_lists_what_is_active() {
+        let mut s = state();
+        assert_eq!(s.locate_summary(), None);
+        locate(&mut s, Some(3), 0);
+        locate(&mut s, None, 0);
+        assert_eq!(
+            s.locate_summary().as_deref(),
+            Some("chassis (until LOCATE off), bay 3 (until LOCATE off)")
+        );
     }
 
     #[test]
