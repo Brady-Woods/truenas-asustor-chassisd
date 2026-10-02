@@ -35,6 +35,10 @@ pub fn init() {
 }
 
 fn send(priority: libc::c_int, msg: &str) {
+    // Keep unit tests from writing to the host's system log.
+    if cfg!(test) {
+        return;
+    }
     // Sanitized to a plain %s argument rather than interpolated into the
     // format string -- syslog(3)'s format string is real printf(3), so a
     // message containing a stray "%s" would otherwise be a format-string

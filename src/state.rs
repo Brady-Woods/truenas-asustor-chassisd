@@ -104,12 +104,10 @@ pub struct AppState {
     eject_available: bool,
     monitor: crate::monitor::HealthMonitor,
     /// Worst current fan health across every configured fan -- pushed in
-    /// each tick from main.rs, which owns the actual `FanController`s (a
-    /// separate top-level value from `AppState`, alongside it in the event
-    /// loop, not inside it). Same "current state, not transition-gated"
-    /// reasoning as `HealthMonitor`'s own LED-facing accessors: this feeds
-    /// `recompute_status_led`, syslog transitions are logged by
-    /// `FanController` itself.
+    /// each tick from main.rs, which reads it from `fan::FanService` (fan
+    /// control runs on its own thread, not inside `AppState`). Current
+    /// state, not transition-gated: this feeds `recompute_status_led`,
+    /// while syslog transitions are logged by `FanController` itself.
     fan_health: Level,
 }
 

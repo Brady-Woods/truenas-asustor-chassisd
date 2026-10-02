@@ -3,7 +3,10 @@
 //! these (see the refresh-on-display design), not this module.
 
 use crate::config::{Config, ScreenTemplate, TempUnits};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Two 16-char-window-ready lines. Line contents may be longer than 16
 /// chars; the display layer handles truncation/scrolling.
@@ -22,13 +25,62 @@ fn render(tpl: &ScreenTemplate, vars: &[(&str, &str)]) -> Screen {
     }
 }
 
+/// Upper bound on any one external command. These all run on the main
+/// event loop, and some can block indefinitely: `zpool` on a pool with
+/// suspended I/O, `docker` with a wedged daemon, `smartctl` on a dying
+/// drive.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
+    run_with_timeout(cmd, args, COMMAND_TIMEOUT)
+}
+
+/// Runs `cmd`, returning its trimmed stdout if it exits successfully
+/// within `timeout`. On timeout the child is killed and reaped on a
+/// background thread rather than waited on here: a process stuck in
+/// uninterruptible I/O ignores SIGKILL until the I/O completes, so
+/// waiting for it would just move the hang.
+fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(cmd)
         .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Drain stdout concurrently so a chatty child can't fill the pipe and
+    // block before exiting.
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                crate::syslog::warning(&format!(
+                    "`{cmd} {}` timed out after {}s, killed",
+                    args.join(" "),
+                    timeout.as_secs()
+                ));
+                let _ = child.kill();
+                thread::spawn(move || child.wait());
+                return None;
+            }
+            Err(_) => return None,
+        }
+    };
+
+    let stdout = reader.join().ok()?;
+    status
+        .success()
+        .then(|| String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Every *physical* interface with a global-scope IPv4 -- i.e. actually
@@ -673,4 +725,40 @@ pub fn docker_issues(ignore: &[String], tpl: &ScreenTemplate) -> Vec<Screen> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_returns_stdout_on_success() {
+        assert_eq!(
+            run_with_timeout("echo", &["hello"], Duration::from_secs(5)).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn run_returns_none_on_failure() {
+        assert_eq!(run_with_timeout("false", &[], Duration::from_secs(5)), None);
+        assert_eq!(
+            run_with_timeout("/nonexistent/cmd", &[], Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn run_gives_up_on_a_hung_command() {
+        let start = Instant::now();
+        assert_eq!(
+            run_with_timeout("sleep", &["30"], Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
 }
