@@ -367,6 +367,49 @@ Restores every pwm output's original enable-mode/value when done,
 regardless of what it found. `--yes` skips the confirmation prompt (for
 non-interactive use); otherwise it asks before touching any hardware.
 
+## Wake-on-LAN
+
+```toml
+[wol]
+nics = ["enp2s0"]   # default [] = WOL left however the driver set it
+mode = "g"          # ethtool notation; "g" (default) = magic packet
+```
+
+Neither TrueNAS nor the kernel turns WOL on by itself (`ethtool enp2s0`
+shows `Supports Wake-on: pumbg`, `Wake-on: d` on a fresh boot), and it
+doesn't persist across reboots. `wol.rs` sets it straight through the
+`SIOCETHTOOL` ioctl (`ETHTOOL_GWOL`/`ETHTOOL_SWOL` -- the same thing
+`ethtool -s enp2s0 wol g` does, without depending on `ethtool` being
+installed), and keeps it set:
+
+- at daemon startup;
+- every 60s after that (one cheap ioctl per NIC), in case a link change
+  or driver reload reset it -- logged as a NOTICE when that happens;
+- once more as the daemon exits, which during a shutdown is shortly
+  before power-off.
+
+`mode` *replaces* the NIC's setting rather than adding to it, like
+`ethtool` -- so `"d"` keeps WOL off. Any of `p`/`u`/`m`/`b`/`a`/`g` are
+accepted; `s` (SecureOn password) and `f` (filters) aren't, since there's
+nowhere to configure what they need. A mode the NIC doesn't support, or a
+driver that doesn't take it, is logged once as a WARNING (and once more
+when it recovers). The `status` report has a Wake-on-LAN section listing
+every physical NIC's current mode and what it supports, whether or not
+it's in `nics` -- handy for checking a NIC before adding it.
+
+Caveats -- the NIC only arms WOL; whether the box actually powers on is
+up to the board:
+
+- **BIOS:** ErP/EuP (deep power saving) must be **off**, and wake on
+  PCIe/PCI-E device or LAN **enabled**. With ErP on, the NICs lose standby
+  power in soft-off and nothing can wake the box.
+- Works from **soft-off** (a normal shutdown -- the panel's SHUTDOWN, the
+  TrueNAS UI, `poweroff`) and from suspend. Not after the power has been
+  cut entirely (unplugged, a power failure) -- that's the BIOS's "restore
+  on AC power loss" setting's job instead.
+- The magic packet has to reach that port: sent to *that NIC's* MAC, on
+  its broadcast domain, with a cable connected at the time of shutdown.
+
 ## Health monitoring (syslog)
 
 `monitor.rs` logs to syslog (`syslog.rs`, real `syslog(3)` calls with
@@ -529,7 +572,8 @@ accumulated stall/low-RPM health only the running process knows, not
 something a brand-new invocation could reconstruct), fresh `hal::` reads
 for every connected temp sensor (with its resolved threshold and current
 level), every pool, every drive bay's SMART state, and every physical
-NIC's link/monitoring status, plus the active socket override if any:
+NIC's link/monitoring status and Wake-on-LAN state, plus the active
+socket override if any:
 
 ```
 === lcm-status report ===
@@ -554,6 +598,11 @@ NIC's link/monitoring status, plus the active socket override if any:
   enp2s0     192.168.1.196        monitored, link up
   enp9s0     disconnected         not monitored, link down
 
+-- Wake-on-LAN --
+  enp2s0     g      (supports pumbg)  managed: keeping at g
+  enp3s0     d      (supports pumbg)
+  enp9s0     g      (supports pg)
+
 -- Active override --
   none
 
@@ -577,8 +626,8 @@ receive the reply.
 `/etc/lcm-status.toml`, hand-edited, every field defaulted -- see
 `lcm-status.example.toml` for the full annotated reference (scroll
 speed/limits, per-category refresh floors, sleep schedule, which screens
-are enabled and in what order, NIC LED mode, Docker containers to ignore,
-temperature units/warning threshold).
+are enabled and in what order, NIC LED mode, Wake-on-LAN, Docker
+containers to ignore, temperature units/warning threshold).
 
 The text on each status screen comes from `[templates.*]`: `{variable}`
 templates per screen kind (`network`, `pool`, `hdd`, `cpu`, `fan`,

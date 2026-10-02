@@ -150,6 +150,19 @@ monitored_nics = []
 some_down_level = "warning"
 all_down_level = "error"
 
+[wol]
+# Interfaces to keep Wake-on-LAN enabled on -- set at startup, rechecked
+# every 60s (some drivers reset it on link changes), and once more as the
+# daemon stops during shutdown. Empty (default) = WOL not touched at all.
+# `lcm-status status` shows every NIC's current WOL mode and what it
+# supports. For the box to actually power on from soft-off, the BIOS must
+# have ErP/EuP OFF and wake on PCIe/LAN enabled; it can't wake after a
+# full power loss (that's the BIOS's "restore on AC power loss").
+nics = []                  # e.g. ["enp2s0"]
+# ethtool-style flags (`ethtool -s IFACE wol <mode>`), replacing the NIC's
+# whole setting: "g" = magic packet; also p/u/m/b/a; "d" = keep WOL off.
+mode = "g"
+
 # One [[fans]] block per physical fan -- replaces lm-sensors' fancontrol
 # package entirely (see src/fan.rs for why, and src/fan_calibrate.rs / the
 # `lcm-status fan-profile` command for how to discover real values for

@@ -11,6 +11,7 @@ mod socket;
 mod state;
 mod syslog;
 mod template;
+mod wol;
 
 use config::Config;
 use protocol::{LCM_DEVICE, Lcm, OP_COMMAND, SUB_VERSION};
@@ -245,13 +246,20 @@ fn run_daemon(cfg_path: &Path) {
     state.init_leds();
     state.set_fan_health(fans.status().health);
 
+    let mut wol = wol::WolKeeper::new(&cfg.wol);
+    wol.enforce();
+
     // A panic in the event loop is caught only long enough to hand the
     // fans back before it propagates; the process still exits non-zero
     // and systemd restarts it.
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        event_loop(&mut state, &mut lcm, &cfg, &fans, &rx)
+        event_loop(&mut state, &mut lcm, &cfg, &fans, &mut wol, &rx)
     }));
     fans.shutdown();
+    // Last chance before a shutdown powers the box off (systemd stops
+    // this service on the way down), in case anything reset it since the
+    // last periodic recheck.
+    wol.enforce();
     match outcome {
         Ok(Ok(())) => syslog::info("stopping: signal received, fans handed back"),
         Ok(Err(e)) => {
@@ -269,6 +277,7 @@ fn event_loop(
     lcm: &mut Lcm,
     cfg: &Config,
     fans: &fan::FanService,
+    wol: &mut wol::WolKeeper,
     rx: &mpsc::Receiver<socket::SocketCommand>,
 ) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
@@ -294,6 +303,7 @@ fn event_loop(
             return Err("fan control thread died");
         }
         state.set_fan_health(fans.status().health);
+        wol.maybe_enforce();
 
         let effect = state.tick();
         apply_effect(effect, lcm);
