@@ -131,7 +131,7 @@ pub struct DisplayConfig {
 impl Default for DisplayConfig {
     fn default() -> Self {
         DisplayConfig {
-            serial_device: "/dev/ttyS1".to_string(),
+            serial_device: crate::protocol::LCM_DEVICE.to_string(),
             scroll_step_ms: 300,
             scroll_max_chars: 64,
             scroll_pause_ms: 800,

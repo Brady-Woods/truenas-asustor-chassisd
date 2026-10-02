@@ -13,8 +13,9 @@ mod syslog;
 mod template;
 
 use config::Config;
-use protocol::{Key, Lcm, LCM_DEVICE};
+use protocol::{Lcm, LCM_DEVICE, OP_COMMAND, SUB_VERSION};
 use state::{Action, AppState, Effect};
+use std::os::unix::io::AsRawFd;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -197,10 +198,7 @@ fn run_daemon(cfg_path: &Path) {
         std::process::exit(1);
     });
 
-    // Power-on init sequence, same bytes the original firmware sends.
-    let _ = lcm.send_and_ack(0xF0, 0x11, &[0x01], Duration::from_millis(300));
-    std::thread::sleep(Duration::from_millis(15));
-    let _ = lcm.send_and_ack(0xF0, 0x22, &[0x00], Duration::from_millis(300));
+    let _ = lcm.init();
 
     // deploy.sh already gates on this before it will even build; this is
     // defense-in-depth for the binary being started some other way. LED
@@ -304,19 +302,14 @@ fn event_loop(
         };
         let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if rc > 0 && pfd.revents & libc::POLLIN != 0 {
-            if let Ok(Some((opcode, subcmd, payload, ok))) =
-                lcm.read_frame(Duration::from_millis(50))
-            {
-                if ok && opcode == 0xF0 {
-                    let _ = lcm.ack(subcmd);
-                    if subcmd == 0x80 {
-                        if let Some(&code) = payload.first() {
-                            let key: Key = code.into();
-                            let effect = state.handle_key(key);
-                            apply_effect(effect, lcm, cfg);
-                            drain_pending_keys(state, lcm, cfg);
-                        }
-                    }
+            if let Ok(Some(frame)) = lcm.read_frame(Duration::from_millis(50)) {
+                if frame.is_unsolicited() {
+                    let _ = lcm.ack(frame.subcmd);
+                }
+                if let Some(key) = frame.key() {
+                    let effect = state.handle_key(key);
+                    apply_effect(effect, lcm, cfg);
+                    drain_pending_keys(state, lcm, cfg);
                 }
             }
         }
@@ -330,13 +323,10 @@ fn event_loop(
 /// through `state.handle_key` exactly like the top-level poll() path does,
 /// so it isn't lost until the MCU gets around to resending it.
 fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, cfg: &Config) {
-    for (subcmd, payload) in lcm.take_pending() {
-        if subcmd == 0x80 {
-            if let Some(&code) = payload.first() {
-                let key: Key = code.into();
-                let effect = state.handle_key(key);
-                apply_effect(effect, lcm, cfg);
-            }
+    for frame in lcm.take_pending() {
+        if let Some(key) = frame.key() {
+            let effect = state.handle_key(key);
+            apply_effect(effect, lcm, cfg);
         }
     }
 }
@@ -407,13 +397,7 @@ fn run_probe_command(cmd: &str, args: &[String]) {
 
     match cmd {
         "init" => {
-            let ok1 = lcm
-                .send_and_ack(0xF0, 0x11, &[0x01], Duration::from_millis(300))
-                .unwrap_or(false);
-            std::thread::sleep(Duration::from_millis(15));
-            let ok2 = lcm
-                .send_and_ack(0xF0, 0x22, &[0x00], Duration::from_millis(300))
-                .unwrap_or(false);
+            let (ok1, ok2) = lcm.init().unwrap_or((false, false));
             println!("init: step1={ok1} step2={ok2}");
         }
         "settext" => {
@@ -428,21 +412,20 @@ fn run_probe_command(cmd: &str, args: &[String]) {
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
                 match lcm.read_frame(Duration::from_millis(500)) {
-                    Ok(Some((opcode, subcmd, payload, ok))) => {
-                        print!("<- opcode={opcode:#04X} subcmd={subcmd:#04X} payload={payload:02X?} cksum_ok={ok}");
-                        if opcode == 0xF0 {
-                            if subcmd == 0x80 {
-                                if let Some(&code) = payload.first() {
-                                    let key: Key = code.into();
-                                    print!("  => KEY {key:?} (code={code})");
-                                }
-                            } else if subcmd == 0x13 && payload.len() >= 3 {
-                                print!(
-                                    "  => MCU VERSION {}.{}.{}",
-                                    payload[0], payload[1], payload[2]
-                                );
+                    Ok(Some(f)) => {
+                        print!(
+                            "<- opcode={:#04X} subcmd={:#04X} payload={:02X?} cksum_ok={}",
+                            f.opcode, f.subcmd, f.payload, f.checksum_ok
+                        );
+                        if let Some(key) = f.key() {
+                            print!("  => KEY {key:?}");
+                        } else if f.is_unsolicited() && f.subcmd == SUB_VERSION {
+                            if let [major, minor, patch, ..] = f.payload[..] {
+                                print!("  => MCU VERSION {major}.{minor}.{patch}");
                             }
-                            let _ = lcm.ack(subcmd);
+                        }
+                        if f.opcode == OP_COMMAND {
+                            let _ = lcm.ack(f.subcmd);
                         }
                         println!();
                     }
