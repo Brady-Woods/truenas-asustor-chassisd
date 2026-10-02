@@ -236,7 +236,7 @@ fn run_daemon(cfg_path: &Path) {
 
     // Started before the first (slow, subprocess-heavy) refresh below so
     // fan control is never waiting on it.
-    let fans = fan::FanService::spawn(cfg.fans.clone()).unwrap_or_else(|e| {
+    let fans = fan::FanService::spawn(cfg.fans.clone(), &cfg.temperature).unwrap_or_else(|e| {
         eprintln!("failed to start fan control thread: {e}");
         std::process::exit(1);
     });
