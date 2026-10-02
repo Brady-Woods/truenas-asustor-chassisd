@@ -151,6 +151,9 @@ pub struct AppState {
     pools: Option<Vec<hal::Pool>>,
     /// Last disk/SMART scan, refreshed whenever pools or HDD are due.
     disks: Vec<hal::Disk>,
+    /// The NIC LED problem last logged, if it hasn't cleared since -- see
+    /// `note_nic_leds`.
+    nic_led_problem: Option<String>,
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
@@ -203,6 +206,7 @@ impl AppState {
             fan_health: Level::Info,
             pools: None,
             disks: Vec::new(),
+            nic_led_problem: None,
         }
     }
 
@@ -216,10 +220,31 @@ impl AppState {
     /// from config, and a first pass of the health-driven status/bay LEDs
     /// so they're not left in whatever the driver's own boot defaults were.
     pub fn init_leds(&mut self) {
-        for iface in hal::physical_nics() {
-            led::set_nic_mode(&iface, self.cfg.led.nic_mode);
-        }
+        let result = led::set_nic_mode(self.cfg.led.nic_mode);
+        self.note_nic_leds(result);
         self.update_health_leds();
+    }
+
+    /// Logs a NIC LED failure (see `led::set_nic_mode`) once per distinct
+    /// problem rather than on every application -- startup, every sleep
+    /// and every wake would otherwise repeat the same line daily -- and
+    /// once more when it clears.
+    fn note_nic_leds(&mut self, result: Result<(), String>) {
+        match result {
+            Err(problem) => {
+                if self.nic_led_problem.as_ref() != Some(&problem) {
+                    crate::syslog::warning(&format!(
+                        "NIC LEDs not applied ([led] nic_mode / night mode): {problem}"
+                    ));
+                    self.nic_led_problem = Some(problem);
+                }
+            }
+            Ok(()) => {
+                if self.nic_led_problem.take().is_some() {
+                    crate::syslog::notice("NIC LEDs applied normally again");
+                }
+            }
+        }
     }
 
     /// (name, health) per pool, from the last `zpool list`.
@@ -859,11 +884,8 @@ impl AppState {
     /// none of them can restore only some of the LEDs.
     fn wake(&mut self) {
         self.sleeping = false;
-        let nics = hal::physical_nics();
-        led::exit_night_mode(&nics);
-        for iface in &nics {
-            led::set_nic_mode(iface, self.cfg.led.nic_mode);
-        }
+        let result = led::exit_night_mode(self.cfg.led.nic_mode);
+        self.note_nic_leds(result);
         self.refresh_all();
         self.reassert_locate_leds();
     }
@@ -892,7 +914,8 @@ impl AppState {
             && matches!(self.mode, Mode::Status)
         {
             self.sleeping = true;
-            led::enter_night_mode(&hal::physical_nics());
+            let result = led::enter_night_mode();
+            self.note_nic_leds(result);
             // Night mode just darkened every LED wholesale; a locate in
             // progress keeps blinking straight through it.
             self.reassert_locate_leds();

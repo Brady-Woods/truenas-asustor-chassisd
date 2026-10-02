@@ -231,10 +231,11 @@ pub fn network(tpl: &ScreenTemplate) -> Vec<Screen> {
 
 /// Every physical NIC name (same /sys/class/net/{iface}/device filter as
 /// `network()`), regardless of whether it currently has an address -- used
-/// for per-port LED convention (`nic_mode`, night mode), which makes sense
-/// to apply to hardware that exists whether or not it's in service. NOT
-/// used for "is the network down" fault detection -- see `configured_nics`
-/// for that, and why the distinction matters.
+/// for the network screens and the `status` report, which should show
+/// hardware that exists whether or not it's in service. NOT used for "is
+/// the network down" fault detection -- see `configured_nics` for that,
+/// and why the distinction matters. (The NIC LEDs find their ports from
+/// the LED class devices instead -- see `led::nic_led_ports`.)
 pub fn physical_nics() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return Vec::new();

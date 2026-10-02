@@ -21,6 +21,7 @@ pub struct Config {
     pub docker: DockerConfig,
     pub led: LedConfig,
     pub network: NetworkConfig,
+    pub wol: WolConfig,
     pub templates: TemplatesConfig,
     /// One entry per physical fan to control -- see `FanProfile`. Defaults
     /// to this board's single real fan (`default_fans()` below) so the
@@ -46,6 +47,7 @@ impl Default for Config {
             docker: DockerConfig::default(),
             led: LedConfig::default(),
             network: NetworkConfig::default(),
+            wol: WolConfig::default(),
             templates: TemplatesConfig::default(),
             fans: default_fans(),
         }
@@ -81,6 +83,30 @@ impl Default for NetworkConfig {
             monitored_nics: Vec::new(),
             some_down_level: NetworkLevel::Warning,
             all_down_level: NetworkLevel::Error,
+        }
+    }
+}
+
+/// Wake-on-LAN, kept applied by `wol::WolKeeper`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct WolConfig {
+    /// Interfaces to keep Wake-on-LAN enabled on, e.g. `["enp2s0"]`. Empty
+    /// (default) means WOL isn't touched at all -- whatever the driver
+    /// came up with stays.
+    pub nics: Vec<String>,
+    /// `ethtool`-style wake flags (`ethtool -s IFACE wol <mode>`): `"g"`
+    /// (default) = magic packet; also `p`/`u`/`m`/`b`/`a`, or `"d"` to
+    /// keep WOL *off* on those NICs. Replaces the NIC's whole setting
+    /// rather than adding to it, same as `ethtool`.
+    pub mode: String,
+}
+
+impl Default for WolConfig {
+    fn default() -> Self {
+        WolConfig {
+            nics: Vec::new(),
+            mode: "g".to_string(),
         }
     }
 }
@@ -592,6 +618,11 @@ pub struct FanProfile {
     /// wire one up); stall detection then falls back to "pwm was
     /// commanded to 0" only, since there's no RPM to check.
     pub fan_index: Option<u32>,
+    /// `curve` (default) or `fixed` -- see `FanMode`.
+    pub mode: FanMode,
+    /// The PWM `mode = "fixed"` runs at, within `min_pwm..=max_pwm`.
+    /// Required for fixed mode; ignored (with a diagnostic) otherwise.
+    pub fixed_pwm: Option<u8>,
     /// How often to re-evaluate this fan's curve and (re)write its pwm.
     /// lm-sensors' fancontrol(8) default INTERVAL is also 1s.
     pub update_secs: u64,
@@ -643,6 +674,8 @@ impl Default for FanProfile {
             pwm_chip: String::new(),
             pwm_index: 1,
             fan_index: None,
+            mode: FanMode::Curve,
+            fixed_pwm: None,
             update_secs: 1,
             min_temp_c: 45.0,
             max_temp_c: 90.0,
@@ -654,6 +687,25 @@ impl Default for FanProfile {
             min_expected_rpm: None,
         }
     }
+}
+
+/// How a fan's PWM is chosen. Either way, everything else in `fan.rs`
+/// still applies: manual mode asserted before every write, a stopped or
+/// stalled fan kicked with `min_start_pwm`, RPM health checks, and
+/// `max_pwm` if every sensor stops reading.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FanMode {
+    /// From the temperature curve (`min_temp_c`/`max_temp_c` and friends).
+    #[default]
+    Curve,
+    /// A constant `fixed_pwm`, like ADM's fixed fan mode -- *except* while
+    /// any of the fan's sensors is at or above its critical threshold
+    /// (`[[temperature.thresholds]]`, else `[temperature]`), which runs it
+    /// at `max_pwm` until every sensor is back below its *warning*
+    /// threshold. A quiet fixed speed must never ignore a cooking drive,
+    /// so fixed mode still needs `sensors`. The curve settings are unused.
+    Fixed,
 }
 
 /// Identifies one or more hwmon temperature inputs. `chip` alone (the most
@@ -808,6 +860,7 @@ impl Config {
     /// - a fan profile with an inconsistent curve is disabled, leaving
     ///   that fan in its BIOS/driver mode rather than driving it from a
     ///   curve that makes no sense;
+    /// - an unparseable `[wol] mode` leaves WOL untouched;
     /// - inverted temperature thresholds are reported only.
     fn validate(&mut self) -> Vec<String> {
         let mut errors = self.templates.validate();
@@ -826,6 +879,12 @@ impl Config {
         }
 
         for fan in self.fans.iter_mut().filter(|f| f.enabled) {
+            if fan.mode == FanMode::Curve && fan.fixed_pwm.is_some() {
+                errors.push(format!(
+                    "[[fans]] '{}': fixed_pwm is ignored unless mode = \"fixed\"",
+                    fan.name
+                ));
+            }
             let problems = fan.problems();
             if !problems.is_empty() {
                 errors.push(format!(
@@ -835,6 +894,16 @@ impl Config {
                 ));
                 fan.enabled = false;
             }
+        }
+
+        if !self.wol.nics.is_empty()
+            && let Err(e) = crate::wol::parse_mode(&self.wol.mode)
+        {
+            errors.push(format!(
+                "[wol] mode = \"{}\": {e}; Wake-on-LAN left alone",
+                self.wol.mode
+            ));
+            self.wol.nics.clear();
         }
 
         let t = &self.temperature;
@@ -877,6 +946,22 @@ impl FanProfile {
                 "min_pwm ({}) and min_stop_pwm ({}) must not exceed max_pwm ({})",
                 self.min_pwm, self.min_stop_pwm, self.max_pwm
             ));
+        }
+        if self.mode == FanMode::Fixed {
+            match self.fixed_pwm {
+                None => out.push("mode = \"fixed\" needs fixed_pwm".to_string()),
+                Some(pwm) if pwm < self.min_pwm || pwm > self.max_pwm => out.push(format!(
+                    "fixed_pwm ({pwm}) must be within min_pwm..=max_pwm ({}..={})",
+                    self.min_pwm, self.max_pwm
+                )),
+                Some(_) => {}
+            }
+            if self.sensors.is_empty() {
+                out.push(
+                    "mode = \"fixed\" needs sensors, for its critical-temperature override"
+                        .to_string(),
+                );
+            }
         }
         for sel in &self.sensors {
             if sel.chip.is_empty() {
@@ -999,6 +1084,49 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(!cfg.fans[0].enabled);
         assert!(cfg.fans[1].enabled);
+    }
+
+    #[test]
+    fn bad_wol_mode_leaves_wol_alone() {
+        let (cfg, diagnostics) = parse("[wol]\nnics = [\"enp2s0\"]\nmode = \"gs\"\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(cfg.wol.nics, Vec::<String>::new());
+        let (cfg, diagnostics) = parse("[wol]\nnics = [\"enp2s0\"]\n");
+        assert_eq!(diagnostics, Vec::<String>::new());
+        assert_eq!(cfg.wol.mode, "g");
+    }
+
+    #[test]
+    fn fixed_fan_mode_is_validated() {
+        let fan = |extra: &str| {
+            parse(&format!(
+                "[[fans]]\npwm_chip = \"it8625\"\n{extra}\n[[fans.sensors]]\nchip = \"drivetemp\"\n"
+            ))
+        };
+        let (cfg, diagnostics) = fan("mode = \"fixed\"\nfixed_pwm = 120");
+        assert_eq!(diagnostics, Vec::<String>::new());
+        assert_eq!(cfg.fans[0].mode, FanMode::Fixed);
+        assert!(cfg.fans[0].enabled);
+
+        for bad in [
+            "mode = \"fixed\"",                 // no fixed_pwm
+            "mode = \"fixed\"\nfixed_pwm = 20", // below min_pwm (50)
+            "mode = \"fixed\"\nfixed_pwm = 200\nmax_pwm = 180",
+        ] {
+            let (cfg, diagnostics) = fan(bad);
+            assert_eq!(diagnostics.len(), 1, "{bad}: {diagnostics:?}");
+            assert!(!cfg.fans[0].enabled, "{bad}");
+        }
+
+        // No sensors: nothing could trigger the critical override.
+        let (cfg, _) =
+            parse("[[fans]]\npwm_chip = \"it8625\"\nmode = \"fixed\"\nfixed_pwm = 120\n");
+        assert!(!cfg.fans[0].enabled);
+
+        // fixed_pwm without fixed mode: reported, but the fan still runs.
+        let (cfg, diagnostics) = fan("fixed_pwm = 120");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(cfg.fans[0].enabled);
     }
 
     #[test]

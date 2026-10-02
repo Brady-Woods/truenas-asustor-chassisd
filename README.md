@@ -223,6 +223,41 @@ shows what the layers below it say *now* -- a SMART failure found mid-locate
 is solid red the moment the locate ends, not whatever the bay was showing
 when it started.
 
+**Front LAN LEDs** (`[led] nic_mode`) aren't GPIOs at all: they're driven
+by the RTL8125 PHYs themselves, exposed by `r8169` as
+`enpXs0-{0..3}::lan` and configured through the kernel's
+hardware-offloaded `netdev` trigger. Channels `-0` (2.5G link) and `-1`
+(10/100/1000 link) are OR'd onto each port's front LED; `-2`/`-3`
+(presumably the rear RJ45) are left alone. Applied to every NIC that has
+these LEDs -- both RTL8125s (`enp2s0`, `enp3s0`), not the AQC113:
+
+| `nic_mode` | `-0` | `-1` | Looks like |
+|---|---|---|---|
+| `link` (default) | `link_2500` | `link_10 link_100 link_1000` | solid on link at any speed (factory) |
+| `activity` | `rx tx` | all off | dark at idle, flickers on traffic |
+| *(night mode)* | all off | all off | dark (the `blue:lan` rail is off too) |
+
+Wake from night mode restores the configured `nic_mode`, not a fixed
+"link". Things that bit this before:
+
+- **`ledtrig-netdev` isn't loaded by default on TrueNAS** (nor is
+  `ledtrig-timer`, which every blink pattern needs). Without it `netdev`
+  can't be selected, none of its attributes exist, and every write
+  failed silently -- the LEDs just stayed in whatever the PHY had from
+  boot. The daemon now `modprobe`s both at startup (as does `deploy.sh`),
+  and checks the result by reading back each attribute plus `offloaded`
+  (1 = the PHY really is driving the LED in that mode), logging a syslog
+  WARNING once per distinct failure (and a notice when it clears) instead
+  of ignoring it.
+- **r8169 can only offload `rx` and `tx` together.** Changing one alone
+  is an unsupported mode: the kernel rejects that write with EOPNOTSUPP
+  (keeping the bit, so the matching write completes a valid mode) and
+  r8169 switches the LED off for that instant. So `rx` and `tx` are
+  always written back to back, after the link bits, never with anything
+  in between, and success is judged by the read-back, not by each write.
+  Attributes already at the wanted value aren't rewritten, so re-applying
+  a mode doesn't blip the LED.
+
 ## Fan control
 
 Drives one or more pwm outputs from temperature -- see `src/fan.rs` (the
@@ -279,6 +314,34 @@ Three ways this goes further than upstream fancontrol:
   forever. A `chip = "..."` selector with no `input` set matches *every*
   temp input that chip has, relying on this filtering rather than needing
   you to already know which specific inputs are real.
+
+**Fixed mode** (`mode = "fixed"` + `fixed_pwm`, the equivalent of ADM's
+fixed fan mode) skips the curve and runs the fan at a constant PWM --
+with one exception that isn't optional: while any sensor feeding that fan
+is at or above its **critical** threshold (its `[[temperature.thresholds]]`
+entry, else `[temperature].critical_threshold` -- the same thresholds the
+health monitor alerts on), the fan goes to `max_pwm`, and stays there until
+*every* sensor is back below its **warning** threshold. A quiet fixed
+speed that ignored a drive cooking at 60C would be worse than no fan
+control at all, which is also why fixed mode refuses to start without
+`sensors`. The gap between critical and warning is deliberate hysteresis:
+a drive hovering at its limit doesn't flip the fan between quiet and full
+speed, and something that got that hot gets properly cooled, not nudged
+just under the line. Both transitions are logged (WARNING on, NOTICE off)
+and shown on the fan's `status` line. `fixed_pwm` must be within
+`min_pwm..=max_pwm`, or the fan is disabled at load with a diagnostic,
+same as an inconsistent curve. Everything below applies to fixed mode
+too.
+
+```toml
+[[fans]]
+name = "chassis"
+pwm_chip = "it8625"
+fan_index = 1
+mode = "fixed"
+fixed_pwm = 100        # ~40%; must be within min_pwm..=max_pwm
+# ...plus the same [[fans.sensors]] as before -- required in fixed mode
+```
 
 Failure handling, all of it aimed at never leaving a fan stopped or
 frozen with nothing watching temperatures:
@@ -340,6 +403,49 @@ measures what happens:
 Restores every pwm output's original enable-mode/value when done,
 regardless of what it found. `--yes` skips the confirmation prompt (for
 non-interactive use); otherwise it asks before touching any hardware.
+
+## Wake-on-LAN
+
+```toml
+[wol]
+nics = ["enp2s0"]   # default [] = WOL left however the driver set it
+mode = "g"          # ethtool notation; "g" (default) = magic packet
+```
+
+Neither TrueNAS nor the kernel turns WOL on by itself (`ethtool enp2s0`
+shows `Supports Wake-on: pumbg`, `Wake-on: d` on a fresh boot), and it
+doesn't persist across reboots. `wol.rs` sets it straight through the
+`SIOCETHTOOL` ioctl (`ETHTOOL_GWOL`/`ETHTOOL_SWOL` -- the same thing
+`ethtool -s enp2s0 wol g` does, without depending on `ethtool` being
+installed), and keeps it set:
+
+- at daemon startup;
+- every 60s after that (one cheap ioctl per NIC), in case a link change
+  or driver reload reset it -- logged as a NOTICE when that happens;
+- once more as the daemon exits, which during a shutdown is shortly
+  before power-off.
+
+`mode` *replaces* the NIC's setting rather than adding to it, like
+`ethtool` -- so `"d"` keeps WOL off. Any of `p`/`u`/`m`/`b`/`a`/`g` are
+accepted; `s` (SecureOn password) and `f` (filters) aren't, since there's
+nowhere to configure what they need. A mode the NIC doesn't support, or a
+driver that doesn't take it, is logged once as a WARNING (and once more
+when it recovers). The `status` report has a Wake-on-LAN section listing
+every physical NIC's current mode and what it supports, whether or not
+it's in `nics` -- handy for checking a NIC before adding it.
+
+Caveats -- the NIC only arms WOL; whether the box actually powers on is
+up to the board:
+
+- **BIOS:** ErP/EuP (deep power saving) must be **off**, and wake on
+  PCIe/PCI-E device or LAN **enabled**. With ErP on, the NICs lose standby
+  power in soft-off and nothing can wake the box.
+- Works from **soft-off** (a normal shutdown -- the panel's SHUTDOWN, the
+  TrueNAS UI, `poweroff`) and from suspend. Not after the power has been
+  cut entirely (unplugged, a power failure) -- that's the BIOS's "restore
+  on AC power loss" setting's job instead.
+- The magic packet has to reach that port: sent to *that NIC's* MAC, on
+  its broadcast domain, with a cable connected at the time of shutdown.
 
 ## Health monitoring (syslog)
 
@@ -565,7 +671,8 @@ accumulated stall/low-RPM health only the running process knows, not
 something a brand-new invocation could reconstruct), fresh `hal::` reads
 for every connected temp sensor (with its resolved threshold and current
 level), every pool, every drive bay's SMART state, and every physical
-NIC's link/monitoring status, plus the active socket override if any:
+NIC's link/monitoring status and Wake-on-LAN state, plus the active
+socket override if any:
 
 ```
 === lcm-status report ===
@@ -589,6 +696,11 @@ NIC's link/monitoring status, plus the active socket override if any:
 -- Network --
   enp2s0     192.168.1.196        monitored, link up
   enp9s0     disconnected         not monitored, link down
+
+-- Wake-on-LAN --
+  enp2s0     g      (supports pumbg)  managed: keeping at g
+  enp3s0     d      (supports pumbg)
+  enp9s0     g      (supports pg)
 
 -- Active override --
   none
@@ -616,8 +728,8 @@ receive the reply.
 `/etc/lcm-status.toml`, hand-edited, every field defaulted -- see
 `lcm-status.example.toml` for the full annotated reference (scroll
 speed/limits, per-category refresh floors, sleep schedule, which screens
-are enabled and in what order, NIC LED mode, Docker containers to ignore,
-temperature units/warning threshold).
+are enabled and in what order, NIC LED mode, Wake-on-LAN, Docker
+containers to ignore, temperature units/warning threshold).
 
 The text on each status screen comes from `[templates.*]`: `{variable}`
 templates per screen kind (`network`, `pool`, `hdd`, `cpu`, `fan`,

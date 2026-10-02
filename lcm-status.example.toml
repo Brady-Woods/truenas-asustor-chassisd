@@ -125,6 +125,9 @@ ignore = []                # container names to exclude from health checks
 
 [led]
 nic_mode = "link"          # "link" (solid while connected) or "activity" (dark, flashes on traffic)
+# Applies to every NIC with r8169 front LEDs (both RTL8125s here). Needs
+# the ledtrig-netdev kernel module, which the daemon loads at startup; if
+# it can't be applied, a WARNING is logged once (journalctl -u lcm-status).
 # Front LEDs share [sleep]'s schedule for night mode -- one schedule for
 # both the LCD backlight and the LEDs, not two. Red bay LEDs are always
 # left alone by night mode so a real drive failure still shows.
@@ -147,6 +150,19 @@ monitored_nics = []
 some_down_level = "warning"
 all_down_level = "error"
 
+[wol]
+# Interfaces to keep Wake-on-LAN enabled on -- set at startup, rechecked
+# every 60s (some drivers reset it on link changes), and once more as the
+# daemon stops during shutdown. Empty (default) = WOL not touched at all.
+# `lcm-status status` shows every NIC's current WOL mode and what it
+# supports. For the box to actually power on from soft-off, the BIOS must
+# have ErP/EuP OFF and wake on PCIe/LAN enabled; it can't wake after a
+# full power loss (that's the BIOS's "restore on AC power loss").
+nics = []                  # e.g. ["enp2s0"]
+# ethtool-style flags (`ethtool -s IFACE wol <mode>`), replacing the NIC's
+# whole setting: "g" = magic packet; also p/u/m/b/a; "d" = keep WOL off.
+mode = "g"
+
 # One [[fans]] block per physical fan -- replaces lm-sensors' fancontrol
 # package entirely (see src/fan.rs for why, and src/fan_calibrate.rs / the
 # `lcm-status fan-profile` command for how to discover real values for
@@ -162,6 +178,14 @@ pwm_chip = "it8625"    # hwmon chip name exposing the pwm output
 pwm_index = 1          # -> pwm1 / pwm1_enable
 fan_index = 1          # -> fan1_input, for stall detection; omit if no tach
 update_secs = 1        # how often to re-evaluate the curve and rewrite pwm
+# "curve" (default): pwm from the temperature curve below. "fixed": a
+# constant fixed_pwm (ADM's fixed fan mode) -- except that while any sensor
+# below is at/above its [[temperature.thresholds]] critical_threshold, the
+# fan runs at max_pwm until every sensor is back under its warn_threshold.
+# Fixed mode still needs [[fans.sensors]] for that, and keeps the stall
+# kicks and RPM checks. fixed_pwm must be within min_pwm..=max_pwm.
+mode = "curve"
+# fixed_pwm = 100      # only with mode = "fixed"
 min_temp_c = 45.0      # at/below this, pwm = min_pwm
 max_temp_c = 90.0      # at/above this, pwm = max_pwm
 min_start_pwm = 60     # PWM needed to get a *stopped* fan spinning again
