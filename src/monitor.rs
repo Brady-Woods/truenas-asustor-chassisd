@@ -125,8 +125,8 @@ impl HealthMonitor {
 
     /// `healths`: (pool name, health string) from `zpool list -H -o
     /// name,health`, e.g. `[("NVMe", "ONLINE"), ("HDD", "DEGRADED")]` --
-    /// pass in whatever `hal::pool_healths()` the caller already fetched
-    /// for its own screen/LED refresh, not a fresh call.
+    /// pass in what the caller already fetched (`hal::pools()`) for its
+    /// own screen/LED refresh, not a fresh call.
     pub fn check_pools(&mut self, healths: &[(String, String)]) {
         for (name, health) in healths {
             let prev = self.pool_healths.insert(name.clone(), health.clone());
@@ -150,7 +150,7 @@ impl HealthMonitor {
         }
     }
 
-    /// `states`: per-bay LED state as `hal::bay_led_states()`/
+    /// `states`: per-bay LED state as `AppState::bay_states()`/
     /// `AppState::update_health_leds` already computed from SMART for this
     /// refresh cycle -- reused here rather than re-running `smartctl`.
     /// Only `Failed` is logged (a confirmed SMART failure); `Alert` is an

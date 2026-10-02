@@ -2,8 +2,10 @@
 //! synchronous, best-effort snapshot -- callers decide how often to call
 //! these (see the refresh-on-display design), not this module.
 
-use crate::config::{Config, ScreenTemplate, TempUnits};
+use crate::config::{Config, NetworkConfig, ScreenTemplate, TempUnits};
+use crate::led::BayState;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,22 +105,28 @@ fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Strin
 /// in hardware, never configured with an IP) was being treated the same
 /// as a real link failure on the NICs that matter.
 pub fn configured_nics() -> Vec<String> {
-    let Some(out) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) else {
-        return Vec::new();
-    };
-    out.lines()
-        .filter_map(|line| {
-            // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
-            let iface = line
-                .split_whitespace()
-                .nth(1)?
-                .trim_end_matches(':')
-                .to_string();
-            std::path::Path::new(&format!("/sys/class/net/{iface}/device"))
-                .exists()
-                .then_some(iface)
-        })
-        .collect()
+    let mut nics: Vec<String> = ip_by_iface()
+        .into_keys()
+        .filter(|iface| is_physical(iface))
+        .collect();
+    nics.sort();
+    nics
+}
+
+/// Only real hardware NICs have a `device` link -- see `configured_nics`.
+fn is_physical(iface: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{iface}/device")).exists()
+}
+
+/// Which interfaces' link state feeds the status LED: the configured
+/// `monitored_nics`, or (if that's empty) whatever is currently
+/// `configured_nics()`.
+pub fn monitored_nics(net: &NetworkConfig) -> Vec<String> {
+    if net.monitored_nics.is_empty() {
+        configured_nics()
+    } else {
+        net.monitored_nics.clone()
+    }
 }
 
 /// Every interface with a global-scope IPv4, mapped to that address --
@@ -159,10 +167,21 @@ pub(crate) fn nic_link_text(iface: &str) -> String {
     }
 }
 
+/// Kernel-reported carrier: `Some(true)` up, `Some(false)` down, `None`
+/// unreadable (e.g. the interface is administratively down).
+fn carrier(iface: &str) -> Option<bool> {
+    let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")).ok()?;
+    Some(s.trim() == "1")
+}
+
 fn carrier_up(iface: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false)
+    carrier(iface) == Some(true)
+}
+
+/// True only for a *confirmed* down link -- unreadable doesn't count, so
+/// an interface that can't report carrier never raises a network alarm.
+pub fn link_is_down(iface: &str) -> bool {
+    carrier(iface) == Some(false)
 }
 
 /// One screen per *every* physical NIC (`physical_nics()`, not just
@@ -221,67 +240,75 @@ pub fn physical_nics() -> Vec<String> {
     };
     entries
         .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            std::path::Path::new(&format!("/sys/class/net/{name}/device"))
-                .exists()
-                .then_some(name)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_physical(name))
+        .collect()
+}
+
+/// One row of `zpool list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pool {
+    pub name: String,
+    pub size: String,
+    pub alloc: String,
+    pub free: String,
+    pub cap: String,
+    pub health: String,
+}
+
+/// Every pool, from one `zpool list` call -- shared by the pool screens,
+/// pool health monitoring and the status LED. `None` if `zpool` itself
+/// failed (distinct from "no pools").
+pub fn pools() -> Option<Vec<Pool>> {
+    run(
+        "zpool",
+        &["list", "-H", "-o", "name,size,alloc,free,capacity,health"],
+    )
+    .map(|out| parse_zpool_list(&out))
+}
+
+fn parse_zpool_list(out: &str) -> Vec<Pool> {
+    out.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut f = line.split_whitespace().map(String::from);
+            let mut next = || f.next().unwrap_or_else(|| "?".to_string());
+            Pool {
+                name: next(),
+                size: next(),
+                alloc: next(),
+                free: next(),
+                cap: next(),
+                health: next(),
+            }
         })
         .collect()
 }
 
-/// Storage + RAID health merged: pool name & health on line 0, capacity on
-/// line 1 -- one `zpool list` call instead of two.
-pub fn pools(tpl: &ScreenTemplate) -> Vec<Screen> {
-    let out = run(
-        "zpool",
-        &["list", "-H", "-o", "name,size,alloc,free,capacity,health"],
-    );
-    let Some(out) = out else {
+/// Storage + RAID health merged: one screen per pool.
+pub fn pool_screens(tpl: &ScreenTemplate, pools: Option<&[Pool]>) -> Vec<Screen> {
+    let Some(pools) = pools else {
         return vec![Screen {
             line0: "STORAGE".into(),
             line1: "zpool unavailable".into(),
         }];
     };
-
-    out.lines()
-        .map(|line| {
-            let mut f = line.split_whitespace();
-            let name = f.next().unwrap_or("?");
-            let size = f.next().unwrap_or("?");
-            let alloc = f.next().unwrap_or("?");
-            let free = f.next().unwrap_or("?");
-            let cap = f.next().unwrap_or("?");
-            let health = f.next().unwrap_or("?");
+    pools
+        .iter()
+        .map(|p| {
             render(
                 tpl,
                 &[
-                    ("name", name),
-                    ("size", size),
-                    ("alloc", alloc),
-                    ("free", free),
-                    ("cap", cap),
-                    ("health", health),
+                    ("name", &p.name),
+                    ("size", &p.size),
+                    ("alloc", &p.alloc),
+                    ("free", &p.free),
+                    ("cap", &p.cap),
+                    ("health", &p.health),
                 ],
             )
         })
         .collect()
-}
-
-/// Raw pool name/health pairs, for LED decisions -- separate from the
-/// display-formatted `pools()` screens so a status-LED check doesn't need
-/// to parse rendered text back apart.
-pub fn pool_healths() -> Vec<(String, String)> {
-    run("zpool", &["list", "-H", "-o", "name,health"])
-        .map(|out| {
-            out.lines()
-                .filter_map(|line| {
-                    let mut f = line.split_whitespace();
-                    Some((f.next()?.to_string(), f.next()?.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn list_disks() -> Vec<String> {
@@ -295,28 +322,85 @@ fn list_disks() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Per-bay SMART-derived LED state (SATA bays only -- NVMe drives don't
-/// have a bay activity LED on this chassis, so they're naturally excluded
-/// since `ata_port_for` returns None for them).
-pub fn bay_led_states() -> Vec<(u32, crate::led::BayState)> {
-    use crate::led::BayState;
+/// `smartctl -H -n standby` verdict for one disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartStatus {
+    Passed,
+    Failed,
+    /// Spun down; `-n standby` declined to wake it to ask.
+    Standby,
+    /// smartctl ran but said neither PASSED nor FAILED.
+    Unknown,
+    /// smartctl failed or isn't installed.
+    Unavailable,
+}
+
+impl SmartStatus {
+    fn parse(out: &str) -> Self {
+        if out.contains("in STANDBY") {
+            SmartStatus::Standby
+        } else if out.contains("PASSED") {
+            SmartStatus::Passed
+        } else if out.contains("FAILED") {
+            SmartStatus::Failed
+        } else {
+            SmartStatus::Unknown
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SmartStatus::Passed => "PASSED",
+            SmartStatus::Failed => "FAILED",
+            SmartStatus::Standby => "STANDBY",
+            SmartStatus::Unknown => "UNKNOWN",
+            SmartStatus::Unavailable => "N/A",
+        }
+    }
+}
+
+/// One whole disk (not a partition).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disk {
+    /// Kernel name, e.g. "sda", "nvme0n1".
+    pub name: String,
+    /// Physical bay number for SATA disks (see `ata_port_for`); `None`
+    /// for NVMe, which has no bay LED on this chassis.
+    pub bay: Option<u32>,
+    pub smart: SmartStatus,
+}
+
+/// Every disk with its bay and SMART verdict -- one `smartctl` call per
+/// disk, shared by the HDD screens, bay LEDs and SMART monitoring.
+pub fn disks() -> Vec<Disk> {
     list_disks()
+        .into_iter()
+        .map(|name| {
+            let smart = run(
+                "smartctl",
+                &["-H", "-n", "standby", &format!("/dev/{name}")],
+            )
+            .map_or(SmartStatus::Unavailable, |out| SmartStatus::parse(&out));
+            Disk {
+                bay: ata_port_for(&name),
+                name,
+                smart,
+            }
+        })
+        .collect()
+}
+
+/// Per-bay LED state from SMART (SATA bays only).
+pub fn bay_led_states(disks: &[Disk]) -> Vec<(u32, BayState)> {
+    disks
         .iter()
         .filter_map(|d| {
-            let bay = ata_port_for(d)?;
-            let dev = format!("/dev/{d}");
-            let state = run("smartctl", &["-H", "-n", "standby", &dev])
-                .map(|out| {
-                    if out.contains("in STANDBY") {
-                        BayState::Standby
-                    } else if out.contains("FAILED") {
-                        BayState::Failed
-                    } else {
-                        BayState::Normal
-                    }
-                })
-                .unwrap_or(BayState::Normal);
-            Some((bay, state))
+            let state = match d.smart {
+                SmartStatus::Standby => BayState::Standby,
+                SmartStatus::Failed => BayState::Failed,
+                _ => BayState::Normal,
+            };
+            Some((d.bay?, state))
         })
         .collect()
 }
@@ -326,9 +410,7 @@ pub fn bay_led_states() -> Vec<(u32, crate::led::BayState)> {
 /// BAY3), which is a real, stable physical identifier -- confirmed to
 /// match this board's ata1..4 <-> sata1..4 LED convention, not just
 /// whatever order the kernel happened to enumerate sdX in.
-pub fn hdd(cfg: &Config) -> Vec<Screen> {
-    let disks = list_disks();
-
+pub fn hdd(cfg: &Config, disks: &[Disk]) -> Vec<Screen> {
     if disks.is_empty() {
         return vec![Screen {
             line0: "HDD".into(),
@@ -340,28 +422,13 @@ pub fn hdd(cfg: &Config) -> Vec<Screen> {
 
     disks
         .iter()
-        .map(|d| {
-            let dev = format!("/dev/{d}");
-            let status = run("smartctl", &["-H", "-n", "standby", &dev])
-                .map(|out| {
-                    if out.contains("in STANDBY") {
-                        "STANDBY".to_string()
-                    } else if out.contains("PASSED") {
-                        "PASSED".to_string()
-                    } else if out.contains("FAILED") {
-                        "FAILED".to_string()
-                    } else {
-                        "UNKNOWN".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "N/A".to_string());
-
-            let bay = ata_port_for(d);
-            let (label, temp) = match bay {
+        .map(|disk| {
+            let d = &disk.name;
+            let (label, temp) = match disk.bay {
                 Some(bay) => (format!("BAY{bay} {d}"), bay_temps.get(&bay).copied()),
                 None => (d.clone(), nvme_temp_for(d)),
             };
-            let bay = bay.map(|b| b.to_string()).unwrap_or_default();
+            let bay = disk.bay.map(|b| b.to_string()).unwrap_or_default();
             let temp = temp
                 .map(|t| {
                     let (val, unit) = display_temp(t, cfg.temperature.units);
@@ -375,7 +442,7 @@ pub fn hdd(cfg: &Config) -> Vec<Screen> {
                     ("label", &label),
                     ("bay", &bay),
                     ("dev", d),
-                    ("status", &status),
+                    ("status", disk.smart.label()),
                     ("temp", &temp),
                 ],
             )
@@ -734,6 +801,52 @@ pub fn docker_issues(ignore: &[String], tpl: &ScreenTemplate) -> Vec<Screen> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_zpool_list() {
+        let pools = parse_zpool_list(
+            "NVMe\t928G\t120G\t808G\t12%\tONLINE\nHDD\t43.6T\t20T\t23.6T\t45%\tDEGRADED\n",
+        );
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[1].name, "HDD");
+        assert_eq!(pools[1].cap, "45%");
+        assert_eq!(pools[1].health, "DEGRADED");
+        assert_eq!(parse_zpool_list("short\n")[0].health, "?");
+    }
+
+    #[test]
+    fn parses_smartctl_verdicts() {
+        let passed = "SMART overall-health self-assessment test result: PASSED";
+        assert_eq!(SmartStatus::parse(passed), SmartStatus::Passed);
+        let failed = "SMART overall-health self-assessment test result: FAILED!";
+        assert_eq!(SmartStatus::parse(failed), SmartStatus::Failed);
+        let standby = "Device is in STANDBY mode, exit(2)";
+        assert_eq!(SmartStatus::parse(standby), SmartStatus::Standby);
+        assert_eq!(SmartStatus::parse("???"), SmartStatus::Unknown);
+    }
+
+    #[test]
+    fn bay_leds_cover_only_sata_bays() {
+        let disk = |name: &str, bay, smart| Disk {
+            name: name.into(),
+            bay,
+            smart,
+        };
+        let disks = [
+            disk("sda", Some(1), SmartStatus::Passed),
+            disk("sdb", Some(2), SmartStatus::Failed),
+            disk("sdc", Some(3), SmartStatus::Standby),
+            disk("nvme0n1", None, SmartStatus::Failed),
+        ];
+        assert_eq!(
+            bay_led_states(&disks),
+            vec![
+                (1, BayState::Normal),
+                (2, BayState::Failed),
+                (3, BayState::Standby)
+            ]
+        );
+    }
 
     #[test]
     fn run_returns_stdout_on_success() {
