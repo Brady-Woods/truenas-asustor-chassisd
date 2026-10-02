@@ -102,7 +102,16 @@ fn main() -> ExitCode {
 
     match cli {
         Cli::Help => println!("{USAGE}"),
-        Cli::CheckConfig(path) => println!("{:#?}", Config::load(&path)),
+        Cli::CheckConfig(path) => {
+            let (cfg, diagnostics) = Config::load_with_diagnostics(&path);
+            println!("{cfg:#?}");
+            for d in &diagnostics {
+                eprintln!("{}: {d}", path.display());
+            }
+            if !diagnostics.is_empty() {
+                return ExitCode::FAILURE;
+            }
+        }
         Cli::HalTest(path) => {
             // Uses the real config (not defaults) so [templates.*] edits can be
             // previewed without restarting the daemon.
@@ -270,11 +279,7 @@ fn event_loop(
         }
 
         if cfg.sleep.enabled {
-            state.set_schedule_sleep_wanted(in_sleep_window(
-                &cfg.sleep.start,
-                &cfg.sleep.end,
-                now_hhmm(),
-            ));
+            state.set_schedule_sleep_wanted(cfg.sleep.contains(now_hhmm()));
         }
 
         if fans.has_died() {
@@ -380,23 +385,6 @@ fn now_hhmm() -> (u32, u32) {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
         (tm.tm_hour as u32, tm.tm_min as u32)
-    }
-}
-
-fn in_sleep_window(start: &str, end: &str, now: (u32, u32)) -> bool {
-    let parse = |s: &str| -> Option<(u32, u32)> {
-        let mut it = s.splitn(2, ':');
-        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-    };
-    let (Some(s), Some(e)) = (parse(start), parse(end)) else {
-        return false;
-    };
-    let to_mins = |t: (u32, u32)| t.0 * 60 + t.1;
-    let (s, e, n) = (to_mins(s), to_mins(e), to_mins(now));
-    if s <= e {
-        n >= s && n < e
-    } else {
-        n >= s || n < e // window wraps past midnight
     }
 }
 
