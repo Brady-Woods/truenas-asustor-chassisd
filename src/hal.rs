@@ -4,6 +4,7 @@
 
 use crate::config::{Config, NetworkConfig, ScreenTemplate, TempUnits};
 use crate::led::BayState;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -134,8 +135,8 @@ pub fn monitored_nics(net: &NetworkConfig) -> Vec<String> {
 /// screens) both build on, and also used directly by `report::build` for
 /// the `status` request. Extracted so there's one parser for `ip -4 -o
 /// addr show scope global`, not three.
-pub(crate) fn ip_by_iface() -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
+pub fn ip_by_iface() -> HashMap<String, String> {
+    let mut out = HashMap::new();
     if let Some(text) = run("ip", &["-4", "-o", "addr", "show", "scope", "global"]) {
         for line in text.lines() {
             // e.g. "2: eth0    inet 192.168.1.196/24 brd ... scope global ..."
@@ -159,7 +160,7 @@ pub(crate) fn ip_by_iface() -> std::collections::HashMap<String, String> {
 /// `"connected, no IP"` (link up, nothing configured) or `"disconnected"`
 /// (no carrier) for an interface with no address -- see `network()`'s doc
 /// comment for why that distinction is worth making at all.
-pub(crate) fn nic_link_text(iface: &str) -> String {
+pub fn nic_link_text(iface: &str) -> String {
     if carrier_up(iface) {
         "connected, no IP".to_string()
     } else {
@@ -538,7 +539,7 @@ fn nvme_temp_for(dev_name: &str) -> Option<f32> {
     read_sysfs_f32(&format!("{hwmon}/temp1_input"))
 }
 
-pub(crate) fn read_sysfs_f32(path: &str) -> Option<f32> {
+pub fn read_sysfs_f32(path: &str) -> Option<f32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
@@ -549,7 +550,7 @@ pub(crate) fn read_sysfs_f32(path: &str) -> Option<f32> {
 /// `["temp1", "temp2"]` -- callers append `_input`/`_label`/`_fault`
 /// themselves). Used to enumerate a chip's sensors without hardcoding how
 /// many it has.
-pub(crate) fn temp_inputs(hwmon: &str) -> Vec<String> {
+pub fn temp_inputs(hwmon: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(hwmon) else {
         return Vec::new();
     };
@@ -580,7 +581,7 @@ pub(crate) fn temp_inputs(hwmon: &str) -> Vec<String> {
 /// nothing filtering that out, a naive "read every temp this chip has"
 /// sensor selector would let a permanently-disconnected input drag a fan
 /// curve's max() up to full speed forever.
-pub(crate) fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
+pub fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
     if let Ok(s) = std::fs::read_to_string(format!("{hwmon}/{input}_fault")) {
         if s.trim() == "1" {
             return None;
@@ -598,7 +599,7 @@ pub(crate) fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
 /// with no matching (or currently unreadable/disconnected) input simply
 /// contribute nothing, same as an empty drive bay having no hwmon instance
 /// at all.
-pub(crate) fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> {
+pub fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> {
     let mut out = Vec::new();
     let Some(hwmons) = glob_hwmon(&sel.chip) else {
         return out;
@@ -630,7 +631,7 @@ pub(crate) fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> 
 /// build on. Skips any hwmon with no readable `name` (shouldn't normally
 /// happen, but a directory mid-teardown during a module reload could
 /// transiently look that way).
-pub(crate) fn all_hwmon() -> Vec<(String, String)> {
+pub fn all_hwmon() -> Vec<(String, String)> {
     let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") else {
         return Vec::new();
     };
@@ -655,11 +656,12 @@ pub(crate) fn all_hwmon() -> Vec<(String, String)> {
 /// (`monitor::HealthMonitor`), deliberately not scoped to whatever a fan
 /// curve happens to select: a sensor with nothing driving off it (this
 /// board's AQC113 PHY/MAC temps, say) is still worth alerting on.
-/// (chip name, full description for logging, value). Chip name is
+///
+/// Returns (chip name, description for logging, value). Chip name is
 /// returned separately (not just folded into the description) so callers
 /// can match per-chip threshold overrides (`config::TempThresholdOverride`)
 /// without re-parsing the description string.
-pub(crate) fn all_connected_temps() -> Vec<(String, String, f32)> {
+pub fn all_connected_temps() -> Vec<(String, String, f32)> {
     let mut out = Vec::new();
     for (hwmon, chip) in all_hwmon() {
         for input in temp_inputs(&hwmon) {
@@ -680,7 +682,7 @@ pub(crate) fn all_connected_temps() -> Vec<(String, String, f32)> {
     out
 }
 
-pub(crate) fn coretemp_package() -> Option<f32> {
+pub fn coretemp_package() -> Option<f32> {
     for hwmon in glob_hwmon("coretemp")? {
         // A transiently unreadable instance is skipped, not the end of
         // the search.
@@ -705,8 +707,8 @@ pub(crate) fn coretemp_package() -> Option<f32> {
 
 /// Maps real bay number (via `ata_port_for`, not hwmon enumeration order)
 /// to that bay's drive temperature.
-fn drivetemps_by_ata_port() -> std::collections::HashMap<u32, f32> {
-    let mut out = std::collections::HashMap::new();
+fn drivetemps_by_ata_port() -> HashMap<u32, f32> {
+    let mut out = HashMap::new();
     let Some(dirs) = glob_hwmon("drivetemp") else {
         return out;
     };
@@ -751,11 +753,11 @@ fn fan1_rpm() -> Option<f32> {
     None
 }
 
-pub(crate) fn read_sysfs_raw_f32(path: &str) -> Option<f32> {
+pub fn read_sysfs_raw_f32(path: &str) -> Option<f32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-pub(crate) fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
+pub fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
         let path = entry.path();

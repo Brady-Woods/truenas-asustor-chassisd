@@ -14,24 +14,16 @@
 //! per-unit view by not also duplicating to stderr.
 
 use std::ffi::CString;
-use std::sync::Once;
 
-static INIT: Once = Once::new();
-
+/// Opens the syslog connection, tagged `lcm-status[pid]` under the daemon
+/// facility. Optional -- `syslog(3)` opens one implicitly -- but sets the
+/// ident and `LOG_PID`.
 pub fn init() {
-    INIT.call_once(|| {
-        let ident = CString::new("lcm-status").expect("no NUL in literal");
-        // LOG_PID: tag each line with our pid, useful across restarts.
-        // Leaked deliberately: openlog keeps a pointer to `ident` for the
-        // life of the process, and this only runs once.
-        unsafe {
-            libc::openlog(
-                Box::leak(Box::new(ident)).as_ptr(),
-                libc::LOG_PID,
-                libc::LOG_DAEMON,
-            );
-        }
-    });
+    // SAFETY: the ident is a `'static` C string literal; openlog keeps
+    // that pointer for the life of the process, which it outlives.
+    unsafe {
+        libc::openlog(c"lcm-status".as_ptr(), libc::LOG_PID, libc::LOG_DAEMON);
+    }
 }
 
 fn send(priority: libc::c_int, msg: &str) {
@@ -39,17 +31,17 @@ fn send(priority: libc::c_int, msg: &str) {
     if cfg!(test) {
         return;
     }
-    // Sanitized to a plain %s argument rather than interpolated into the
-    // format string -- syslog(3)'s format string is real printf(3), so a
-    // message containing a stray "%s" would otherwise be a format-string
-    // bug, not just a display glitch.
-    let Ok(c) = CString::new(msg) else { return }; // msg can't legally contain a NUL anyway
+    // A NUL would truncate (or, unescaped, drop) the message; one can only
+    // arrive via text read from sysfs or a tool's output.
+    let Ok(msg) = CString::new(msg.replace('\0', "\\0")) else {
+        return;
+    };
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    // The message is passed as a `%s` argument, never as the format
+    // string itself -- syslog(3)'s format is real printf(3), so a stray
+    // `%s` in a message would otherwise be a format-string bug.
     unsafe {
-        libc::syslog(
-            priority,
-            b"%s\0".as_ptr() as *const libc::c_char,
-            c.as_ptr(),
-        );
+        libc::syslog(priority, c"%s".as_ptr(), msg.as_ptr());
     }
 }
 

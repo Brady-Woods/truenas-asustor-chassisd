@@ -560,22 +560,13 @@ fn compute_pwm(temp_c: f32, min_temp_c: f32, max_temp_c: f32, cfg: &FanProfile) 
 mod tests {
     use super::*;
 
+    /// The default curve (45-90C, pwm 50/55/60..255) on it8625 pwm1/fan1.
     fn cfg() -> FanProfile {
         FanProfile {
             name: "test".to_string(),
-            enabled: true,
             pwm_chip: "it8625".to_string(),
-            pwm_index: 1,
             fan_index: Some(1),
-            update_secs: 1,
-            min_temp_c: 45.0,
-            max_temp_c: 90.0,
-            min_start_pwm: 60,
-            min_stop_pwm: 55,
-            min_pwm: 50,
-            max_pwm: 255,
-            sensors: Vec::new(),
-            min_expected_rpm: None,
+            ..FanProfile::default()
         }
     }
 
@@ -612,7 +603,7 @@ mod tests {
         // halfway between 45 and 90 -> halfway between min_stop(55) and 255
         let p = pwm(67.5);
         let expected = 55 + (255 - 55) / 2;
-        assert!((p as i32 - expected as i32).abs() <= 1, "got {p}");
+        assert!((i32::from(p) - expected).abs() <= 1, "got {p}");
     }
 
     #[test]
