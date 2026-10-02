@@ -119,8 +119,12 @@ fn main() -> ExitCode {
             let cfg = Config::load(&path);
             let t = &cfg.templates;
             println!("-- network --\n{:#?}", hal::network(&t.network));
-            println!("-- pools --\n{:#?}", hal::pools(&t.pool));
-            println!("-- hdd --\n{:#?}", hal::hdd(&cfg));
+            let pools = hal::pools();
+            println!(
+                "-- pools --\n{:#?}",
+                hal::pool_screens(&t.pool, pools.as_deref())
+            );
+            println!("-- hdd --\n{:#?}", hal::hdd(&cfg, &hal::disks()));
             println!("-- temperature/fan --\n{:#?}", hal::cpu_and_fan(&cfg));
             println!(
                 "-- docker issues --\n{:#?}",

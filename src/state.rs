@@ -109,6 +109,11 @@ pub struct AppState {
     /// state, not transition-gated: this feeds `recompute_status_led`,
     /// while syslog transitions are logged by `FanController` itself.
     fan_health: Level,
+    /// Last `zpool list`, refreshed on the pools cadence. `None` if
+    /// `zpool` failed.
+    pools: Option<Vec<hal::Pool>>,
+    /// Last disk/SMART scan, refreshed whenever pools or HDD are due.
+    disks: Vec<hal::Disk>,
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
@@ -160,6 +165,8 @@ impl AppState {
             eject_available: false,
             monitor: crate::monitor::HealthMonitor::new(),
             fan_health: Level::Info,
+            pools: None,
+            disks: Vec::new(),
         }
     }
 
@@ -179,8 +186,22 @@ impl AppState {
         self.update_health_leds();
     }
 
+    /// (name, health) per pool, from the last `zpool list`.
+    fn pool_healths(&self) -> Vec<(String, String)> {
+        self.pools
+            .iter()
+            .flatten()
+            .map(|p| (p.name.clone(), p.health.clone()))
+            .collect()
+    }
+
+    /// Bay LED state per SATA bay, from the last disk scan.
+    pub fn bay_states(&self) -> Vec<(u32, led::BayState)> {
+        hal::bay_led_states(&self.disks)
+    }
+
     fn update_health_leds(&mut self) {
-        let bay_states = hal::bay_led_states();
+        let bay_states = self.bay_states();
         for &(bay, bay_state) in &bay_states {
             led::set_bay(bay, bay_state);
         }
@@ -253,7 +274,7 @@ impl AppState {
     pub(crate) fn health_summary(&self) -> HealthSummary {
         use led::StatusPattern;
 
-        let pool_healths = hal::pool_healths();
+        let pool_healths = self.pool_healths();
         let pool_degraded = pool_healths.iter().any(|(_, h)| h == "DEGRADED");
         let pool_faulted = pool_healths
             .iter()
@@ -332,15 +353,11 @@ impl AppState {
         if !net.enabled {
             return Level::Info;
         }
-        let monitored: Vec<String> = if net.monitored_nics.is_empty() {
-            hal::configured_nics()
-        } else {
-            net.monitored_nics.clone()
-        };
+        let monitored = hal::monitored_nics(net);
         if monitored.is_empty() {
             return Level::Info; // nothing configured/in-service to check
         }
-        let down = monitored.iter().filter(|i| led::link_is_down(i)).count();
+        let down = monitored.iter().filter(|i| hal::link_is_down(i)).count();
         if down == 0 {
             Level::Info
         } else if down == monitored.len() {
@@ -386,7 +403,10 @@ impl AppState {
     /// `tick` even runs this check against a meaningfully later clock.
     pub fn refresh_stale(&mut self) {
         let r = &self.cfg.refresh;
-        let mut pools_or_hdd_changed = false;
+        let pools_due = self
+            .pools_cache
+            .stale(Duration::from_secs(r.pools_min_secs));
+        let hdd_due = self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs));
 
         if self.cfg.screens.network
             && self
@@ -396,28 +416,29 @@ impl AppState {
             self.network_cache.screens = hal::network(&self.cfg.templates.network);
             self.network_cache.last_refresh = Some(Instant::now());
         }
-        // Pool/hdd staleness (and so, health monitoring + LED updates) is
-        // checked regardless of `cfg.screens.pools`/`.hdd` -- those only
-        // gate the *display* screen, populated separately below. Alerting
-        // has no business being silently disabled because someone turned
-        // off an LCD screen.
-        if self
-            .pools_cache
-            .stale(Duration::from_secs(r.pools_min_secs))
-        {
-            self.monitor.check_pools(&hal::pool_healths());
+        // Pool/hdd data (and so, health monitoring + LED updates) is
+        // refreshed regardless of `cfg.screens.pools`/`.hdd` -- those only
+        // gate the *display* screen. Alerting has no business being
+        // silently disabled because someone turned off an LCD screen.
+        if pools_due {
+            self.pools = hal::pools();
+            self.monitor.check_pools(&self.pool_healths());
             if self.cfg.screens.pools {
-                self.pools_cache.screens = hal::pools(&self.cfg.templates.pool);
+                self.pools_cache.screens =
+                    hal::pool_screens(&self.cfg.templates.pool, self.pools.as_deref());
             }
             self.pools_cache.last_refresh = Some(Instant::now());
-            pools_or_hdd_changed = true;
         }
-        if self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs)) {
+        // One SMART scan serves both the HDD screens and the bay LEDs, on
+        // whichever of the two cadences comes due first.
+        if pools_due || hdd_due {
+            self.disks = hal::disks();
+        }
+        if hdd_due {
             if self.cfg.screens.hdd {
-                self.hdd_cache.screens = hal::hdd(&self.cfg);
+                self.hdd_cache.screens = hal::hdd(&self.cfg, &self.disks);
             }
             self.hdd_cache.last_refresh = Some(Instant::now());
-            pools_or_hdd_changed = true;
         }
         if self.cfg.screens.temperature
             && self
@@ -464,7 +485,7 @@ impl AppState {
 
         // Bay/status LEDs are driven by pool + SMART health, so only worth
         // recomputing when that data actually changed -- not every tick.
-        if pools_or_hdd_changed {
+        if pools_due || hdd_due {
             self.update_health_leds();
         }
     }

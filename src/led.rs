@@ -271,14 +271,6 @@ pub fn set_nic_mode(iface: &str, mode: NicLedMode) {
     }
 }
 
-/// True if the interface's kernel-reported carrier is down. Used for the
-/// "network disconnected" status LED pattern.
-pub fn link_is_down(iface: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier"))
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false)
-}
-
 pub fn ledtrig_timer_loaded() -> bool {
     Path::new("/sys/class/leds/red:status/delay_on").exists()
 }

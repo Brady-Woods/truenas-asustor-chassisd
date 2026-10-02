@@ -7,8 +7,8 @@
 
 use crate::config::Config;
 use crate::fan::FanStatus;
+use crate::hal;
 use crate::state::AppState;
-use crate::{hal, led};
 
 pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     let mut out = String::new();
@@ -57,7 +57,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     out.push('\n');
 
     out.push_str("-- Drive bays (SMART) --\n");
-    let bays = hal::bay_led_states();
+    let bays = state.bay_states();
     if bays.is_empty() {
         out.push_str("  (none found)\n");
     }
@@ -67,11 +67,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     out.push('\n');
 
     out.push_str("-- Network --\n");
-    let monitored: Vec<String> = if cfg.network.monitored_nics.is_empty() {
-        hal::configured_nics()
-    } else {
-        cfg.network.monitored_nics.clone()
-    };
+    let monitored = hal::monitored_nics(&cfg.network);
     let with_ip = hal::ip_by_iface();
     for iface in hal::physical_nics() {
         let addr = with_ip
@@ -79,7 +75,7 @@ pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
             .cloned()
             .unwrap_or_else(|| hal::nic_link_text(&iface));
         let is_monitored = cfg.network.enabled && monitored.contains(&iface);
-        let link = if led::link_is_down(&iface) {
+        let link = if hal::link_is_down(&iface) {
             "down"
         } else {
             "up"
