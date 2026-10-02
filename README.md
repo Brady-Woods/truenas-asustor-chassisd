@@ -306,6 +306,34 @@ Three ways this goes further than upstream fancontrol:
   temp input that chip has, relying on this filtering rather than needing
   you to already know which specific inputs are real.
 
+**Fixed mode** (`mode = "fixed"` + `fixed_pwm`, the equivalent of ADM's
+fixed fan mode) skips the curve and runs the fan at a constant PWM --
+with one exception that isn't optional: while any sensor feeding that fan
+is at or above its **critical** threshold (its `[[temperature.thresholds]]`
+entry, else `[temperature].critical_threshold` -- the same thresholds the
+health monitor alerts on), the fan goes to `max_pwm`, and stays there until
+*every* sensor is back below its **warning** threshold. A quiet fixed
+speed that ignored a drive cooking at 60C would be worse than no fan
+control at all, which is also why fixed mode refuses to start without
+`sensors`. The gap between critical and warning is deliberate hysteresis:
+a drive hovering at its limit doesn't flip the fan between quiet and full
+speed, and something that got that hot gets properly cooled, not nudged
+just under the line. Both transitions are logged (WARNING on, NOTICE off)
+and shown on the fan's `status` line. `fixed_pwm` must be within
+`min_pwm..=max_pwm`, or the fan is disabled at load with a diagnostic,
+same as an inconsistent curve. Everything below applies to fixed mode
+too.
+
+```toml
+[[fans]]
+name = "chassis"
+pwm_chip = "it8625"
+fan_index = 1
+mode = "fixed"
+fixed_pwm = 100        # ~40%; must be within min_pwm..=max_pwm
+# ...plus the same [[fans.sensors]] as before -- required in fixed mode
+```
+
 Failure handling, all of it aimed at never leaving a fan stopped or
 frozen with nothing watching temperatures:
 

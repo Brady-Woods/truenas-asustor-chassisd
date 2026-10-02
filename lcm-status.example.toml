@@ -178,6 +178,14 @@ pwm_chip = "it8625"    # hwmon chip name exposing the pwm output
 pwm_index = 1          # -> pwm1 / pwm1_enable
 fan_index = 1          # -> fan1_input, for stall detection; omit if no tach
 update_secs = 1        # how often to re-evaluate the curve and rewrite pwm
+# "curve" (default): pwm from the temperature curve below. "fixed": a
+# constant fixed_pwm (ADM's fixed fan mode) -- except that while any sensor
+# below is at/above its [[temperature.thresholds]] critical_threshold, the
+# fan runs at max_pwm until every sensor is back under its warn_threshold.
+# Fixed mode still needs [[fans.sensors]] for that, and keeps the stall
+# kicks and RPM checks. fixed_pwm must be within min_pwm..=max_pwm.
+mode = "curve"
+# fixed_pwm = 100      # only with mode = "fixed"
 min_temp_c = 45.0      # at/below this, pwm = min_pwm
 max_temp_c = 90.0      # at/above this, pwm = max_pwm
 min_start_pwm = 60     # PWM needed to get a *stopped* fan spinning again
