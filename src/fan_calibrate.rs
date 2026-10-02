@@ -17,7 +17,7 @@
 use crate::hal::{all_hwmon, read_temp_input, temp_inputs};
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn run(config_path: &Path, assume_yes: bool) {
     if !running_as_root() {
@@ -55,28 +55,30 @@ pub fn run(config_path: &Path, assume_yes: bool) {
         return;
     }
 
-    let daemon_was_active = systemctl_is_active("lcm-status.service");
-    if daemon_was_active {
-        println!("Stopping lcm-status.service for the duration of this sweep...");
-        let _ = std::process::Command::new("systemctl")
-            .args(["stop", "lcm-status.service"])
-            .status();
-    }
+    // From here on, Ctrl-C/SIGTERM aborts the sweep cleanly (see
+    // `interruptible_sleep`) instead of killing the process mid-ramp with
+    // a fan at pwm=20 and the daemon stopped. Installed only now, after
+    // the prompt: std retries reads interrupted by a signal, so a handler
+    // installed earlier would make Ctrl-C at the prompt do nothing.
+    crate::shutdown::install();
+    let daemon = DaemonPause::stop();
 
     let mut results = Vec::new();
     for c in &candidates {
         println!();
         println!("--- {} pwm{} ---", c.chip_name, c.pwm_index);
-        results.push(calibrate_one(c));
+        match calibrate_one(c) {
+            Ok(r) => results.push(r),
+            Err(Interrupted) => {
+                println!();
+                println!(
+                    "Interrupted -- restoring this pwm output and the daemon, no config proposed."
+                );
+                return; // `PwmRestore` and `daemon` restore on drop
+            }
+        }
     }
-
-    if daemon_was_active {
-        println!();
-        println!("Restarting lcm-status.service...");
-        let _ = std::process::Command::new("systemctl")
-            .args(["start", "lcm-status.service"])
-            .status();
-    }
+    drop(daemon);
 
     println!();
     println!("== Results ==");
@@ -261,28 +263,101 @@ fn set_pwm(hwmon: &str, idx: u32, value: u8) {
     let _ = std::fs::write(format!("{hwmon}/pwm{idx}"), value.to_string());
 }
 
-fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
-    let fans = fan_indices(&c.hwmon);
+/// The sweep was cut short by SIGINT/SIGTERM.
+struct Interrupted;
 
-    // Save original state to restore afterward, whatever we find.
-    let orig_enable =
-        std::fs::read_to_string(format!("{}/pwm{}_enable", c.hwmon, c.pwm_index)).ok();
-    let orig_pwm = std::fs::read_to_string(format!("{}/pwm{}", c.hwmon, c.pwm_index)).ok();
-    let restore = || {
-        if let Some(v) = &orig_pwm {
-            let _ = std::fs::write(format!("{}/pwm{}", c.hwmon, c.pwm_index), v.trim());
+/// Sleeps for `d`, waking early (as `Err`) if SIGINT/SIGTERM arrives.
+fn interruptible_sleep(d: Duration) -> Result<(), Interrupted> {
+    let deadline = Instant::now() + d;
+    while Instant::now() < deadline {
+        if crate::shutdown::requested() {
+            return Err(Interrupted);
         }
-        if let Some(v) = &orig_enable {
-            let _ = std::fs::write(format!("{}/pwm{}_enable", c.hwmon, c.pwm_index), v.trim());
+        sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())));
+    }
+    if crate::shutdown::requested() {
+        Err(Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+/// Puts one pwm output's original `pwmN`/`pwmN_enable` back when dropped
+/// -- on success, on an early return, on interruption, or on a panic.
+struct PwmRestore {
+    pwm_path: String,
+    enable_path: String,
+    orig_pwm: Option<String>,
+    orig_enable: Option<String>,
+}
+
+impl PwmRestore {
+    fn capture(c: &PwmCandidate) -> Self {
+        let pwm_path = format!("{}/pwm{}", c.hwmon, c.pwm_index);
+        let enable_path = format!("{pwm_path}_enable");
+        PwmRestore {
+            orig_pwm: std::fs::read_to_string(&pwm_path).ok(),
+            orig_enable: std::fs::read_to_string(&enable_path).ok(),
+            pwm_path,
+            enable_path,
         }
-    };
+    }
+}
+
+impl Drop for PwmRestore {
+    fn drop(&mut self) {
+        if let Some(v) = &self.orig_pwm {
+            let _ = std::fs::write(&self.pwm_path, v.trim());
+        }
+        if let Some(v) = &self.orig_enable {
+            let _ = std::fs::write(&self.enable_path, v.trim());
+        }
+    }
+}
+
+/// Stops `lcm-status.service` for the sweep (if it was running) and starts
+/// it again when dropped, however the sweep ends.
+struct DaemonPause {
+    was_active: bool,
+}
+
+impl DaemonPause {
+    fn stop() -> Self {
+        let was_active = systemctl_is_active("lcm-status.service");
+        if was_active {
+            println!("Stopping lcm-status.service for the duration of this sweep...");
+            let _ = std::process::Command::new("systemctl")
+                .args(["stop", "lcm-status.service"])
+                .status();
+        }
+        DaemonPause { was_active }
+    }
+}
+
+impl Drop for DaemonPause {
+    fn drop(&mut self) {
+        if self.was_active {
+            println!();
+            println!("Restarting lcm-status.service...");
+            let _ = std::process::Command::new("systemctl")
+                .args(["start", "lcm-status.service"])
+                .status();
+        }
+    }
+}
+
+fn calibrate_one(c: &PwmCandidate) -> Result<CalibrationResult<'_>, Interrupted> {
+    let fans = fan_indices(&c.hwmon);
 
     if fans.is_empty() {
         println!(
             "  no tachometer inputs on this chip at all -- can't confirm a fan responds, skipping"
         );
-        return CalibrationResult::NoFanDetected { candidate: c };
+        return Ok(CalibrationResult::NoFanDetected { candidate: c });
     }
+
+    // Original state is put back when this drops, whatever happens below.
+    let _restore = PwmRestore::capture(c);
 
     // A single "ramp to max, see what's nonzero" snapshot isn't enough to
     // prove *this* pwm output caused anything -- a chip can expose more
@@ -298,21 +373,21 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
     // that.
     println!("  probing for a real response (max -> low -> max, not just nonzero RPM)...");
     set_pwm(&c.hwmon, c.pwm_index, 255);
-    sleep(Duration::from_secs(2));
+    interruptible_sleep(Duration::from_secs(2))?;
     let hi1: Vec<(u32, f32)> = fans
         .iter()
         .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
         .collect();
 
     set_pwm(&c.hwmon, c.pwm_index, 20);
-    sleep(Duration::from_secs(3));
+    interruptible_sleep(Duration::from_secs(3))?;
     let lo: Vec<(u32, f32)> = fans
         .iter()
         .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
         .collect();
 
     set_pwm(&c.hwmon, c.pwm_index, 255);
-    sleep(Duration::from_secs(3));
+    interruptible_sleep(Duration::from_secs(3))?;
     let hi2: Vec<(u32, f32)> = fans
         .iter()
         .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
@@ -342,12 +417,11 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
                 None
             }
         })
-        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        .max_by(|a, b| a.2.total_cmp(&b.2));
 
     let Some((fan_index, max_rpm, _delta)) = best else {
         println!("  no fan showed a real response to this pwm output (RPM didn't drop when lowered) -- skipping");
-        restore();
-        return CalibrationResult::NoFanDetected { candidate: c };
+        return Ok(CalibrationResult::NoFanDetected { candidate: c });
     };
     println!("  fan{fan_index} responds (confirmed causally, ~{max_rpm:.0} RPM at pwm=255)");
 
@@ -361,7 +435,7 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
             pwm = 0;
         }
         set_pwm(&c.hwmon, c.pwm_index, pwm as u8);
-        sleep(Duration::from_millis(1500));
+        interruptible_sleep(Duration::from_millis(1500))?;
         let rpm = read_fan_rpm(&c.hwmon, fan_index);
         if rpm <= 0.0 {
             actually_stalled = true;
@@ -384,7 +458,7 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
                 up = 255;
             }
             set_pwm(&c.hwmon, c.pwm_index, up as u8);
-            sleep(Duration::from_millis(1500));
+            interruptible_sleep(Duration::from_millis(1500))?;
             let rpm = read_fan_rpm(&c.hwmon, fan_index);
             if rpm > 0.0 || up == 255 {
                 break up as u8;
@@ -412,14 +486,13 @@ fn calibrate_one(c: &PwmCandidate) -> CalibrationResult<'_> {
         );
     }
 
-    restore();
-    CalibrationResult::Found {
+    Ok(CalibrationResult::Found {
         candidate: c,
         fan_index,
         min_start_pwm,
         min_stop_pwm: min_stop_pwm.max(1), // 0 would mean "never runs" as a ramp floor; floor at 1
         max_pwm_rpm: max_rpm,
-    }
+    })
 }
 
 fn print_proposed_toml(
@@ -476,4 +549,33 @@ fn confirm(prompt: &str) -> bool {
         return false;
     }
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pwm_restore_puts_original_values_back_on_drop() {
+        let dir = std::env::temp_dir().join(format!("lcm-status-cal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pwm1"), "153\n").unwrap();
+        std::fs::write(dir.join("pwm1_enable"), "2\n").unwrap();
+        let c = PwmCandidate {
+            hwmon: dir.to_string_lossy().into_owned(),
+            chip_name: "test".into(),
+            pwm_index: 1,
+        };
+        {
+            let _restore = PwmRestore::capture(&c);
+            set_pwm(&c.hwmon, 1, 20); // mid-sweep: manual, near-stopped
+            assert_eq!(std::fs::read_to_string(dir.join("pwm1")).unwrap(), "20");
+        } // e.g. an early `?` return on Ctrl-C
+        assert_eq!(std::fs::read_to_string(dir.join("pwm1")).unwrap(), "153");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pwm1_enable")).unwrap(),
+            "2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
