@@ -100,7 +100,9 @@ impl FanController {
         };
         format!(
             "{} (pwm{}): pwm={pwm} ({pct}%) {rpm} [{:?}]",
-            self.profile.name, self.profile.pwm_index, self.health_level()
+            self.profile.name,
+            self.profile.pwm_index,
+            self.health_level()
         )
     }
 
@@ -274,7 +276,10 @@ impl FanController {
         let mut target: Option<u8> = None;
         for i in 0..self.profile.sensors.len() {
             let sel = &self.profile.sensors[i];
-            let min_resample = sel.min_resample_secs.unwrap_or(self.profile.update_secs).max(1);
+            let min_resample = sel
+                .min_resample_secs
+                .unwrap_or(self.profile.update_secs)
+                .max(1);
             let need_refresh = match self.sensor_cache[i].0 {
                 None => true,
                 Some(t) => t.elapsed() >= Duration::from_secs(min_resample),
@@ -300,7 +305,10 @@ impl FanController {
     }
 
     fn write_pwm(&self, hwmon: &str, value: u8) -> std::io::Result<()> {
-        std::fs::write(format!("{hwmon}/pwm{}", self.profile.pwm_index), value.to_string())
+        std::fs::write(
+            format!("{hwmon}/pwm{}", self.profile.pwm_index),
+            value.to_string(),
+        )
     }
 }
 

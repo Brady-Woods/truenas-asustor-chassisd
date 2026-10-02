@@ -23,7 +23,10 @@ fn main() {
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
 
     if cmd == "check-config" {
-        let path = args.get(2).map(Path::new).unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        let path = args
+            .get(2)
+            .map(Path::new)
+            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
         println!("{:#?}", Config::load(path));
         return;
     }
@@ -31,14 +34,20 @@ fn main() {
     if cmd == "hal-test" {
         // Uses the real config (not defaults) so [templates.*] edits can be
         // previewed without restarting the daemon.
-        let path = args.get(2).map(Path::new).unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        let path = args
+            .get(2)
+            .map(Path::new)
+            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
         let cfg = Config::load(path);
         let t = &cfg.templates;
         println!("-- network --\n{:#?}", hal::network(&t.network));
         println!("-- pools --\n{:#?}", hal::pools(&t.pool));
         println!("-- hdd --\n{:#?}", hal::hdd(&cfg));
         println!("-- temperature/fan --\n{:#?}", hal::cpu_and_fan(&cfg));
-        println!("-- docker issues --\n{:#?}", hal::docker_issues(&cfg.docker.ignore, &t.docker));
+        println!(
+            "-- docker issues --\n{:#?}",
+            hal::docker_issues(&cfg.docker.ignore, &t.docker)
+        );
         return;
     }
 
@@ -61,7 +70,10 @@ fn main() {
     }
 
     if cmd == "status" {
-        let path = args.get(2).map(Path::new).unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
+        let path = args
+            .get(2)
+            .map(Path::new)
+            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
         let socket_path = Config::load(path).socket.path;
         request_status(&socket_path);
         return;
@@ -154,7 +166,9 @@ fn run_daemon(args: &[String]) {
     // Blink triggers (RAID-degraded flash, critical-alert flash, bay
     // standby flash) need this loaded; it's not on by default on TrueNAS.
     if !led::ledtrig_timer_loaded() {
-        let _ = std::process::Command::new("modprobe").arg("ledtrig-timer").status();
+        let _ = std::process::Command::new("modprobe")
+            .arg("ledtrig-timer")
+            .status();
     }
 
     let mut state = AppState::new(cfg.clone());
@@ -165,8 +179,12 @@ fn run_daemon(args: &[String]) {
     // (independent of the LCD rotation/scroll timing below). `tick()`
     // fires immediately on this first call (no `last_tick` yet), so the
     // curve applies from startup rather than waiting a full interval.
-    let mut fans: Vec<fan::FanController> =
-        cfg.fans.iter().cloned().map(fan::FanController::new).collect();
+    let mut fans: Vec<fan::FanController> = cfg
+        .fans
+        .iter()
+        .cloned()
+        .map(fan::FanController::new)
+        .collect();
     for f in &mut fans {
         f.tick();
     }
@@ -188,7 +206,11 @@ fn run_daemon(args: &[String]) {
         }
 
         if cfg.sleep.enabled {
-            state.set_schedule_sleep_wanted(in_sleep_window(&cfg.sleep.start, &cfg.sleep.end, now_hhmm()));
+            state.set_schedule_sleep_wanted(in_sleep_window(
+                &cfg.sleep.start,
+                &cfg.sleep.end,
+                now_hhmm(),
+            ));
         }
 
         for f in &mut fans {
@@ -213,7 +235,9 @@ fn run_daemon(args: &[String]) {
         };
         let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if rc > 0 && pfd.revents & libc::POLLIN != 0 {
-            if let Ok(Some((opcode, subcmd, payload, ok))) = lcm.read_frame(Duration::from_millis(50)) {
+            if let Ok(Some((opcode, subcmd, payload, ok))) =
+                lcm.read_frame(Duration::from_millis(50))
+            {
                 if ok && opcode == 0xF0 {
                     let _ = lcm.ack(subcmd);
                     if subcmd == 0x80 {
@@ -261,10 +285,14 @@ fn apply_effect(effect: Effect, lcm: &mut Lcm, cfg: &Config) {
 fn run_action(action: Action, _cfg: &Config) {
     match action {
         Action::Shutdown => {
-            let _ = std::process::Command::new("systemctl").arg("poweroff").status();
+            let _ = std::process::Command::new("systemctl")
+                .arg("poweroff")
+                .status();
         }
         Action::Restart => {
-            let _ = std::process::Command::new("systemctl").arg("reboot").status();
+            let _ = std::process::Command::new("systemctl")
+                .arg("reboot")
+                .status();
         }
         Action::Eject => {
             // Placeholder: real implementation unmounts + powers down the
@@ -320,7 +348,10 @@ fn next_wake_ms(_cfg: &Config) -> i32 {
 /// trouble in. Lives here (not in `state.rs`) because `FanController`s are
 /// a separate top-level value from `AppState` in this loop, not owned by it.
 fn worst_fan_health(fans: &[fan::FanController]) -> socket::Level {
-    fans.iter().map(|f| f.health_level()).max().unwrap_or(socket::Level::Info)
+    fans.iter()
+        .map(|f| f.health_level())
+        .max()
+        .unwrap_or(socket::Level::Info)
 }
 
 fn run_probe_command(cmd: &str, args: &[String]) {
@@ -334,9 +365,13 @@ fn run_probe_command(cmd: &str, args: &[String]) {
 
     match cmd {
         "init" => {
-            let ok1 = lcm.send_and_ack(0xF0, 0x11, &[0x01], Duration::from_millis(300)).unwrap_or(false);
+            let ok1 = lcm
+                .send_and_ack(0xF0, 0x11, &[0x01], Duration::from_millis(300))
+                .unwrap_or(false);
             std::thread::sleep(Duration::from_millis(15));
-            let ok2 = lcm.send_and_ack(0xF0, 0x22, &[0x00], Duration::from_millis(300)).unwrap_or(false);
+            let ok2 = lcm
+                .send_and_ack(0xF0, 0x22, &[0x00], Duration::from_millis(300))
+                .unwrap_or(false);
             println!("init: step1={ok1} step2={ok2}");
         }
         "settext" => {
@@ -360,7 +395,10 @@ fn run_probe_command(cmd: &str, args: &[String]) {
                                     print!("  => KEY {key:?} (code={code})");
                                 }
                             } else if subcmd == 0x13 && payload.len() >= 3 {
-                                print!("  => MCU VERSION {}.{}.{}", payload[0], payload[1], payload[2]);
+                                print!(
+                                    "  => MCU VERSION {}.{}.{}",
+                                    payload[0], payload[1], payload[2]
+                                );
                             }
                             let _ = lcm.ack(subcmd);
                         }

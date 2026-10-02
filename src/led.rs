@@ -32,7 +32,7 @@ fn set_blink(led: &str, on_ms: u32, off_ms: u32) {
 /// pick the single most severe condition currently true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusPattern {
-    Ok,               // solid green
+    Ok, // solid green
     /// Solid amber (green+red both on) -- "our addition" per the doc, not a
     /// factory pattern. Originally just "network down"; now the generic
     /// non-critical warning indicator (some monitored NICs down, a temp/fan
@@ -179,7 +179,11 @@ pub fn exit_night_mode(nic_ifaces: &[String]) {
     set_solid("red:power", false);
 
     for bay in 1..=4 {
-        write_attr(&format!("sata{bay}:green:disk"), "trigger", &format!("asustor-sata{bay}"));
+        write_attr(
+            &format!("sata{bay}:green:disk"),
+            "trigger",
+            &format!("asustor-sata{bay}"),
+        );
     }
 
     write_attr("green:usb", "trigger", "asustor-front-usb");

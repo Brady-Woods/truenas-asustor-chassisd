@@ -25,7 +25,11 @@ pub fn init() {
         // Leaked deliberately: openlog keeps a pointer to `ident` for the
         // life of the process, and this only runs once.
         unsafe {
-            libc::openlog(Box::leak(Box::new(ident)).as_ptr(), libc::LOG_PID, libc::LOG_DAEMON);
+            libc::openlog(
+                Box::leak(Box::new(ident)).as_ptr(),
+                libc::LOG_PID,
+                libc::LOG_DAEMON,
+            );
         }
     });
 }
@@ -37,7 +41,11 @@ fn send(priority: libc::c_int, msg: &str) {
     // bug, not just a display glitch.
     let Ok(c) = CString::new(msg) else { return }; // msg can't legally contain a NUL anyway
     unsafe {
-        libc::syslog(priority, b"%s\0".as_ptr() as *const libc::c_char, c.as_ptr());
+        libc::syslog(
+            priority,
+            b"%s\0".as_ptr() as *const libc::c_char,
+            c.as_ptr(),
+        );
     }
 }
 

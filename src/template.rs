@@ -19,9 +19,13 @@ pub fn placeholders(tpl: &str) -> Result<Vec<&str>, String> {
             continue;
         }
         if c == b'}' {
-            return Err(format!("stray '}}' in \"{tpl}\" (use '}}}}' for a literal brace)"));
+            return Err(format!(
+                "stray '}}' in \"{tpl}\" (use '}}}}' for a literal brace)"
+            ));
         }
-        let end = after.find('}').ok_or_else(|| format!("unclosed '{{' in \"{tpl}\""))?;
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unclosed '{{' in \"{tpl}\""))?;
         names.push(&after[..end]);
         rest = &after[end + 1..];
     }
@@ -73,7 +77,10 @@ mod tests {
     fn substitutes_and_trims() {
         let vars = [("status", "PASSED"), ("temp", "")];
         assert_eq!(render("{status} {temp}", &vars), "PASSED");
-        assert_eq!(render("{status} {temp}", &[("status", "OK"), ("temp", "34C")]), "OK 34C");
+        assert_eq!(
+            render("{status} {temp}", &[("status", "OK"), ("temp", "34C")]),
+            "OK 34C"
+        );
     }
 
     #[test]
