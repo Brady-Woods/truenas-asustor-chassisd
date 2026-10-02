@@ -13,7 +13,7 @@ mod syslog;
 mod template;
 
 use config::Config;
-use protocol::{Lcm, LCM_DEVICE, OP_COMMAND, SUB_VERSION};
+use protocol::{LCM_DEVICE, Lcm, OP_COMMAND, SUB_VERSION};
 use state::{Action, AppState, Effect};
 use std::os::unix::io::AsRawFd;
 use std::panic::{self, AssertUnwindSafe};
@@ -89,7 +89,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         }
         [cmd @ ("init" | "settext" | "listen"), ..] => Ok(Cli::Probe((*cmd).to_string())),
         ["help" | "-h" | "--help", ..] => Ok(Cli::Help),
-        [path] if path.contains('/') || path.ends_with(".toml") => {
+        [path]
+            if path.contains('/')
+                || Path::new(path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("toml")) =>
+        {
             Ok(Cli::Daemon(PathBuf::from(path)))
         }
         [cmd, ..] => Err(format!("unknown command '{cmd}'")),
@@ -311,16 +316,17 @@ fn event_loop(
         // SAFETY: `pfd` is a valid pollfd for the duration of the call,
         // and the count (1) matches.
         let rc = unsafe { libc::poll(&raw mut pfd, 1, POLL_INTERVAL_MS) };
-        if rc > 0 && pfd.revents & libc::POLLIN != 0 {
-            if let Ok(Some(frame)) = lcm.read_frame(Duration::from_millis(50)) {
-                if frame.is_unsolicited() {
-                    let _ = lcm.ack(frame.subcmd);
-                }
-                if let Some(key) = frame.key() {
-                    let effect = state.handle_key(key);
-                    apply_effect(effect, lcm);
-                    drain_pending_keys(state, lcm);
-                }
+        if rc > 0
+            && pfd.revents & libc::POLLIN != 0
+            && let Some(frame) = lcm.read_frame(Duration::from_millis(50))
+        {
+            if frame.is_unsolicited() {
+                let _ = lcm.ack(frame.subcmd);
+            }
+            if let Some(key) = frame.key() {
+                let effect = state.handle_key(key);
+                apply_effect(effect, lcm);
+                drain_pending_keys(state, lcm);
             }
         }
     }
@@ -330,7 +336,7 @@ fn event_loop(
 /// Dispatches button presses `Lcm::send_and_ack` had to queue (see its
 /// doc) instead of discarding -- e.g. a press that arrived while a
 /// `set_text` call was mid-flight waiting on its own ACK. Feeds each one
-/// through `state.handle_key` exactly like the top-level poll() path does,
+/// through `state.handle_key` exactly like the top-level `poll()` path does,
 /// so it isn't lost until the MCU gets around to resending it.
 fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm) {
     for frame in lcm.take_pending() {
@@ -413,26 +419,23 @@ fn run_probe_command(cmd: &str, args: &[String]) {
             println!("listening for {secs}s (press panel buttons now)...");
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
-                match lcm.read_frame(Duration::from_millis(500)) {
-                    Ok(Some(f)) => {
-                        print!(
-                            "<- opcode={:#04X} subcmd={:#04X} payload={:02X?} cksum_ok={}",
-                            f.opcode, f.subcmd, f.payload, f.checksum_ok
-                        );
-                        if let Some(key) = f.key() {
-                            print!("  => KEY {key:?}");
-                        } else if f.is_unsolicited() && f.subcmd == SUB_VERSION {
-                            if let [major, minor, patch, ..] = f.payload[..] {
-                                print!("  => MCU VERSION {major}.{minor}.{patch}");
-                            }
-                        }
-                        if f.opcode == OP_COMMAND {
-                            let _ = lcm.ack(f.subcmd);
-                        }
-                        println!();
+                if let Some(f) = lcm.read_frame(Duration::from_millis(500)) {
+                    print!(
+                        "<- opcode={:#04X} subcmd={:#04X} payload={:02X?} cksum_ok={}",
+                        f.opcode, f.subcmd, f.payload, f.checksum_ok
+                    );
+                    if let Some(key) = f.key() {
+                        print!("  => KEY {key:?}");
+                    } else if f.is_unsolicited()
+                        && f.subcmd == SUB_VERSION
+                        && let [major, minor, patch, ..] = f.payload[..]
+                    {
+                        print!("  => MCU VERSION {major}.{minor}.{patch}");
                     }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("read error: {e}"),
+                    if f.opcode == OP_COMMAND {
+                        let _ = lcm.ack(f.subcmd);
+                    }
+                    println!();
                 }
             }
         }
@@ -445,11 +448,11 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
-        let argv: Vec<String> = std::iter::once("lcm-status")
+        let cmdline: Vec<String> = std::iter::once("lcm-status")
             .chain(args.iter().copied())
             .map(String::from)
             .collect();
-        parse_args(&argv)
+        parse_args(&cmdline)
     }
 
     fn default_path() -> PathBuf {

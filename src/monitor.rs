@@ -164,7 +164,7 @@ impl HealthMonitor {
             }
             match state {
                 BayState::Failed => {
-                    crate::syslog::critical(&format!("bay {bay}: SMART reports FAILED"))
+                    crate::syslog::critical(&format!("bay {bay}: SMART reports FAILED"));
                 }
                 _ => {
                     if prev == Some(BayState::Failed) {

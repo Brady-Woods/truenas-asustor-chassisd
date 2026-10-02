@@ -197,11 +197,10 @@ impl FanController {
     /// read) or the chip isn't resolved (not loaded yet).
     pub fn status_line(&self) -> String {
         let pwm = self.last_pwm.unwrap_or(0);
-        let pct = pwm as u32 * 100 / 255;
+        let pct = u32::from(pwm) * 100 / 255;
         let rpm = match (&self.hwmon, self.profile.fan_index) {
             (Some(hwmon), Some(n)) => read_sysfs_raw_f32(&format!("{hwmon}/fan{n}_input"))
-                .map(|r| format!("{r:.0}rpm"))
-                .unwrap_or_else(|| "--".to_string()),
+                .map_or_else(|| "--".to_string(), |r| format!("{r:.0}rpm")),
             _ => "--".to_string(),
         };
         format!(
@@ -385,7 +384,7 @@ impl FanController {
         self.ever_ran_normally = true;
 
         if let (Some(min_rpm), Some(rpm)) = (self.profile.min_expected_rpm, rpm) {
-            let low = rpm < min_rpm as f32;
+            let low = f64::from(rpm) < f64::from(min_rpm);
             if low && !self.low_rpm_warned {
                 self.low_rpm_warned = true;
                 crate::syslog::warning(&format!(
@@ -487,14 +486,14 @@ impl FanController {
         let Some(hwmon) = self.hwmon.clone().or_else(|| self.resolve_hwmon()) else {
             return;
         };
-        if let Some(mode) = self.original_enable.as_deref().filter(|m| *m != "1") {
-            if std::fs::write(self.enable_path(&hwmon), mode).is_ok() {
-                crate::syslog::info(&format!(
-                    "fan '{}' (pwm{}): restored pwm{}_enable={mode}",
-                    self.profile.name, self.profile.pwm_index, self.profile.pwm_index
-                ));
-                return;
-            }
+        if let Some(mode) = self.original_enable.as_deref().filter(|m| *m != "1")
+            && std::fs::write(self.enable_path(&hwmon), mode).is_ok()
+        {
+            crate::syslog::info(&format!(
+                "fan '{}' (pwm{}): restored pwm{}_enable={mode}",
+                self.profile.name, self.profile.pwm_index, self.profile.pwm_index
+            ));
+            return;
         }
         if self.write_pwm(&hwmon, u8::MAX).is_ok() {
             crate::syslog::info(&format!(
@@ -546,14 +545,20 @@ impl Drop for FanController {
 /// doesn't have.
 fn compute_pwm(temp_c: f32, min_temp_c: f32, max_temp_c: f32, cfg: &FanProfile) -> u8 {
     let raw = if temp_c <= min_temp_c {
-        cfg.min_pwm as f32
+        f32::from(cfg.min_pwm)
     } else if temp_c >= max_temp_c {
-        cfg.max_pwm as f32
+        f32::from(cfg.max_pwm)
     } else {
-        let (min_stop, max_pwm) = (cfg.min_stop_pwm as f32, cfg.max_pwm as f32);
+        let (min_stop, max_pwm) = (f32::from(cfg.min_stop_pwm), f32::from(cfg.max_pwm));
         (temp_c - min_temp_c) * (max_pwm - min_stop) / (max_temp_c - min_temp_c) + min_stop
     };
-    raw.round().clamp(0.0, 255.0) as u8
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 0..=255 first"
+    )]
+    let pwm = raw.round().clamp(0.0, 255.0) as u8;
+    pwm
 }
 
 #[cfg(test)]
@@ -570,7 +575,7 @@ mod tests {
         }
     }
 
-    /// Evaluates against `cfg()`'s own min_temp_c/max_temp_c (45/90) --
+    /// Evaluates against `cfg()`'s own `min_temp_c`/`max_temp_c` (45/90) --
     /// the common case, a sensor with no per-selector override.
     fn pwm(temp_c: f32) -> u8 {
         let c = cfg();

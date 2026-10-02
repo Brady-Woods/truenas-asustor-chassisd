@@ -5,7 +5,7 @@
 //!   checksum = 8-bit sum of bytes[0 .. N+2], stored at byte[N+3]
 //!   wire length = N + 4
 //!
-//! Serial: /dev/ttyS1, 115200 8N1, opened O_RDWR|O_NOCTTY|O_NONBLOCK, VMIN=1.
+//! Serial: /dev/ttyS1, 115200 8N1, opened `O_RDWR|O_NOCTTY|O_NONBLOCK`, VMIN=1.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -168,8 +168,8 @@ impl Lcm {
 
     /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
     /// time, the same approach the original firmware uses. `None` on
-    /// timeout with nothing received.
-    pub fn read_frame(&mut self, timeout: Duration) -> io::Result<Option<Frame>> {
+    /// timeout (or a read error) with nothing received.
+    pub fn read_frame(&mut self, timeout: Duration) -> Option<Frame> {
         let fd = self.port.as_raw_fd();
         let mut buf = [0u8; FRAME_MAX];
         let mut got = 0usize;
@@ -220,9 +220,9 @@ impl Lcm {
         }
 
         if got == 0 {
-            return Ok(None);
+            return None;
         }
-        Ok(decode(&buf[..got]))
+        decode(&buf[..got])
     }
 
     /// Sends a frame and waits for the corresponding ACK (`OP_ACK`,
@@ -248,7 +248,7 @@ impl Lcm {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            match self.read_frame(remaining)? {
+            match self.read_frame(remaining) {
                 Some(f) if f.checksum_ok && f.opcode == OP_ACK && f.subcmd == subcmd => {
                     return Ok(f.payload.first() == Some(&0));
                 }

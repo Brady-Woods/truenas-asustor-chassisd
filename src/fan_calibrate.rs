@@ -19,6 +19,7 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+#[expect(clippy::too_many_lines, reason = "a linear, printed walkthrough")]
 pub fn run(config_path: &Path, assume_yes: bool) {
     if !running_as_root() {
         eprintln!("must run as root (reads/writes hwmon pwm files)");
@@ -157,16 +158,19 @@ fn print_sensor_inventory() {
                 .filter(|s| !s.is_empty());
             let raw = std::fs::read_to_string(format!("{hwmon}/{input}_input"))
                 .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok());
+                .and_then(|s| s.trim().parse::<f32>().ok());
             let connected = read_temp_input(&hwmon, &input);
             let label_str = label.map(|l| format!(" \"{l}\"")).unwrap_or_default();
             match connected {
                 Some(t) => println!("  [connected]    {chip} {input}{label_str}: {t:.1}C"),
                 None => {
-                    let raw_str = raw
-                        .map(|r| format!("{:.1}C raw", r as f32 / 1000.0))
-                        .unwrap_or_else(|| "unreadable".to_string());
-                    println!("  [unconnected]  {chip} {input}{label_str}: {raw_str} (fault flag set, or outside plausible range)");
+                    let raw_str = raw.map_or_else(
+                        || "unreadable".to_string(),
+                        |r| format!("{:.1}C raw", r / 1000.0),
+                    );
+                    println!(
+                        "  [unconnected]  {chip} {input}{label_str}: {raw_str} (fault flag set, or outside plausible range)"
+                    );
                 }
             }
         }
@@ -220,16 +224,16 @@ fn pwm_indices(hwmon: &str) -> Vec<u32> {
     if let Ok(entries) = std::fs::read_dir(hwmon) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(n) = name.strip_prefix("pwm") {
-                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
-                    if let Ok(idx) = n.parse() {
-                        v.push(idx);
-                    }
-                }
+            if let Some(n) = name.strip_prefix("pwm")
+                && !n.is_empty()
+                && n.chars().all(|c| c.is_ascii_digit())
+                && let Ok(idx) = n.parse()
+            {
+                v.push(idx);
             }
         }
     }
-    v.sort();
+    v.sort_unstable();
     v
 }
 
@@ -238,16 +242,15 @@ fn fan_indices(hwmon: &str) -> Vec<u32> {
     if let Ok(entries) = std::fs::read_dir(hwmon) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name.strip_prefix("fan") {
-                if let Some(n) = rest.strip_suffix("_input") {
-                    if let Ok(idx) = n.parse() {
-                        v.push(idx);
-                    }
-                }
+            if let Some(rest) = name.strip_prefix("fan")
+                && let Some(n) = rest.strip_suffix("_input")
+                && let Ok(idx) = n.parse()
+            {
+                v.push(idx);
             }
         }
     }
-    v.sort();
+    v.sort_unstable();
     v
 }
 
@@ -393,12 +396,8 @@ fn calibrate_one(c: &PwmCandidate) -> Result<CalibrationResult<'_>, Interrupted>
         .map(|&i| (i, read_fan_rpm(&c.hwmon, i)))
         .collect();
 
-    let get = |v: &[(u32, f32)], i: u32| {
-        v.iter()
-            .find(|(idx, _)| *idx == i)
-            .map(|&(_, v)| v)
-            .unwrap_or(0.0)
-    };
+    let get =
+        |v: &[(u32, f32)], i: u32| v.iter().find(|(idx, _)| *idx == i).map_or(0.0, |&(_, v)| v);
     let best = fans
         .iter()
         .filter_map(|&i| {
@@ -420,28 +419,27 @@ fn calibrate_one(c: &PwmCandidate) -> Result<CalibrationResult<'_>, Interrupted>
         .max_by(|a, b| a.2.total_cmp(&b.2));
 
     let Some((fan_index, max_rpm, _delta)) = best else {
-        println!("  no fan showed a real response to this pwm output (RPM didn't drop when lowered) -- skipping");
+        println!(
+            "  no fan showed a real response to this pwm output (RPM didn't drop when lowered) -- skipping"
+        );
         return Ok(CalibrationResult::NoFanDetected { candidate: c });
     };
     println!("  fan{fan_index} responds (confirmed causally, ~{max_rpm:.0} RPM at pwm=255)");
 
     println!("  ramping down to find min_stop_pwm (where it stalls)...");
     let mut min_stop_pwm: u8 = 255;
-    let mut pwm: i32 = 255;
+    let mut pwm: u8 = 255;
     let mut actually_stalled = false;
     loop {
-        pwm -= 15;
-        if pwm < 0 {
-            pwm = 0;
-        }
-        set_pwm(&c.hwmon, c.pwm_index, pwm as u8);
+        pwm = pwm.saturating_sub(15);
+        set_pwm(&c.hwmon, c.pwm_index, pwm);
         interruptible_sleep(Duration::from_millis(1500))?;
         let rpm = read_fan_rpm(&c.hwmon, fan_index);
         if rpm <= 0.0 {
             actually_stalled = true;
             break;
         }
-        min_stop_pwm = pwm as u8;
+        min_stop_pwm = pwm;
         if pwm == 0 {
             break; // never stalls even at 0 -- see below, handled explicitly
         }
@@ -451,17 +449,14 @@ fn calibrate_one(c: &PwmCandidate) -> Result<CalibrationResult<'_>, Interrupted>
     if actually_stalled {
         println!("  stalled below pwm={pwm} -- min_stop_pwm candidate: {min_stop_pwm}");
         println!("  ramping up from stopped to find min_start_pwm (where it restarts)...");
-        let mut up: i32 = pwm;
+        let mut up = pwm;
         min_start_pwm = loop {
-            up += 10;
-            if up > 255 {
-                up = 255;
-            }
-            set_pwm(&c.hwmon, c.pwm_index, up as u8);
+            up = up.saturating_add(10);
+            set_pwm(&c.hwmon, c.pwm_index, up);
             interruptible_sleep(Duration::from_millis(1500))?;
             let rpm = read_fan_rpm(&c.hwmon, fan_index);
-            if rpm > 0.0 || up == 255 {
-                break up as u8;
+            if rpm > 0.0 || up == u8::MAX {
+                break up;
             }
         };
         println!("  restarts at pwm={min_start_pwm} -- min_start_pwm candidate: {min_start_pwm}");
@@ -537,8 +532,7 @@ fn systemctl_is_active(unit: &str) -> bool {
     std::process::Command::new("systemctl")
         .args(["is-active", "--quiet", unit])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 fn confirm(prompt: &str) -> bool {
