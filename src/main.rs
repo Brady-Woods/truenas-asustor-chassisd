@@ -171,35 +171,28 @@ fn run_daemon(args: &[String]) {
             .status();
     }
 
+    // Started before the first (slow, subprocess-heavy) refresh below so
+    // fan control is never waiting on it.
+    let fans = fan::FanService::spawn(cfg.fans.clone()).unwrap_or_else(|e| {
+        eprintln!("failed to start fan control thread: {e}");
+        std::process::exit(1);
+    });
+
     let mut state = AppState::new(cfg.clone());
     state.refresh_all();
     state.init_leds();
-
-    // One controller per configured fan, each on its own cadence
-    // (independent of the LCD rotation/scroll timing below). `tick()`
-    // fires immediately on this first call (no `last_tick` yet), so the
-    // curve applies from startup rather than waiting a full interval.
-    let mut fans: Vec<fan::FanController> = cfg
-        .fans
-        .iter()
-        .cloned()
-        .map(fan::FanController::new)
-        .collect();
-    for f in &mut fans {
-        f.tick();
-    }
-    state.set_fan_health(worst_fan_health(&fans));
+    state.set_fan_health(fans.status().health);
 
     let serial_fd = lcm.as_raw_fd();
 
     loop {
         // Drain any socket commands that arrived since the last wakeup.
         // STATUS is handled here rather than forwarded into
-        // `apply_socket_command`: building the report needs `fans` too,
-        // which lives out here alongside `state`, not inside it.
+        // `apply_socket_command`: building the report needs the fan
+        // status too, which lives out here alongside `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
-                let _ = resp_tx.send(report::build(&state, &fans, &cfg));
+                let _ = resp_tx.send(report::build(&state, &fans.status(), &cfg));
                 continue;
             }
             state.apply_socket_command(cmd);
@@ -213,10 +206,11 @@ fn run_daemon(args: &[String]) {
             ));
         }
 
-        for f in &mut fans {
-            f.tick();
+        if fans.has_died() {
+            syslog::critical("fan control thread died; exiting so systemd restarts the daemon");
+            std::process::exit(1);
         }
-        state.set_fan_health(worst_fan_health(&fans));
+        state.set_fan_health(fans.status().health);
 
         let effect = state.tick();
         apply_effect(effect, &mut lcm, &cfg);
@@ -341,17 +335,6 @@ fn next_wake_ms(_cfg: &Config) -> i32 {
     // threaded through the poll() call. At idle (no scrolling, no pending
     // timers) this is the only cost -- one wakeup per 100ms is negligible.
     100
-}
-
-/// Worst current health across every configured fan -- fed into
-/// `AppState::set_fan_health` each tick so the status LED can factor fan
-/// trouble in. Lives here (not in `state.rs`) because `FanController`s are
-/// a separate top-level value from `AppState` in this loop, not owned by it.
-fn worst_fan_health(fans: &[fan::FanController]) -> socket::Level {
-    fans.iter()
-        .map(|f| f.health_level())
-        .max()
-        .unwrap_or(socket::Level::Info)
 }
 
 fn run_probe_command(cmd: &str, args: &[String]) {

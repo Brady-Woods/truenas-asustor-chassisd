@@ -36,7 +36,8 @@
 //!   independently, and the *worst resulting PWM* wins -- not the worst
 //!   raw temperature fed through a single curve.
 //! - **Multiple fans, not one.** `Config::fans` is a `Vec`; `main.rs` runs
-//!   one `FanController` per entry, independently.
+//!   one `FanController` per entry, independently, on a dedicated thread
+//!   (`FanService`) so the main loop can never stall fan control.
 //!
 //! `lcm-status fan-profile` (`fan_calibrate.rs`) is the discovery
 //! counterpart to `pwmconfig`: it finds which pwm outputs and sensors
@@ -45,7 +46,96 @@
 
 use crate::config::FanProfile;
 use crate::hal::{glob_hwmon, read_sysfs_raw_f32, resolve_selector};
+use crate::socket::Level;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// How often the fan thread wakes to give each controller a chance to
+/// tick. Each controller still only acts every `update_secs`.
+const FAN_THREAD_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What the main loop needs from the fan thread: the worst current health
+/// (for the status LED) and one status line per fan (for `STATUS`).
+#[derive(Debug, Clone)]
+pub struct FanStatus {
+    pub health: Level,
+    pub lines: Vec<String>,
+}
+
+/// Fan control, running on its own thread so nothing the main loop does
+/// (a slow `smartctl`, a hung `zpool`, a stuck socket client) can stall
+/// it. The controllers are owned by that thread; the main loop only sees
+/// the published `FanStatus`.
+pub struct FanService {
+    status: Arc<Mutex<FanStatus>>,
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl FanService {
+    /// Starts one `FanController` per profile on a dedicated thread. Each
+    /// ticks immediately (no `last_tick` yet), so curves apply from startup.
+    pub fn spawn(profiles: Vec<FanProfile>) -> std::io::Result<Self> {
+        let status = Arc::new(Mutex::new(FanStatus {
+            health: Level::Info,
+            lines: Vec::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = thread::Builder::new().name("fans".into()).spawn({
+            let status = Arc::clone(&status);
+            let stop = Arc::clone(&stop);
+            move || {
+                let mut fans: Vec<FanController> =
+                    profiles.into_iter().map(FanController::new).collect();
+                while !stop.load(Ordering::Relaxed) {
+                    for f in &mut fans {
+                        f.tick();
+                    }
+                    let snapshot = FanStatus {
+                        health: worst_health(&fans),
+                        lines: fans.iter().map(FanController::status_line).collect(),
+                    };
+                    *status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+                    thread::sleep(FAN_THREAD_INTERVAL);
+                }
+            }
+        })?;
+        Ok(FanService {
+            status,
+            stop,
+            handle,
+        })
+    }
+
+    pub fn status(&self) -> FanStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// True if the fan thread has exited on its own, i.e. it panicked.
+    pub fn has_died(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Stops the fan thread and waits for it to exit.
+    pub fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
+    }
+}
+
+fn worst_health(fans: &[FanController]) -> Level {
+    fans.iter()
+        .map(FanController::health_level)
+        .max()
+        .unwrap_or(Level::Info)
+}
 
 /// Consecutive failed restart attempts (each ~1-2s apart, gated by
 /// `kick_until` + `update_secs`) before a stalled fan is logged as
@@ -109,8 +199,7 @@ impl FanController {
     /// Current health, for the status LED (`state::recompute_status_led`)
     /// -- current state, not transition-gated the way this fan's own
     /// syslog lines are (the LED always reflects "right now").
-    pub fn health_level(&self) -> crate::socket::Level {
-        use crate::socket::Level;
+    pub fn health_level(&self) -> Level {
         if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS {
             Level::Critical
         } else if self.consecutive_stalls > 0 || self.low_rpm_warned {

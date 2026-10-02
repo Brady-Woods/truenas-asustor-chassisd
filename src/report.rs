@@ -6,21 +6,21 @@
 //! itself can never disagree about what's currently true.
 
 use crate::config::Config;
-use crate::fan::FanController;
+use crate::fan::FanStatus;
 use crate::state::AppState;
 use crate::{hal, led};
 
-pub fn build(state: &AppState, fans: &[FanController], cfg: &Config) -> String {
+pub fn build(state: &AppState, fans: &FanStatus, cfg: &Config) -> String {
     let mut out = String::new();
 
     out.push_str("=== lcm-status report ===\n\n");
 
     out.push_str("-- Fans --\n");
-    if fans.is_empty() {
+    if fans.lines.is_empty() {
         out.push_str("  (none configured)\n");
     }
-    for f in fans {
-        out.push_str(&format!("  {}\n", f.status_line()));
+    for line in &fans.lines {
+        out.push_str(&format!("  {line}\n"));
     }
     out.push('\n');
 
