@@ -144,11 +144,21 @@ fn worst_health(fans: &[FanController]) -> Level {
 /// prompt alert (a few seconds, not minutes).
 const UNRESPONSIVE_AFTER_STALLS: u32 = 3;
 
+/// What `FanController::plan` wants written this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PwmCommand {
+    /// Write this value, as the steady-state curve output.
+    Set(u8),
+    /// Write `min_start_pwm` and hold it for a second to get a stopped or
+    /// stalled fan turning, before resuming the curve.
+    Kick(u8),
+}
+
 pub struct FanController {
     profile: FanProfile,
     hwmon: Option<String>,
     last_pwm: Option<u8>,
-    /// Set while a stalled/stopped fan is being kicked with min_start_pwm;
+    /// Set while a stalled/stopped fan is being kicked with `min_start_pwm`;
     /// the real curve value is written once this elapses. Non-blocking by
     /// design -- upstream fancontrol just `sleep 1`s inline, which is fine
     /// for a single-purpose daemon but would freeze LCD/button handling
@@ -290,21 +300,60 @@ impl FanController {
             self.kick_until = None;
         }
 
-        let current_pwm = self.last_pwm.unwrap_or(0);
-        let current_rpm = self
+        let rpm = self
             .profile
             .fan_index
             .and_then(|n| read_sysfs_raw_f32(&format!("{hwmon}/fan{n}_input")));
-        // Stalled if we commanded it off, or a tachometer reading exists
-        // and genuinely reads zero (not "reading unavailable"/"no tach
-        // configured" -- neither of those is evidence of a stall).
-        let stalled = current_pwm == 0 || matches!(current_rpm, Some(rpm) if rpm <= 0.0);
 
+        match self.plan(sensor_target, rpm) {
+            PwmCommand::Kick(pwm) => {
+                if self.write_pwm(&hwmon, pwm).is_ok() {
+                    self.last_pwm = Some(pwm);
+                    self.kick_until = Some(Instant::now() + Duration::from_secs(1));
+                } else {
+                    self.hwmon = None; // path went stale -- re-resolve next tick
+                }
+            }
+            PwmCommand::Set(pwm) => {
+                // Re-assert manual mode every tick, not just once: some
+                // firmware/hardware resets pwmN_enable back to automatic
+                // on its own, and fancontrol(8) defends against that the
+                // same way.
+                if self.ensure_manual_mode(&hwmon).is_err() || self.write_pwm(&hwmon, pwm).is_err()
+                {
+                    self.hwmon = None;
+                    return;
+                }
+                self.last_pwm = Some(pwm);
+            }
+        }
+    }
+
+    /// Decides what to write given the curve's `target` and the tach
+    /// reading, updating stall/low-RPM tracking (and logging transitions)
+    /// along the way. No I/O of its own -- the caller writes the result
+    /// and records it in `last_pwm` only if the write succeeds.
+    ///
+    /// A `target` of 0 (`min_pwm = 0`, below `min_temp_c`) is a deliberate
+    /// stop, not a stall. A stopped fan that the curve now wants spinning
+    /// is kicked with `min_start_pwm` first, as upstream fancontrol does.
+    /// A *stall* is narrower: the fan was last commanded to spin, yet a
+    /// tach reading exists and is zero ("no reading" / "no tach" is not
+    /// evidence of a stall).
+    fn plan(&mut self, target: u8, rpm: Option<f32>) -> PwmCommand {
+        if target == 0 {
+            self.consecutive_stalls = 0;
+            self.low_rpm_warned = false;
+            return PwmCommand::Set(0);
+        }
+
+        let commanded = self.last_pwm.unwrap_or(0);
+        let stalled = commanded > 0 && matches!(rpm, Some(r) if r <= 0.0);
         if stalled {
             self.consecutive_stalls += 1;
-            // Not logged at all until this fan has run normally at least
-            // once -- the very first kick from a cold daemon start hits
-            // this same path and isn't a fault.
+            // Not logged until this fan has run normally at least once --
+            // right after a cold start the tach can still read 0 for a
+            // moment after the first kick, which isn't a fault.
             if self.ever_ran_normally {
                 if self.consecutive_stalls == 1 {
                     crate::syslog::warning(&format!(
@@ -318,13 +367,10 @@ impl FanController {
                     ));
                 }
             }
-            if self.write_pwm(&hwmon, self.profile.min_start_pwm).is_ok() {
-                self.last_pwm = Some(self.profile.min_start_pwm);
-                self.kick_until = Some(Instant::now() + Duration::from_secs(1));
-            } else {
-                self.hwmon = None; // path went stale -- re-resolve next tick
-            }
-            return;
+            return PwmCommand::Kick(self.profile.min_start_pwm);
+        }
+        if commanded == 0 {
+            return PwmCommand::Kick(self.profile.min_start_pwm);
         }
 
         if self.consecutive_stalls > 0 {
@@ -338,7 +384,7 @@ impl FanController {
         }
         self.ever_ran_normally = true;
 
-        if let (Some(min_rpm), Some(rpm)) = (self.profile.min_expected_rpm, current_rpm) {
+        if let (Some(min_rpm), Some(rpm)) = (self.profile.min_expected_rpm, rpm) {
             let low = rpm < min_rpm as f32;
             if low && !self.low_rpm_warned {
                 self.low_rpm_warned = true;
@@ -355,15 +401,7 @@ impl FanController {
             }
         }
 
-        let target = sensor_target;
-        // Re-assert manual mode every tick, not just once: some
-        // firmware/hardware resets pwmN_enable back to automatic on its
-        // own, and fancontrol(8) itself defends against that the same way.
-        if self.ensure_manual_mode(&hwmon).is_err() || self.write_pwm(&hwmon, target).is_err() {
-            self.hwmon = None;
-            return;
-        }
-        self.last_pwm = Some(target);
+        PwmCommand::Set(target)
     }
 
     /// The PWM this fan should run at, right now, per its *hottest-demanding*
@@ -614,8 +652,8 @@ mod tests {
 
     impl FakeHwmon {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("lcm-status-test-{}-{name}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("lcm-status-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("pwm1"), "120").unwrap();
@@ -690,6 +728,65 @@ mod tests {
         c.last_pwm = Some(100);
         drop(c);
         assert_eq!(hw.read("pwm1"), "255");
+    }
+
+    fn plan_controller() -> FanController {
+        FanController::new(cfg())
+    }
+
+    #[test]
+    fn intentional_stop_is_not_a_stall() {
+        // min_pwm = 0: the curve asks for 0 below min_temp_c. The fan must
+        // stay stopped -- no kick/stop oscillation, no stall alerts.
+        let mut c = plan_controller();
+        c.ever_ran_normally = true;
+        c.last_pwm = Some(0);
+        for _ in 0..5 {
+            assert_eq!(c.plan(0, Some(0.0)), PwmCommand::Set(0));
+            c.last_pwm = Some(0);
+        }
+        assert_eq!(c.consecutive_stalls, 0);
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn restarting_from_an_intentional_stop_kicks_without_counting_a_stall() {
+        let mut c = plan_controller();
+        c.ever_ran_normally = true;
+        c.last_pwm = Some(0);
+        assert_eq!(c.plan(100, Some(0.0)), PwmCommand::Kick(60));
+        assert_eq!(c.consecutive_stalls, 0);
+    }
+
+    #[test]
+    fn cold_start_kicks_first() {
+        let mut c = plan_controller();
+        assert_eq!(c.plan(100, None), PwmCommand::Kick(60));
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn real_stall_escalates_to_critical_and_recovers() {
+        let mut c = plan_controller();
+        c.ever_ran_normally = true;
+        c.last_pwm = Some(150);
+        assert_eq!(c.plan(150, Some(0.0)), PwmCommand::Kick(60));
+        assert_eq!(c.health_level(), Level::Warn);
+        c.last_pwm = Some(60);
+        c.plan(150, Some(0.0));
+        c.plan(150, Some(0.0));
+        assert_eq!(c.health_level(), Level::Critical);
+
+        assert_eq!(c.plan(150, Some(1200.0)), PwmCommand::Set(150));
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn missing_tach_reading_is_not_a_stall() {
+        let mut c = plan_controller();
+        c.last_pwm = Some(150);
+        assert_eq!(c.plan(150, None), PwmCommand::Set(150));
+        assert_eq!(c.consecutive_stalls, 0);
     }
 
     #[test]
