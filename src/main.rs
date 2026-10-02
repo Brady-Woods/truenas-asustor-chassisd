@@ -16,72 +16,113 @@ use config::Config;
 use protocol::{Key, Lcm, LCM_DEVICE};
 use state::{Action, AppState, Effect};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn main() {
+const USAGE: &str = "\
+usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/lcm-status.toml)
+       lcm-status status [CONFIG]         print the running daemon's health report
+       lcm-status check-config [CONFIG]   parse and print a config file
+       lcm-status hal-test [CONFIG]       print every screen rendered with that config
+       lcm-status fan-profile [-y] [CONFIG]
+                                          discover and calibrate fans (stops the daemon)
+       lcm-status init                    send the LCD power-on sequence
+       lcm-status settext LINE TEXT       write up to 16 chars to line 0 or 1
+       lcm-status listen [SECS]           print unsolicited panel frames";
+
+/// A parsed command line.
+#[derive(Debug, PartialEq, Eq)]
+enum Cli {
+    Daemon(PathBuf),
+    Status(PathBuf),
+    CheckConfig(PathBuf),
+    HalTest(PathBuf),
+    FanProfile {
+        config: PathBuf,
+        assume_yes: bool,
+    },
+    /// `init` / `settext` / `listen`: low-level panel probes, which parse
+    /// their own remaining arguments.
+    Probe(String),
+    Help,
+}
+
+/// Parses `args` (including `argv[0]`). Anything unrecognized is an error
+/// rather than a config path: treating a mistyped subcommand as a path
+/// used to start a second daemon, which removed the running one's socket.
+/// The one bare-path form still accepted is the daemon's legacy
+/// `lcm-status /path/to/config.toml`, recognized by looking like a path.
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let config_arg = |args: &[&str]| -> Result<PathBuf, String> {
+        match args {
+            [] => Ok(PathBuf::from(config::DEFAULT_CONFIG_PATH)),
+            [path] if !path.starts_with('-') => Ok(PathBuf::from(path)),
+            _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+        }
+    };
+    match rest.as_slice() {
+        [] => config_arg(&[]).map(Cli::Daemon),
+        ["daemon", tail @ ..] => config_arg(tail).map(Cli::Daemon),
+        ["status", tail @ ..] => config_arg(tail).map(Cli::Status),
+        ["check-config", tail @ ..] => config_arg(tail).map(Cli::CheckConfig),
+        ["hal-test", tail @ ..] => config_arg(tail).map(Cli::HalTest),
+        ["fan-profile", tail @ ..] => {
+            let assume_yes = tail.iter().any(|a| matches!(*a, "-y" | "--yes"));
+            let positional: Vec<&str> = tail
+                .iter()
+                .copied()
+                .filter(|a| !matches!(*a, "-y" | "--yes"))
+                .collect();
+            Ok(Cli::FanProfile {
+                config: config_arg(&positional)?,
+                assume_yes,
+            })
+        }
+        [cmd @ ("init" | "settext" | "listen"), ..] => Ok(Cli::Probe((*cmd).to_string())),
+        ["help" | "-h" | "--help", ..] => Ok(Cli::Help),
+        [path] if path.contains('/') || path.ends_with(".toml") => {
+            Ok(Cli::Daemon(PathBuf::from(path)))
+        }
+        [cmd, ..] => Err(format!("unknown command '{cmd}'")),
+    }
+}
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("");
+    let cli = match parse_args(&args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("lcm-status: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
 
-    if cmd == "check-config" {
-        let path = args
-            .get(2)
-            .map(Path::new)
-            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
-        println!("{:#?}", Config::load(path));
-        return;
+    match cli {
+        Cli::Help => println!("{USAGE}"),
+        Cli::CheckConfig(path) => println!("{:#?}", Config::load(&path)),
+        Cli::HalTest(path) => {
+            // Uses the real config (not defaults) so [templates.*] edits can be
+            // previewed without restarting the daemon.
+            let cfg = Config::load(&path);
+            let t = &cfg.templates;
+            println!("-- network --\n{:#?}", hal::network(&t.network));
+            println!("-- pools --\n{:#?}", hal::pools(&t.pool));
+            println!("-- hdd --\n{:#?}", hal::hdd(&cfg));
+            println!("-- temperature/fan --\n{:#?}", hal::cpu_and_fan(&cfg));
+            println!(
+                "-- docker issues --\n{:#?}",
+                hal::docker_issues(&cfg.docker.ignore, &t.docker)
+            );
+        }
+        Cli::Probe(cmd) => run_probe_command(&cmd, &args),
+        Cli::FanProfile { config, assume_yes } => fan_calibrate::run(&config, assume_yes),
+        Cli::Status(path) => request_status(&Config::load(&path).socket.path),
+        Cli::Daemon(path) => run_daemon(&path),
     }
-
-    if cmd == "hal-test" {
-        // Uses the real config (not defaults) so [templates.*] edits can be
-        // previewed without restarting the daemon.
-        let path = args
-            .get(2)
-            .map(Path::new)
-            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
-        let cfg = Config::load(path);
-        let t = &cfg.templates;
-        println!("-- network --\n{:#?}", hal::network(&t.network));
-        println!("-- pools --\n{:#?}", hal::pools(&t.pool));
-        println!("-- hdd --\n{:#?}", hal::hdd(&cfg));
-        println!("-- temperature/fan --\n{:#?}", hal::cpu_and_fan(&cfg));
-        println!(
-            "-- docker issues --\n{:#?}",
-            hal::docker_issues(&cfg.docker.ignore, &t.docker)
-        );
-        return;
-    }
-
-    if cmd == "init" || cmd == "settext" || cmd == "listen" {
-        return run_probe_command(cmd, &args);
-    }
-
-    if cmd == "fan-profile" {
-        // Skip flags (e.g. --yes) when looking for a positional config
-        // path, rather than blindly taking args[2] -- `--yes` would
-        // otherwise get parsed as the path.
-        let path = args
-            .iter()
-            .skip(2)
-            .find(|a| !a.starts_with('-'))
-            .map(|s| Path::new(s.as_str()))
-            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
-        fan_calibrate::run(path);
-        return;
-    }
-
-    if cmd == "status" {
-        let path = args
-            .get(2)
-            .map(Path::new)
-            .unwrap_or(Path::new(config::DEFAULT_CONFIG_PATH));
-        let socket_path = Config::load(path).socket.path;
-        request_status(&socket_path);
-        return;
-    }
-
-    run_daemon(&args);
+    ExitCode::SUCCESS
 }
 
 /// Client side of the `STATUS` request: connect to the running daemon's
@@ -117,22 +158,30 @@ fn request_status(socket_path: &str) {
     print!("{response}");
 }
 
-fn run_daemon(args: &[String]) {
+fn run_daemon(cfg_path: &Path) {
     syslog::init();
     shutdown::install();
 
-    let cfg_path = args
-        .get(1)
-        .filter(|a| a.as_str() != "daemon")
-        .map(String::as_str)
-        .unwrap_or(config::DEFAULT_CONFIG_PATH);
-    let cfg = Config::load(Path::new(cfg_path));
+    let cfg = Config::load(cfg_path);
     syslog::info(&format!(
         "starting: {} fan(s) configured, temperature warn/critical at {:.0}C/{:.0}C",
         cfg.fans.iter().filter(|f| f.enabled).count(),
         cfg.temperature.warn_threshold,
         cfg.temperature.critical_threshold,
     ));
+
+    // First, before touching the serial port or fans: if another daemon
+    // is already running, this is a second instance and must not start.
+    let (tx, rx) = mpsc::channel();
+    let socket_path = &cfg.socket.path;
+    match socket::spawn(socket_path, &cfg.socket.group, tx) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("{socket_path}: {e}; exiting");
+            std::process::exit(1);
+        }
+        Err(e) => eprintln!("socket listener failed to start on {socket_path}: {e}"),
+    }
 
     let mut lcm = Lcm::open(&cfg.display.serial_device).unwrap_or_else(|e| {
         eprintln!("failed to open {}: {e}", cfg.display.serial_device);
@@ -143,13 +192,6 @@ fn run_daemon(args: &[String]) {
     let _ = lcm.send_and_ack(0xF0, 0x11, &[0x01], Duration::from_millis(300));
     std::thread::sleep(Duration::from_millis(15));
     let _ = lcm.send_and_ack(0xF0, 0x22, &[0x00], Duration::from_millis(300));
-
-    let (tx, rx) = mpsc::channel();
-    let socket_path = cfg.socket.path.clone();
-    let socket_group = cfg.socket.group.clone();
-    if let Err(e) = socket::spawn(&socket_path, &socket_group, tx) {
-        eprintln!("socket listener failed to start on {socket_path}: {e}");
-    }
 
     // deploy.sh already gates on this before it will even build; this is
     // defense-in-depth for the binary being started some other way. LED
@@ -422,5 +464,71 @@ fn run_probe_command(cmd: &str, args: &[String]) {
             }
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        let argv: Vec<String> = std::iter::once("lcm-status")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        parse_args(&argv)
+    }
+
+    fn default_path() -> PathBuf {
+        PathBuf::from(config::DEFAULT_CONFIG_PATH)
+    }
+
+    #[test]
+    fn mistyped_subcommand_is_rejected_not_run_as_a_daemon() {
+        assert!(parse(&["stauts"]).is_err());
+        assert!(parse(&["hal-tset"]).is_err());
+    }
+
+    #[test]
+    fn daemon_forms() {
+        assert_eq!(parse(&[]), Ok(Cli::Daemon(default_path())));
+        assert_eq!(parse(&["daemon"]), Ok(Cli::Daemon(default_path())));
+        assert_eq!(
+            parse(&["daemon", "/tmp/x.toml"]),
+            Ok(Cli::Daemon("/tmp/x.toml".into()))
+        );
+        // Legacy unit-file form.
+        assert_eq!(
+            parse(&["/etc/lcm-status.toml"]),
+            Ok(Cli::Daemon("/etc/lcm-status.toml".into()))
+        );
+    }
+
+    #[test]
+    fn subcommands_take_an_optional_config_path() {
+        assert_eq!(parse(&["status"]), Ok(Cli::Status(default_path())));
+        assert_eq!(
+            parse(&["check-config", "a.toml"]),
+            Ok(Cli::CheckConfig("a.toml".into()))
+        );
+        assert!(parse(&["status", "a.toml", "extra"]).is_err());
+    }
+
+    #[test]
+    fn fan_profile_flags_are_not_taken_as_the_path() {
+        assert_eq!(
+            parse(&["fan-profile", "--yes"]),
+            Ok(Cli::FanProfile {
+                config: default_path(),
+                assume_yes: true
+            })
+        );
+        assert_eq!(
+            parse(&["fan-profile", "-y", "/tmp/c.toml"]),
+            Ok(Cli::FanProfile {
+                config: "/tmp/c.toml".into(),
+                assume_yes: true
+            })
+        );
     }
 }

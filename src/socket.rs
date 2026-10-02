@@ -146,7 +146,17 @@ fn handle_connection(stream: UnixStream, tx: &Sender<SocketCommand>) {
 
 /// Starts the socket listener on its own thread. Returns immediately;
 /// parsed commands arrive on `tx`.
+///
+/// Fails with `ErrorKind::AddrInUse` if another daemon is already
+/// accepting connections on `path`, rather than unlinking its socket out
+/// from under it.
 pub fn spawn(path: &str, group: &str, tx: Sender<SocketCommand>) -> std::io::Result<()> {
+    if UnixStream::connect(path).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "another lcm-status daemon is already listening there",
+        ));
+    }
     let _ = std::fs::remove_file(path); // stale socket from a previous run
     let listener = UnixListener::bind(path)?;
 
@@ -256,6 +266,36 @@ mod tests {
             parse_message(&lines("CLEAR")),
             Some(SocketCommand::Clear { bay: None })
         ));
+    }
+
+    fn temp_socket_path(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("lcm-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn refuses_to_take_over_a_live_socket() {
+        let path = temp_socket_path("live");
+        let _running = UnixListener::bind(&path).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let err = spawn(&path, "nogroup", tx).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(std::path::Path::new(&path).exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replaces_a_stale_socket() {
+        let path = temp_socket_path("stale");
+        // A leftover entry nothing is listening on. (A plain file rather
+        // than a bound-then-dropped listener: on macOS a child spawned by
+        // another test can inherit and hold the listener open.)
+        std::fs::write(&path, "").unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        spawn(&path, "nogroup", tx).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
