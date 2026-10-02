@@ -13,7 +13,7 @@
 //! timeout) for the main loop to compute and send one back before writing
 //! it to the client and closing the connection.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -111,14 +111,32 @@ fn parse_bay<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<u32> {
     parts.find_map(|p| p.strip_prefix("bay=").and_then(|n| n.parse().ok()))
 }
 
+/// How long a client may take to send its request (and, for `STATUS`,
+/// to accept the reply) before the connection is dropped.
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a `STATUS` request waits for the main loop to build the
+/// report. Generous because building it runs `zpool`/`smartctl`, each of
+/// which `hal` allows up to 10s before giving up.
+const STATUS_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Requests are a header plus two short lines; anything past this is
+/// ignored.
+const MAX_REQUEST_BYTES: u64 = 4096;
+
 fn handle_connection(stream: UnixStream, tx: &Sender<SocketCommand>) {
+    // A client that connects and then never sends (or never closes) only
+    // ties up its own thread, and only until this expires.
+    let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+
     // A second handle to the same socket, kept for writing a STATUS
     // response after the BufReader below has consumed the original for
     // reading -- both directions of a Unix stream socket are independent,
     // so this is fine even though `stream` itself is about to be moved.
     let writer = stream.try_clone().ok();
 
-    let reader = BufReader::new(stream);
+    let reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
     let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
     if lines.is_empty() {
         return;
@@ -130,10 +148,9 @@ fn handle_connection(stream: UnixStream, tx: &Sender<SocketCommand>) {
         if tx.send(SocketCommand::StatusRequest(resp_tx)).is_err() {
             return;
         }
-        // The main loop polls at a ~100ms ceiling, so this should resolve
-        // almost immediately; the timeout is just so a client can't hang
-        // forever if the daemon's main loop is somehow wedged.
-        if let Ok(report) = resp_rx.recv_timeout(Duration::from_secs(5)) {
+        // Normally resolves within one ~100ms main-loop pass; the timeout
+        // is so a client can't hang forever if the main loop is wedged.
+        if let Ok(report) = resp_rx.recv_timeout(STATUS_REPLY_TIMEOUT) {
             let _ = writer.write_all(report.as_bytes());
         }
         return;
@@ -162,9 +179,12 @@ pub fn spawn(path: &str, group: &str, tx: Sender<SocketCommand>) -> std::io::Res
 
     set_socket_perms(path, group);
 
+    // One thread per connection, so a slow client (or a STATUS request
+    // waiting on the main loop) never holds up anyone else's.
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            handle_connection(conn, &tx);
+            let tx = tx.clone();
+            std::thread::spawn(move || handle_connection(conn, &tx));
         }
     });
     Ok(())
@@ -295,6 +315,30 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         spawn(&path, "nogroup", tx).unwrap();
         assert!(UnixStream::connect(&path).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_stuck_client_does_not_block_others_and_is_eventually_dropped() {
+        let path = temp_socket_path("stuck");
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn(&path, "nogroup", tx).unwrap();
+
+        // Connects, sends nothing, never closes.
+        let mut stuck = UnixStream::connect(&path).unwrap();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"hello\nworld\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let cmd = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("second client blocked behind the stuck one");
+        assert!(matches!(cmd, SocketCommand::Show { line0, .. } if line0 == "hello"));
+
+        // The daemon side gives up on the stuck client: we see EOF.
+        stuck.set_read_timeout(Some(CLIENT_IO_TIMEOUT * 3)).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(stuck.read(&mut buf).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
     }
 
