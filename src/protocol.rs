@@ -45,9 +45,18 @@ const PAYLOAD_MAX: usize = FRAME_MAX - 4;
 const LINE_WIDTH: usize = 16;
 /// How long to wait for the MCU to ACK a command.
 const ACK_TIMEOUT: Duration = Duration::from_millis(300);
-/// Settle time the MCU needs after ACKing one command before it will
-/// accept the next.
-const SETTLE: Duration = Duration::from_millis(15);
+/// Quiet time the MCU needs after sending a frame (an ACK, or a key press)
+/// before it reliably receives the next one. Measured live (2026-10-02,
+/// a wire trace): a frame sent within ~0.1ms of the MCU's ACK for the
+/// previous one -- line 1 straight after line 0 -- went entirely
+/// unanswered about 1 time in 7, presumably while the MCU was busy
+/// updating the LCD. Worse, when only *part* of a frame was dropped, the
+/// leftover bytes merged with the next frame and put stray text on the
+/// panel (e.g. the end of one line's IP address showing on the other).
+/// With a 10ms or 20ms gap after every received frame: 240 writes, zero
+/// failures. 20ms keeps 2x margin. Applied in `send`, so it covers every
+/// write, and is also the retry backoff in `set_text`.
+const SETTLE: Duration = Duration::from_millis(20);
 
 pub struct Lcm {
     port: File,
@@ -67,6 +76,22 @@ pub struct Lcm {
     /// the display on by itself on a key press -- harmless, since the
     /// caller wakes on that same key press and asks for on anyway.
     display_on: Option<bool>,
+    /// When the last byte arrived from the MCU -- `send` waits out
+    /// `SETTLE` from here.
+    last_rx: Option<Instant>,
+    /// Running totals for the `status` report -- see `LinkStats`.
+    stats: LinkStats,
+}
+
+/// How text writes to the panel have gone since the daemon started. A
+/// retry means the MCU didn't ACK a write the first time; a failure means
+/// it never did (the line is retried on the next render). Both should
+/// stay at or near zero -- see `SETTLE`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkStats {
+    pub writes: u64,
+    pub retries: u64,
+    pub failures: u64,
 }
 
 /// One received frame.
@@ -164,6 +189,8 @@ impl Lcm {
             pending: Vec::new(),
             last_sent: [None, None],
             display_on: None,
+            last_rx: None,
+            stats: LinkStats::default(),
         })
     }
 
@@ -172,12 +199,19 @@ impl Lcm {
     pub fn init(&mut self) -> io::Result<(bool, bool)> {
         let first = self.send_and_ack(OP_COMMAND, SUB_DISPLAY, &[0x01], ACK_TIMEOUT)?;
         self.display_on = first.then_some(true);
-        std::thread::sleep(SETTLE);
         let second = self.send_and_ack(OP_COMMAND, SUB_INIT_2, &[0x00], ACK_TIMEOUT)?;
         Ok((first, second))
     }
 
+    /// Writes one frame, first waiting out `SETTLE` since the MCU last
+    /// sent anything.
     pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
+        if let Some(last) = self.last_rx {
+            let wait = SETTLE.saturating_sub(last.elapsed());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
         self.port.write_all(&encode(opcode, subcmd, payload))
     }
 
@@ -207,6 +241,14 @@ impl Lcm {
             let mut byte = [0u8; 1];
             match self.port.read(&mut byte) {
                 Ok(1) => {
+                    self.last_rx = Some(Instant::now());
+                    // Resync: a frame only starts at an opcode byte. Anything
+                    // else ahead of one is the tail of a frame we lost the
+                    // start of; taking it as a header would misread the
+                    // length and swallow the next real frame with it.
+                    if got == 0 && !matches!(byte[0], OP_COMMAND | OP_ACK) {
+                        continue;
+                    }
                     buf[got] = byte[0];
                     got += 1;
                     // Byte 1 (N) tells us the exact frame length (N + 4) as
@@ -302,12 +344,13 @@ impl Lcm {
         let mut payload = vec![line, flag];
         payload.extend(line_bytes(text));
 
-        // Two of these calls fire back-to-back every render (one per
-        // line), and sent immediately after each other the second one
-        // reliably gets NACKed (see `SETTLE`) -- so retry with that gap
-        // rather than leaving that line stale.
+        // `send` paces every write (see `SETTLE`), so a retry should be
+        // rare; it's still kept, with the same backoff, rather than leaving
+        // a line stale.
+        self.stats.writes += 1;
         for attempt in 0..3 {
             if attempt > 0 {
+                self.stats.retries += 1;
                 std::thread::sleep(SETTLE);
             }
             if self.send_and_ack(OP_COMMAND, SUB_SET_TEXT, &payload, ACK_TIMEOUT)? {
@@ -315,11 +358,16 @@ impl Lcm {
                 return Ok(true);
             }
         }
+        self.stats.failures += 1;
         // Left uncached on failure so the next call with this same text
         // (the caller will keep asking, since as far as it's concerned
         // this is still the text that should be showing) retries instead
         // of being treated as "already sent".
         Ok(false)
+    }
+
+    pub fn stats(&self) -> LinkStats {
+        self.stats
     }
 
     /// Forgets what the panel is confirmed to be showing, so the next
@@ -395,6 +443,58 @@ impl From<u8> for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// An `Lcm` on the slave side of a fresh pty, plus the master side
+    /// standing in for the panel's MCU.
+    fn lcm_on_pty() -> (Lcm, File) {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes the two fds it creates into the locals
+        // passed; the optional name/termios/winsize pointers may be null.
+        let rc = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: `slave` is a valid open fd; ttyname returns a pointer to
+        // a static NUL-terminated buffer, copied out before any other call.
+        let path = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) }
+            .to_string_lossy()
+            .into_owned();
+        let lcm = Lcm::open(&path).unwrap();
+        // SAFETY: both fds are open and owned by nothing else from here.
+        unsafe {
+            libc::close(slave);
+            (lcm, File::from_raw_fd(master))
+        }
+    }
+
+    #[test]
+    fn read_frame_skips_bytes_ahead_of_a_frame_start() {
+        let (mut lcm, mut mcu) = lcm_on_pty();
+        // The tail of a frame whose start was lost, then a real key press.
+        let mut wire = vec![0x27, 0x04, 0x1d];
+        wire.extend(encode(OP_COMMAND, SUB_KEY, &[2]));
+        mcu.write_all(&wire).unwrap();
+        let f = lcm.read_frame(Duration::from_millis(500)).unwrap();
+        assert!(f.checksum_ok);
+        assert_eq!(f.key(), Some(Key::Down));
+    }
+
+    #[test]
+    fn send_waits_out_settle_after_the_mcu_last_spoke() {
+        let (mut lcm, mut mcu) = lcm_on_pty();
+        mcu.write_all(&encode(OP_ACK, SUB_SET_TEXT, &[0])).unwrap();
+        lcm.read_frame(Duration::from_millis(500)).unwrap();
+        let start = Instant::now();
+        lcm.send(OP_COMMAND, SUB_DISPLAY, &[1]).unwrap();
+        assert!(start.elapsed() >= SETTLE.saturating_sub(Duration::from_millis(1)));
+    }
 
     #[test]
     fn encode_then_decode_round_trips() {

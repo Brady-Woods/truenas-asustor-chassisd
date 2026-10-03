@@ -129,6 +129,19 @@ this -- everything below was derived, not looked up.
 Any unsolicited `0xF0` frame from the MCU must be ACKed with `0xF1
 <subcmd> [0x00]` or the MCU will eventually resend it.
 
+**Pacing:** wait ~20ms after the MCU sends anything before sending the
+next frame. Found with a byte-level wire trace (2026-10-02): a frame sent
+right after the MCU's ACK for the previous one -- line 1 straight after
+line 0 -- went unanswered about 1 time in 7, the MCU apparently busy
+updating the LCD. When only part of a frame was lost, the leftover bytes
+merged with the next frame and put stray text on the panel (the tail of
+one line's IP address showing on the other line). With a 10ms or 20ms
+gap: 240 writes, zero failures. The daemon applies 20ms before every
+write (`protocol::SETTLE`), and the receive side resyncs on the next
+`0xF0`/`0xF1` byte if it ever sees a partial frame. `lcm-status status`
+reports text writes/retries/failures since startup under `-- LCD link --`;
+retries and failures should stay at or near zero.
+
 **Button key codes** (subcmd `0x80` payload byte), confirmed by physically
 pressing each button while running `lcm-status listen`:
 
@@ -831,6 +844,9 @@ socket override if any:
   next power on:   Mon 2026-10-05 07:30 (in 2d 14h 55m, #1 power on weekdays 07:30)
   next power off:  Fri 2026-10-02 23:30 (in 6h 55m, #3 shutdown daily 23:30)
   RTC wake alarm:  set for Mon 2026-10-05 07:30
+
+-- LCD link --
+  412 text writes, 0 retried, 0 failed
 
 -- Active override --
   none
