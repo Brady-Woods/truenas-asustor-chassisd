@@ -152,6 +152,22 @@ fn set_blink(led: &str, on_ms: u32, off_ms: u32) {
 /// flicker, which is still unlike any other state.
 pub const LOCATE_BLINK_MS: u32 = 250;
 
+/// Lights a locate's LEDs solid amber (green + red) just before it starts
+/// blinking them. A timer trigger keeps an LED's current state until its
+/// first toggle, so without this the blink began as plain green (or
+/// whatever the LED was showing) until red joined. Only for the start of a
+/// locate: re-applying a running one must not interrupt the blink.
+pub fn prime_locate_status() {
+    set_solid("green:status", true);
+    set_solid("red:status", true);
+}
+
+/// `prime_locate_status` for a bay's LEDs.
+pub fn prime_locate_bay(bay: u32) {
+    set_solid(&format!("sata{bay}:green:disk"), true);
+    set_solid(&format!("sata{bay}:red:disk"), true);
+}
+
 /// Every status-LED pattern: the five documented health patterns, worst
 /// last, plus two that aren't health verdicts at all (`Locate`, `Off`) --
 /// `state::recompute_status_led` picks between them.
