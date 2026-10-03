@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 /// frame. A fixed 100ms keeps scroll steps and timers responsive without
 /// per-state deadline math; one wakeup per 100ms at idle is negligible.
 const POLL_INTERVAL_MS: i32 = 100;
+/// How often both LCD lines (and the display on/off state) are resent even
+/// if unchanged -- see `Lcm::forget_shown`. Two frames a minute is nothing
+/// on the wire, and bounds how long any stray text can stay up.
+const LCD_REDRAW_INTERVAL: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
 usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/lcm-status.toml)
@@ -369,6 +373,7 @@ fn event_loop(
     rx: &mpsc::Receiver<socket::SocketCommand>,
 ) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
+    let mut last_redraw = Instant::now();
 
     while !shutdown::requested() {
         // Drain any socket commands that arrived since the last wakeup.
@@ -408,6 +413,10 @@ fn event_loop(
         state.set_fan_health(fans.status().health);
         wol.maybe_enforce();
 
+        if last_redraw.elapsed() >= LCD_REDRAW_INTERVAL {
+            lcm.forget_shown();
+            last_redraw = Instant::now();
+        }
         let effect = state.tick();
         apply_effect(effect, state.display_wanted(), lcm, power);
         drain_pending_keys(state, lcm, power);
@@ -432,6 +441,7 @@ fn event_loop(
             if frame.is_unsolicited() {
                 let _ = lcm.ack(frame.subcmd);
             }
+            note_mcu_boot(&frame, lcm);
             if let Some(key) = frame.key() {
                 let effect = state.handle_key(key);
                 apply_effect(effect, state.display_wanted(), lcm, power);
@@ -442,6 +452,19 @@ fn event_loop(
     Ok(())
 }
 
+/// The MCU reports its firmware version unprompted when it boots -- after a
+/// power blip on `power:lcd` (e.g. the platform driver being reloaded), or
+/// a reset of its own. It then shows its own boot text and has forgotten
+/// the init sequence, while `Lcm`'s caches still think our text is up: so
+/// redo the init and forget the caches, and the next render redraws.
+fn note_mcu_boot(frame: &protocol::Frame, lcm: &mut Lcm) {
+    if frame.is_unsolicited() && frame.subcmd == SUB_VERSION {
+        syslog::notice("LCD panel reported a (re)boot; re-initializing and redrawing");
+        lcm.forget_shown();
+        let _ = lcm.init();
+    }
+}
+
 /// Dispatches button presses `Lcm::send_and_ack` had to queue (see its
 /// doc) instead of discarding -- e.g. a press that arrived while a
 /// `set_text` call was mid-flight waiting on its own ACK. Feeds each one
@@ -449,6 +472,7 @@ fn event_loop(
 /// so it isn't lost until the MCU gets around to resending it.
 fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, power: &mut power::Scheduler) {
     for frame in lcm.take_pending() {
+        note_mcu_boot(&frame, lcm);
         if let Some(key) = frame.key() {
             let effect = state.handle_key(key);
             apply_effect(effect, state.display_wanted(), lcm, power);

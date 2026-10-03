@@ -170,6 +170,14 @@ pub struct AppState {
     day_brightness: Option<u8>,
     /// Last duty `apply_front_brightness` wrote, to skip repeat writes.
     applied_brightness: Cell<Option<u8>>,
+    /// Status LED pattern last written by `recompute_status_led`, so an
+    /// unchanged verdict isn't rewritten -- rewriting a blinking pattern
+    /// restarts its blink. `None` after anything else wrote the status
+    /// LED directly (night mode in/out, a locate), forcing the next write.
+    status_shown: Cell<Option<led::StatusPattern>>,
+    /// Fan health and worst temperature level as of the last status LED
+    /// recompute -- see the end of `refresh_stale`.
+    led_inputs: Option<(Level, Level)>,
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
@@ -215,6 +223,8 @@ impl AppState {
             locate_chassis: None,
             day_brightness: None,
             applied_brightness: Cell::new(None),
+            status_shown: Cell::new(None),
+            led_inputs: None,
             sleeping: false,
             schedule_wants_sleep: false,
             awake_override_until: None,
@@ -246,6 +256,7 @@ impl AppState {
         // dark until morning.) If the schedule wants night mode, the first
         // tick enters it from here as usual.
         let result = led::exit_night_mode(self.cfg.led.nic_mode, true);
+        self.status_shown.set(None);
         self.note_nic_leds(result);
         if let Some(mode) = self.cfg.led.bay_mode
             && let Err(e) = led::set_bay_mode(mode)
@@ -324,8 +335,11 @@ impl AppState {
     }
 
     /// Bay LED state per SATA bay, from the last disk scan.
+    /// Every bay with a disk, in bay order.
     pub fn bay_states(&self) -> Vec<(u32, led::BayState)> {
-        hal::bay_led_states(&self.disks)
+        let mut states = hal::bay_led_states(&self.disks);
+        states.sort_by_key(|&(bay, _)| bay);
+        states
     }
 
     fn update_health_leds(&mut self) {
@@ -410,16 +424,20 @@ impl AppState {
     /// unless `[led] night_brightness` dims it instead, in which case it
     /// keeps showing the verdict.
     fn recompute_status_led(&self) {
-        if self.locate_chassis.is_some() {
-            led::set_status(led::StatusPattern::Locate);
+        let pattern = if self.locate_chassis.is_some() {
+            led::StatusPattern::Locate
         } else if self.sleeping && self.night_darkens_front() {
-            led::set_status(led::StatusPattern::Off);
+            led::StatusPattern::Off
         } else if let Some(ov) = &self.over
             && let Some(pattern) = led::pattern_for_level(ov.level)
         {
-            led::set_status(pattern);
+            pattern
         } else {
-            led::set_status(self.health_summary().pattern);
+            self.health_summary().pattern
+        };
+        if self.status_shown.get() != Some(pattern) {
+            led::set_status(pattern);
+            self.status_shown.set(Some(pattern));
         }
     }
 
@@ -445,6 +463,7 @@ impl AppState {
         if self.locate_chassis.is_some() {
             led::set_power(led::PowerPattern::Locate);
             led::set_status(led::StatusPattern::Locate);
+            self.status_shown.set(Some(led::StatusPattern::Locate));
         }
     }
 
@@ -687,12 +706,15 @@ impl AppState {
             .stale(Duration::from_secs(r.pools_min_secs));
         let hdd_due = self.hdd_cache.stale(Duration::from_secs(r.hdd_min_secs));
 
-        if self.cfg.screens.network
-            && self
-                .network_cache
-                .stale(Duration::from_secs(r.network_min_secs))
-        {
-            self.network_cache.screens = hal::network(&self.cfg.templates.network);
+        let network_due = self
+            .network_cache
+            .stale(Duration::from_secs(r.network_min_secs));
+        if network_due {
+            // Fetched whether or not the screen is enabled: the cadence
+            // also paces the status LED's link check below.
+            if self.cfg.screens.network {
+                self.network_cache.screens = hal::network(&self.cfg.templates.network);
+            }
             self.network_cache.last_refresh = Some(Instant::now());
         }
         // Pool/hdd data (and so, health monitoring + LED updates) is
@@ -762,11 +784,21 @@ impl AppState {
         }
         self.screens = screens;
 
-        // Bay/status LEDs are driven by pool + SMART health, so only worth
+        // Bay LEDs are driven by pool + SMART health, so only worth
         // recomputing when that data actually changed -- not every tick.
+        // The status LED also folds in fan health, temperatures and NIC
+        // links, so it's recomputed whenever one of those may have changed
+        // too. (It used to wait for the next pool refresh, up to
+        // `pools_min_secs` later -- found live: a critical temperature
+        // alert logged straight away, but the LED stayed green until
+        // then.) `recompute_status_led` only writes on an actual change.
+        let led_inputs = (self.fan_health, self.monitor.worst_temp_level());
         if pools_due || hdd_due {
             self.update_health_leds();
+        } else if network_due || self.led_inputs != Some(led_inputs) {
+            self.recompute_status_led();
         }
+        self.led_inputs = Some(led_inputs);
     }
 
     pub fn handle_key(&mut self, key: Key) -> Effect {
@@ -1020,6 +1052,9 @@ impl AppState {
     fn wake(&mut self) {
         self.sleeping = false;
         let result = led::exit_night_mode(self.cfg.led.nic_mode, self.night_darkens_front());
+        if self.night_darkens_front() {
+            self.status_shown.set(None);
+        }
         self.note_nic_leds(result);
         self.apply_front_brightness();
         self.refresh_all();
@@ -1051,6 +1086,9 @@ impl AppState {
         {
             self.sleeping = true;
             let result = led::enter_night_mode(self.night_darkens_front());
+            if self.night_darkens_front() {
+                self.status_shown.set(Some(led::StatusPattern::Off));
+            }
             self.note_nic_leds(result);
             self.apply_front_brightness();
             // Night mode just darkened every LED wholesale; a locate in
@@ -1062,6 +1100,12 @@ impl AppState {
             return self.render();
         }
         if self.sleeping {
+            // Health monitoring (temps, pools, SMART, and the LEDs and
+            // alerts they drive) keeps running at night -- this early
+            // return used to skip it, so nothing was checked from sleep
+            // start to wake. SMART uses `-n standby`, so this doesn't
+            // spin up sleeping drives.
+            self.refresh_stale();
             // Blanks the text but leaves the panel's own MCU powered --
             // unlike cutting power:lcd, which also kills the MCU (and so,
             // its ability to report a button press at all: confirmed live,
@@ -1720,6 +1764,57 @@ mod tests {
             "trigger",
             "asustor-front-usb"
         ));
+    }
+
+    #[test]
+    fn status_led_follows_fan_and_temp_changes_without_waiting_for_pools() {
+        let mut s = state();
+        s.refresh_all(); // every category fresh: nothing due for a while
+        test_writes::take();
+        s.set_fan_health(Level::Critical);
+        s.refresh_stale();
+        assert!(test_writes::wrote("red:status", "delay_on", "1000"));
+        assert!(test_writes::wrote("green:status", "brightness", "0"));
+
+        // An unchanged verdict isn't rewritten (that would restart the blink).
+        test_writes::take();
+        s.refresh_stale();
+        s.recompute_status_led();
+        assert!(
+            !test_writes::take()
+                .iter()
+                .any(|(l, _, _)| l.ends_with(":status"))
+        );
+
+        s.set_fan_health(Level::Info);
+        s.refresh_stale();
+        assert!(test_writes::wrote("green:status", "brightness", "1"));
+    }
+
+    #[test]
+    fn health_checks_keep_running_at_night() {
+        let mut s = state();
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert!(s.sleeping);
+        s.pools_cache.last_refresh = None;
+        s.tick();
+        assert!(s.sleeping);
+        assert!(
+            s.pools_cache.last_refresh.is_some(),
+            "pools not refreshed while asleep"
+        );
+    }
+
+    #[test]
+    fn bay_states_are_in_bay_order() {
+        let mut s = state();
+        s.disks = [3, 1, 4, 2]
+            .into_iter()
+            .map(|b| disk(b, hal::SmartStatus::Passed))
+            .collect();
+        let bays: Vec<u32> = s.bay_states().into_iter().map(|(b, _)| b).collect();
+        assert_eq!(bays, [1, 2, 3, 4]);
     }
 
     #[test]

@@ -473,7 +473,15 @@ mod tests {
         // The daemon side gives up on the stuck client: we see EOF.
         stuck.set_read_timeout(Some(CLIENT_IO_TIMEOUT * 3)).unwrap();
         let mut buf = [0u8; 1];
-        assert_eq!(stuck.read(&mut buf).unwrap(), 0);
+        // Retried on EINTR: a signal aimed at another test thread (several
+        // spawn and reap subprocesses) can interrupt this blocking read.
+        let n = loop {
+            match stuck.read(&mut buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                other => break other.unwrap(),
+            }
+        };
+        assert_eq!(n, 0);
         let _ = std::fs::remove_file(&path);
     }
 

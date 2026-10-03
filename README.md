@@ -177,6 +177,17 @@ also acted on as UP/DOWN/ENTER. `[sleep] lcd_off = false` goes back to
 the older behavior of only blanking both lines (a dark-but-not-black
 backlight glow).
 
+Night mode only changes what's *shown*: temperature, pool, SMART and fan
+monitoring (and the alerts, syslog entries and red bay LEDs they drive)
+keep running all night. (Before 2026-10-02 they didn't -- every check
+paused from sleep start to wake.)
+
+The daemon only resends a line when its text changes, so it tracks what
+the panel is showing. To keep that from drifting -- e.g. the panel's MCU
+resetting and showing its own boot text -- both lines are resent every
+60s regardless, and when the MCU reports its firmware version (which it
+does on boot) the init sequence is redone and everything redrawn.
+
 Per `asustord`'s own `LED-MODES.md`, `power:lcd` should **only** be used
 by this project's own logic if at all -- other LED "night mode" logic
 explicitly avoids it for the same reboot-on-toggle reason.
