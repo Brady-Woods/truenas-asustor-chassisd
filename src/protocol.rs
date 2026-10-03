@@ -81,6 +81,10 @@ pub struct Lcm {
     last_rx: Option<Instant>,
     /// Running totals for the `status` report -- see `LinkStats`.
     stats: LinkStats,
+    /// Wire trace, when `LCM_STATUS_TRACE` names a file: every byte sent
+    /// and received, timestamped. For debugging the panel link (this is
+    /// how `SETTLE` was found); off by default.
+    trace: Option<(File, Instant)>,
 }
 
 /// How text writes to the panel have gone since the daemon started. A
@@ -191,6 +195,14 @@ impl Lcm {
             display_on: None,
             last_rx: None,
             stats: LinkStats::default(),
+            trace: std::env::var_os("LCM_STATUS_TRACE").and_then(|path| {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+                    .map(|f| (f, Instant::now()))
+            }),
         })
     }
 
@@ -212,7 +224,9 @@ impl Lcm {
                 std::thread::sleep(wait);
             }
         }
-        self.port.write_all(&encode(opcode, subcmd, payload))
+        let wire = encode(opcode, subcmd, payload);
+        self.trace_bytes("TX", &wire);
+        self.port.write_all(&wire)
     }
 
     /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
@@ -242,6 +256,7 @@ impl Lcm {
             match self.port.read(&mut byte) {
                 Ok(1) => {
                     self.last_rx = Some(Instant::now());
+                    self.trace_bytes("RX", &byte);
                     // Resync: a frame only starts at an opcode byte. Anything
                     // else ahead of one is the tail of a frame we lost the
                     // start of; taking it as a header would misread the
@@ -353,10 +368,12 @@ impl Lcm {
                 self.stats.retries += 1;
                 std::thread::sleep(SETTLE);
             }
+            self.trace_note(&format!("text line{line} {text:?} attempt{attempt}"));
             if self.send_and_ack(OP_COMMAND, SUB_SET_TEXT, &payload, ACK_TIMEOUT)? {
                 self.last_sent[idx] = Some(text.to_string());
                 return Ok(true);
             }
+            self.trace_note("  no ACK (or NAK)");
         }
         self.stats.failures += 1;
         // Left uncached on failure so the next call with this same text
@@ -364,6 +381,20 @@ impl Lcm {
         // this is still the text that should be showing) retries instead
         // of being treated as "already sent".
         Ok(false)
+    }
+
+    fn trace_bytes(&mut self, dir: &str, bytes: &[u8]) {
+        if self.trace.is_some() {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            self.trace_note(&format!("{dir} {}", hex.join(" ")));
+        }
+    }
+
+    fn trace_note(&mut self, note: &str) {
+        if let Some((file, start)) = &mut self.trace {
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let _ = writeln!(file, "{ms:10.1} {note}");
+        }
     }
 
     pub fn stats(&self) -> LinkStats {
