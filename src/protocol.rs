@@ -226,7 +226,15 @@ impl Lcm {
         }
         let wire = encode(opcode, subcmd, payload);
         self.trace_bytes("TX", &wire);
-        self.port.write_all(&wire)
+        self.port.write_all(&wire)?;
+        if self.trace.is_some() {
+            let start = Instant::now();
+            // SAFETY: the fd is open (owned by `port`) for the call.
+            unsafe { libc::tcdrain(self.port.as_raw_fd()) };
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.trace_note(&format!("  drained in {ms:.1}ms"));
+        }
+        Ok(())
     }
 
     /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
