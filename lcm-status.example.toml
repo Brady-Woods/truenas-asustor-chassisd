@@ -206,6 +206,16 @@ monitored_nics = []
 some_down_level = "warning"
 all_down_level = "error"
 
+[buzzer]
+# The chassis beeper, like ADM's "enable buzzer". Off by default.
+enabled = false
+boot = true               # one long beep (800 ms) when the daemon starts during boot
+power = true              # one short beep (200 ms) before a shutdown/restart,
+                          # including one the OS starts (the daemon is stopped)
+alerts = true             # short beep on a warning/error/critical SHOW; at most
+                          # once a minute; during the [sleep] window only critical
+find_me = true            # short beep when a chassis LOCATE starts
+
 [wol]
 # Interfaces to keep Wake-on-LAN enabled on -- set at startup, rechecked
 # every 60s (some drivers reset it on link changes), and once more as the

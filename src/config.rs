@@ -22,6 +22,7 @@ pub struct Config {
     pub led: LedConfig,
     pub network: NetworkConfig,
     pub wol: WolConfig,
+    pub buzzer: BuzzerConfig,
     pub templates: TemplatesConfig,
     /// One entry per physical fan to control -- see `FanProfile`. Defaults
     /// to this board's single real fan (`default_fans()` below) so the
@@ -52,6 +53,7 @@ impl Default for Config {
             led: LedConfig::default(),
             network: NetworkConfig::default(),
             wol: WolConfig::default(),
+            buzzer: BuzzerConfig::default(),
             templates: TemplatesConfig::default(),
             fans: default_fans(),
             power_schedule: Vec::new(),
@@ -88,6 +90,37 @@ impl Default for NetworkConfig {
             monitored_nics: Vec::new(),
             some_down_level: NetworkLevel::Warning,
             all_down_level: NetworkLevel::Error,
+        }
+    }
+}
+
+/// The chassis beeper (ADM's "enable buzzer"), see `buzzer.rs`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+#[expect(clippy::struct_excessive_bools, reason = "one on/off key per beep")]
+pub struct BuzzerConfig {
+    /// Master switch. Off by default: a box that suddenly beeps is a
+    /// surprise nobody asked for.
+    pub enabled: bool,
+    /// Beep once (long) when the daemon starts during boot.
+    pub boot: bool,
+    /// Beep (short) just before a shutdown or restart.
+    pub power: bool,
+    /// Beep (short) when a warning, error or critical alert is shown, at
+    /// most once a minute; during the sleep window only critical ones.
+    pub alerts: bool,
+    /// Beep (short) when a chassis `LOCATE` starts.
+    pub find_me: bool,
+}
+
+impl Default for BuzzerConfig {
+    fn default() -> Self {
+        BuzzerConfig {
+            enabled: false,
+            boot: true,
+            power: true,
+            alerts: true,
+            find_me: true,
         }
     }
 }

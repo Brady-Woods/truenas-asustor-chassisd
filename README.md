@@ -470,6 +470,23 @@ Restores every pwm output's original enable-mode/value when done,
 regardless of what it found. `--yes` skips the confirmation prompt (for
 non-interactive use); otherwise it asks before touching any hardware.
 
+## Buzzer
+
+```toml
+[buzzer]
+enabled = false   # master switch; off by default
+boot = true       # long beep when the daemon starts during boot
+power = true      # short beep before a shutdown/restart (also when the OS reboots)
+alerts = true     # short beep on warn/error/critical alerts (max 1/min; only critical while asleep)
+find_me = true    # short beep when a chassis LOCATE starts
+```
+
+Same patterns as ADM: one long beep (800 ms) at boot, one short beep
+(200 ms) for power actions and alerts. ADM drives the speaker by toggling
+the speaker bits of port `0x61` at ~2 kHz with Super I/O pin GP75 high;
+the stock `pcspkr` driver is silent on this board (the timer clock is
+gated), so `buzzer.rs` does the same through `/dev/port`. Needs root.
+
 ## Wake-on-LAN
 
 ```toml
