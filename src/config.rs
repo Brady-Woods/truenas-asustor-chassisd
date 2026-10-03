@@ -212,6 +212,11 @@ pub struct SleepConfig {
     /// 24h "HH:MM" local time.
     pub start: String,
     pub end: String,
+    /// Switch the LCD's display (backlight included) off while asleep,
+    /// rather than only blanking its text and leaving the backlight glow.
+    /// Uses the panel's own display-off command, not `power:lcd`, so the
+    /// panel's MCU stays powered and a button press still wakes it.
+    pub lcd_off: bool,
 }
 
 impl Default for SleepConfig {
@@ -220,6 +225,7 @@ impl Default for SleepConfig {
             enabled: false,
             start: "23:00".to_string(),
             end: "07:00".to_string(),
+            lcd_off: true,
         }
     }
 }
@@ -281,12 +287,28 @@ pub struct LedConfig {
     /// Reuses [sleep]'s schedule for LED night mode too -- one schedule
     /// governs both the LCD backlight and the front LEDs, not two.
     pub nic_mode: crate::led::NicLedMode,
+    /// Front LED brightness, 0-100 (power, status, LAN, USB -- not the bay
+    /// LEDs, which have no brightness control). Unset leaves the BIOS
+    /// level alone (about 80%).
+    pub brightness: Option<u8>,
+    /// Brightness for those same LEDs during night mode, 0-100. Unset
+    /// (default) switches them off at night instead; set, they keep
+    /// showing status, just dimmed. Bay green LEDs go dark either way.
+    pub night_brightness: Option<u8>,
+    /// "ready": a bay's green LED is solid while a disk is present and
+    /// blinks off on access (factory). "activity": dark at idle, flashes on
+    /// access. Unset leaves the driver's setting alone. Needs the platform
+    /// driver's runtime-writable `disk_led_ready`.
+    pub bay_mode: Option<crate::led::BayLedMode>,
 }
 
 impl Default for LedConfig {
     fn default() -> Self {
         LedConfig {
             nic_mode: crate::led::NicLedMode::Link,
+            brightness: None,
+            night_brightness: None,
+            bay_mode: None,
         }
     }
 }
@@ -915,6 +937,7 @@ impl Config {
     ///   that fan in its BIOS/driver mode rather than driving it from a
     ///   curve that makes no sense;
     /// - an unparseable `[wol] mode` leaves WOL untouched;
+    /// - an `[led]` brightness over 100 is clamped to 100;
     /// - inverted temperature thresholds are reported only;
     /// - a malformed `[[power_schedule]]` entry is disabled; rules that
     ///   are fine alone but clash (see `power::lint`) are reported only.
@@ -976,6 +999,18 @@ impl Config {
         errors.extend(crate::power::lint(&crate::power::parse_rules(
             &self.power_schedule,
         )));
+
+        for (key, value) in [
+            ("brightness", &mut self.led.brightness),
+            ("night_brightness", &mut self.led.night_brightness),
+        ] {
+            if let Some(v) = value.as_mut()
+                && *v > 100
+            {
+                errors.push(format!("[led] {key} = {v} is over 100; using 100"));
+                *v = 100;
+            }
+        }
 
         let t = &self.temperature;
         if t.warn_threshold >= t.critical_threshold {
@@ -1178,6 +1213,21 @@ mod tests {
     }
 
     #[test]
+    fn led_settings_parse_and_brightness_is_clamped() {
+        let (cfg, diagnostics) = parse(
+            "[led]\nbrightness = 150\nnight_brightness = 5\nbay_mode = \"activity\"\n\
+             [sleep]\nlcd_off = false\n",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("brightness"));
+        assert_eq!(cfg.led.brightness, Some(100));
+        assert_eq!(cfg.led.night_brightness, Some(5));
+        assert_eq!(cfg.led.bay_mode, Some(crate::led::BayLedMode::Activity));
+        assert!(!cfg.sleep.lcd_off);
+        assert!(Config::default().sleep.lcd_off);
+    }
+
+    #[test]
     fn bad_wol_mode_leaves_wol_alone() {
         let (cfg, diagnostics) = parse("[wol]\nnics = [\"enp2s0\"]\nmode = \"gs\"\n");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -1247,6 +1297,7 @@ mod tests {
             enabled: true,
             start: start.into(),
             end: end.into(),
+            lcd_off: true,
         };
         let night = window("22:00", "06:00");
         assert!(night.contains((23, 30)));

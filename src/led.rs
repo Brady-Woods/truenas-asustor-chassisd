@@ -3,9 +3,9 @@
 //! class devices under /sys/class/leds -- see the asustord project's
 //! LED-MODES.md for the reference this was built against.
 //!
-//! Deliberately NOT touched here: `disk_led_ready` (requires reloading the
-//! shared kernel LED driver, which power-cycles the LCD as a side effect --
-//! out of scope, left as an operator-set kernel module option).
+//! Also here: front LED brightness (the IT8625E's `pwm3`, see
+//! `FRONT_BRIGHTNESS_CHIP`) and the bay LEDs' idle style (the platform
+//! driver's `disk_led_ready` parameter, see `set_bay_mode`).
 
 use crate::socket::Level;
 use serde::Deserialize;
@@ -305,20 +305,26 @@ fn set_bay_red(bay: u32, state: BayState) {
     }
 }
 
-/// Night mode: dark status/power/network/USB LEDs, bay green LEDs off --
-/// but red bay LEDs are deliberately left alone so a real failure still
-/// shows even while "asleep", same principle as a critical alert waking
-/// the LCD. Returns the NIC LED result (see `set_nic_mode`), the one part
-/// here whose failure is worth surfacing.
-pub fn enter_night_mode() -> Result<(), String> {
-    set_status(StatusPattern::Off);
-    set_power(PowerPattern::Off);
-
+/// Night mode: bay green LEDs off, and -- when `front` is set -- the
+/// status/power/network/USB LEDs too. `front` is false when
+/// `[led] night_brightness` dims those instead of darkening them (the bay
+/// LEDs aren't on the brightness PWM, so they always go dark). Red bay
+/// LEDs are deliberately left alone so a real failure still shows even
+/// while "asleep", same principle as a critical alert waking the LCD.
+/// Returns the NIC LED result (see `set_nic_mode`), the one part here
+/// whose failure is worth surfacing.
+pub fn enter_night_mode(front: bool) -> Result<(), String> {
     for bay in 1..=4 {
         write_attr(&format!("sata{bay}:green:disk"), "trigger", "none");
         set_solid(&format!("sata{bay}:green:disk"), false);
         // sata{bay}:red:disk intentionally untouched.
     }
+    if !front {
+        return Ok(());
+    }
+
+    set_status(StatusPattern::Off);
+    set_power(PowerPattern::Off);
 
     set_solid("green:usb", false);
     write_attr("green:usb", "trigger", "none");
@@ -332,19 +338,12 @@ pub fn enter_night_mode() -> Result<(), String> {
     apply_nic_leds(FrontLanState::Off)
 }
 
-/// Restores factory-automatic behavior for everything night mode touched,
-/// and the *configured* `nic_mode` on the NIC LEDs. (This used to restore
-/// "link" unconditionally and leave the caller to then apply `activity`
-/// if configured -- two PHY reconfigurations, and a visible blip, per
-/// wake.)
-pub fn exit_night_mode(nic_mode: NicLedMode) -> Result<(), String> {
-    write_attr("green:status", "trigger", "none");
-    set_solid("green:status", true);
-    write_attr("red:status", "trigger", "panic");
-    set_solid("red:status", false);
-
-    set_power(PowerPattern::On);
-
+/// Restores factory-automatic behavior for everything `enter_night_mode`
+/// (with the same `front`) touched, and the *configured* `nic_mode` on the
+/// NIC LEDs. (This used to restore "link" unconditionally and leave the
+/// caller to then apply `activity` if configured -- two PHY
+/// reconfigurations, and a visible blip, per wake.)
+pub fn exit_night_mode(nic_mode: NicLedMode, front: bool) -> Result<(), String> {
     for bay in 1..=4 {
         write_attr(
             &format!("sata{bay}:green:disk"),
@@ -352,6 +351,16 @@ pub fn exit_night_mode(nic_mode: NicLedMode) -> Result<(), String> {
             &format!("asustor-sata{bay}"),
         );
     }
+    if !front {
+        return Ok(());
+    }
+
+    write_attr("green:status", "trigger", "none");
+    set_solid("green:status", true);
+    write_attr("red:status", "trigger", "panic");
+    set_solid("red:status", false);
+
+    set_power(PowerPattern::On);
 
     write_attr("green:usb", "trigger", "asustor-front-usb");
 
@@ -522,6 +531,121 @@ fn trigger_selected(led: &str, name: &str) -> bool {
     read_attr(led, "trigger").is_some_and(|t| t.split_whitespace().any(|w| w == selected))
 }
 
+/// hwmon chip whose `FRONT_BRIGHTNESS_PWM` output sets the front LEDs'
+/// brightness. Found from ADM's `Hal_Led_Set_Brightness` (libnhal), which
+/// on this platform writes `255 - level` to the IT8625E's PWM3 duty
+/// register, and confirmed live (2026-10-02): sweeping `pwm3` smoothly
+/// dims the power, status, LAN and USB LEDs -- not the bay LEDs, which
+/// stay at fixed brightness (`pwm2`, the other output at the same odd
+/// BIOS default, was swept too and does nothing visible).
+pub const FRONT_BRIGHTNESS_CHIP: &str = "it8625";
+/// See `FRONT_BRIGHTNESS_CHIP`. Inverted: 0 = brightest, 255 = off.
+pub const FRONT_BRIGHTNESS_PWM: u32 = 3;
+
+/// `percent` (0-100, clamped) as the inverted `pwm3` duty. 0% is 255,
+/// which it87 treats as "full speed" and flips `pwm3_enable` to 0 for --
+/// still full duty, so still off; `set_front_brightness` puts manual mode
+/// back before every later write.
+pub fn brightness_pwm(percent: u8) -> u8 {
+    let lit = u16::from(percent.min(100)) * 255 / 100;
+    255 - u8::try_from(lit).unwrap_or(255)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn front_brightness_hwmon() -> Option<String> {
+    crate::hal::glob_hwmon(FRONT_BRIGHTNESS_CHIP)?
+        .into_iter()
+        .next()
+}
+
+/// The front LEDs' current brightness as a raw (inverted) duty, so a
+/// day level can be put back after night mode dims it when only
+/// `[led] night_brightness` is configured.
+pub fn read_front_brightness() -> Option<u8> {
+    #[cfg(not(test))]
+    return std::fs::read_to_string(format!(
+        "{}/pwm{FRONT_BRIGHTNESS_PWM}",
+        front_brightness_hwmon()?
+    ))
+    .ok()?
+    .trim()
+    .parse()
+    .ok();
+    #[cfg(test)]
+    return test_writes::value("front-brightness", "pwm")
+        .and_then(|v| v.parse().ok())
+        .or(Some(51));
+}
+
+/// Sets the front LEDs' brightness to raw (inverted) duty `pwm`. Manual
+/// mode (`pwm3_enable` = 1) goes first every time: the BIOS leaves it
+/// manual, but a 255 write (0%) flips it to 0, and in automatic mode the
+/// duty would follow the chip's own (unconnected) temp inputs instead.
+#[cfg_attr(test, allow(clippy::unnecessary_wraps))]
+pub fn set_front_brightness(pwm: u8) -> Result<(), String> {
+    #[cfg(not(test))]
+    {
+        let hwmon = front_brightness_hwmon()
+            .ok_or_else(|| format!("no {FRONT_BRIGHTNESS_CHIP} hwmon found"))?;
+        let base = format!("{hwmon}/pwm{FRONT_BRIGHTNESS_PWM}");
+        std::fs::write(format!("{base}_enable"), "1")
+            .and_then(|()| std::fs::write(&base, pwm.to_string()))
+            .map_err(|e| format!("{base}: {e}"))
+    }
+    #[cfg(test)]
+    {
+        test_writes::record("front-brightness", "pwm", &pwm.to_string());
+        Ok(())
+    }
+}
+
+/// How the bay green LEDs show a present disk, via the platform driver's
+/// `disk_led_ready` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BayLedMode {
+    /// Solid while a disk is present, blinks off on access (factory).
+    Ready,
+    /// Dark at idle, flashes on access.
+    Activity,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+const DISK_LED_READY: &str = "/sys/module/asustor/parameters/disk_led_ready";
+
+/// Applies `mode` through `disk_led_ready`, writing only if it differs
+/// (a no-op write would still restart any blink in flight). The parameter
+/// is only writable at runtime with the platform driver's
+/// "Make `disk_led_ready` writable at runtime" change; on an older driver
+/// the `Err` says so, since the only other way to change it is reloading
+/// `asustor`, which power-cycles the LCD -- not something to do from here.
+#[cfg_attr(test, allow(clippy::unnecessary_wraps))]
+pub fn set_bay_mode(mode: BayLedMode) -> Result<(), String> {
+    let want = match mode {
+        BayLedMode::Ready => "Y",
+        BayLedMode::Activity => "N",
+    };
+    #[cfg(not(test))]
+    {
+        let current = std::fs::read_to_string(DISK_LED_READY)
+            .map_err(|e| format!("{DISK_LED_READY}: {e} (asustor driver not loaded?)"))?;
+        if current.trim() == want {
+            return Ok(());
+        }
+        std::fs::write(DISK_LED_READY, if want == "Y" { "1" } else { "0" }).map_err(|e| {
+            format!(
+                "{DISK_LED_READY}: {e} -- this asustor driver only reads it at load; \
+                 it needs the runtime-writable disk_led_ready change"
+            )
+        })
+    }
+    #[cfg(test)]
+    {
+        test_writes::record("disk_led_ready", "value", want);
+        Ok(())
+    }
+}
+
 /// LED triggers selected here that live in modules TrueNAS doesn't load
 /// by default: `timer` (every blink pattern -- RAID degraded, critical
 /// alert, bay standby) and `netdev` (`nic_mode` and night mode on the NIC
@@ -581,6 +705,15 @@ pub fn driver_present() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn brightness_percent_maps_to_inverted_pwm() {
+        assert_eq!(brightness_pwm(100), 0);
+        assert_eq!(brightness_pwm(0), 255);
+        assert_eq!(brightness_pwm(30), 179); // ADM's default
+        assert_eq!(brightness_pwm(80), 51); // about where the BIOS leaves it
+        assert_eq!(brightness_pwm(200), 0);
+    }
+
     use super::*;
 
     /// Presets `port`'s two front channels as the kernel would show them

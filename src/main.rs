@@ -409,7 +409,7 @@ fn event_loop(
         wol.maybe_enforce();
 
         let effect = state.tick();
-        apply_effect(effect, lcm, power);
+        apply_effect(effect, state.display_wanted(), lcm, power);
         drain_pending_keys(state, lcm, power);
 
         // Wait for the next thing that could matter: a serial byte, or the
@@ -434,7 +434,7 @@ fn event_loop(
             }
             if let Some(key) = frame.key() {
                 let effect = state.handle_key(key);
-                apply_effect(effect, lcm, power);
+                apply_effect(effect, state.display_wanted(), lcm, power);
                 drain_pending_keys(state, lcm, power);
             }
         }
@@ -451,12 +451,17 @@ fn drain_pending_keys(state: &mut AppState, lcm: &mut Lcm, power: &mut power::Sc
     for frame in lcm.take_pending() {
         if let Some(key) = frame.key() {
             let effect = state.handle_key(key);
-            apply_effect(effect, lcm, power);
+            apply_effect(effect, state.display_wanted(), lcm, power);
         }
     }
 }
 
-fn apply_effect(effect: Effect, lcm: &mut Lcm, power: &mut power::Scheduler) {
+/// Applies `effect`, after first switching the display to `display_on`
+/// (`AppState::display_wanted`) -- on before new text goes up when
+/// waking, off as night mode starts. Retried on every call while the MCU
+/// hasn't confirmed it, the same as text (see `Lcm::set_display`).
+fn apply_effect(effect: Effect, display_on: bool, lcm: &mut Lcm, power: &mut power::Scheduler) {
+    let _ = lcm.set_display(display_on);
     match effect {
         Effect::Render(line0, line1) => {
             let _ = lcm.set_text(0, &line0, 0);
