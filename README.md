@@ -129,18 +129,32 @@ this -- everything below was derived, not looked up.
 Any unsolicited `0xF0` frame from the MCU must be ACKed with `0xF1
 <subcmd> [0x00]` or the MCU will eventually resend it.
 
-**Pacing:** wait ~20ms after the MCU sends anything before sending the
-next frame. Found with a byte-level wire trace (2026-10-02): a frame sent
-right after the MCU's ACK for the previous one -- line 1 straight after
-line 0 -- went unanswered about 1 time in 7, the MCU apparently busy
-updating the LCD. When only part of a frame was lost, the leftover bytes
-merged with the next frame and put stray text on the panel (the tail of
-one line's IP address showing on the other line). With a 10ms or 20ms
-gap: 240 writes, zero failures. The daemon applies 20ms before every
-write (`protocol::SETTLE`), and the receive side resyncs on the next
-`0xF0`/`0xF1` byte if it ever sees a partial frame. `lcm-status status`
-reports text writes/retries/failures since startup under `-- LCD link --`;
-retries and failures should stay at or near zero.
+**Pacing and lost frames:** wait ~20ms after the MCU sends anything
+before sending the next frame -- a frame sent right after its ACK for
+the previous one went unanswered ~1 time in 7 (found with a byte-level
+wire trace, 2026-10-02). Even paced, the MCU still drops part of a frame
+now and then on its own (a few percent of writes in testing, at any frame
+rate and with any text; ADM's `lcmd` retries too, and restarts itself
+after 100 straight failures). It then completes the partial frame with
+the start of the next one and ACKs *that* -- and taking that ACK for the
+next frame's own is what left stray text on the panel (the tail of one
+line's IP address showing on the other line), since the daemon then
+believed a line was showing that never was. So the daemon:
+
+- waits `protocol::SETTLE` (20ms) after anything from the MCU before
+  writing;
+- ignores an ACK that arrives before the frame could even have finished
+  arriving at 115200 baud (`protocol::wire_time`);
+- retries an unACKed write after 100ms, and treats the *other* line as
+  unknown too, so the next render rewrites both;
+- resyncs its own receive side on the next `0xF0`/`0xF1` byte;
+- resends both lines every 60s regardless, and redraws everything if the
+  MCU reports a (re)boot.
+
+`lcm-status status` reports text writes/retries/failures since startup
+under `-- LCD link --`. Retries are expected now and then; failures
+(all three attempts lost) should be rare. Set `LCM_STATUS_TRACE=/path`
+in the daemon's environment to log every byte to and from the panel.
 
 **Button key codes** (subcmd `0x80` payload byte), confirmed by physically
 pressing each button while running `lcm-status listen`:

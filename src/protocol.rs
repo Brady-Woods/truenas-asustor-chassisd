@@ -57,6 +57,25 @@ const ACK_TIMEOUT: Duration = Duration::from_millis(300);
 /// failures. 20ms keeps 2x margin. Applied in `send`, so it covers every
 /// write, and is also the retry backoff in `set_text`.
 const SETTLE: Duration = Duration::from_millis(20);
+/// Wait before retrying a write the MCU didn't ACK, giving it time to
+/// finish with whatever it made of the lost frame first. ADM's `lcmd`
+/// uses the same 100ms.
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Even with pacing, the MCU occasionally drops part of a frame on its
+/// own (measured: a few percent of writes, at any frame rate, with any
+/// text -- ADM's `lcmd` has retries and even a daemon restart after 100
+/// straight failures for it). It then completes that partial frame with
+/// the start of the *next* one and answers that merged frame instead: an
+/// ACK that arrives before our frame can even have finished arriving at
+/// 115200 baud (seen at ~1.4ms for a 22-byte frame, vs ~3.1ms for a real
+/// ACK). Taking that as our ACK is what left stray text up: the cache
+/// then claimed a line was showing that never was. Anything ACKed sooner
+/// than the frame plus its ACK take on the wire is treated as not ours.
+fn wire_time(bytes: usize) -> Duration {
+    // 10 bits per byte (start + 8 data + stop) at 115200 baud.
+    let micros = u64::try_from(bytes).unwrap_or(u64::MAX) * 10 * 1_000_000 / 115_200;
+    Duration::from_micros(micros)
+}
 
 pub struct Lcm {
     port: File,
@@ -81,6 +100,9 @@ pub struct Lcm {
     last_rx: Option<Instant>,
     /// Running totals for the `status` report -- see `LinkStats`.
     stats: LinkStats,
+    /// When the last frame started going out -- see `send_and_ack`'s
+    /// too-early-ACK check.
+    tx_started: Instant,
     /// Wire trace, when `LCM_STATUS_TRACE` names a file: every byte sent
     /// and received, timestamped. For debugging the panel link (this is
     /// how `SETTLE` was found); off by default.
@@ -188,13 +210,19 @@ impl Lcm {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(Lcm {
+        Ok(Self::with_port(port))
+    }
+
+    /// The `Lcm` around an already-configured port.
+    fn with_port(port: File) -> Self {
+        Lcm {
             port,
             pending: Vec::new(),
             last_sent: [None, None],
             display_on: None,
             last_rx: None,
             stats: LinkStats::default(),
+            tx_started: Instant::now(),
             trace: std::env::var_os("LCM_STATUS_TRACE").and_then(|path| {
                 OpenOptions::new()
                     .create(true)
@@ -203,7 +231,7 @@ impl Lcm {
                     .ok()
                     .map(|f| (f, Instant::now()))
             }),
-        })
+        }
     }
 
     /// Sends the stock firmware's power-on sequence. Returns whether each
@@ -226,15 +254,8 @@ impl Lcm {
         }
         let wire = encode(opcode, subcmd, payload);
         self.trace_bytes("TX", &wire);
-        self.port.write_all(&wire)?;
-        if self.trace.is_some() {
-            let start = Instant::now();
-            // SAFETY: the fd is open (owned by `port`) for the call.
-            unsafe { libc::tcdrain(self.port.as_raw_fd()) };
-            let ms = start.elapsed().as_secs_f64() * 1000.0;
-            self.trace_note(&format!("  drained in {ms:.1}ms"));
-        }
-        Ok(())
+        self.tx_started = Instant::now();
+        self.port.write_all(&wire)
     }
 
     /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
@@ -323,6 +344,9 @@ impl Lcm {
     ) -> io::Result<bool> {
         self.send(opcode, subcmd, payload)?;
         let deadline = Instant::now() + timeout;
+        // The frame itself plus a 5-byte ACK: the earliest a real ACK for
+        // it can have been fully received.
+        let earliest = wire_time(payload.len() + 4) + wire_time(5);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -330,6 +354,13 @@ impl Lcm {
             }
             match self.read_frame(remaining) {
                 Some(f) if f.checksum_ok && f.opcode == OP_ACK && f.subcmd == subcmd => {
+                    if self.tx_started.elapsed() < earliest {
+                        // An answer to a merged leftover frame, not to
+                        // this one (see `wire_time`). Keep waiting in case
+                        // ours follows; usually it doesn't.
+                        self.trace_note("  ACK too early to be ours; ignored");
+                        continue;
+                    }
                     return Ok(f.payload.first() == Some(&0));
                 }
                 Some(f) if f.is_unsolicited() => {
@@ -367,14 +398,20 @@ impl Lcm {
         let mut payload = vec![line, flag];
         payload.extend(line_bytes(text));
 
-        // `send` paces every write (see `SETTLE`), so a retry should be
-        // rare; it's still kept, with the same backoff, rather than leaving
-        // a line stale.
+        // `send` paces every write (see `SETTLE`), but the MCU still drops
+        // the odd frame on its own (see `wire_time`), so retry rather than
+        // leave a line stale.
         self.stats.writes += 1;
         for attempt in 0..3 {
             if attempt > 0 {
                 self.stats.retries += 1;
-                std::thread::sleep(SETTLE);
+                // A failed write may have left the MCU holding part of a
+                // frame, which it then completes with bytes of whatever
+                // comes next -- possibly landing them on the *other* line.
+                // So that line can't be trusted to still show what it
+                // did: forget it, and the next render rewrites it too.
+                self.last_sent[1 - idx] = None;
+                std::thread::sleep(RETRY_BACKOFF);
             }
             self.trace_note(&format!("text line{line} {text:?} attempt{attempt}"));
             if self.send_and_ack(OP_COMMAND, SUB_SET_TEXT, &payload, ACK_TIMEOUT)? {
@@ -409,16 +446,17 @@ impl Lcm {
         self.stats
     }
 
-    /// Forgets what the panel is confirmed to be showing, so the next
-    /// `set_text`/`set_display` goes out on the wire even if unchanged.
+    /// Forgets what text the panel is confirmed to be showing, so the next
+    /// `set_text` goes out on the wire even if unchanged. (Not the display
+    /// on/off state: resending display-on re-runs the MCU's power-on init,
+    /// which leaves it deaf to the next frame or two -- seen in replays.)
     /// The caches assume the panel still shows what it last ACKed, which
     /// stops being true if its MCU resets (it then shows its own boot text
     /// until told otherwise) -- the caller does this when the MCU reports
     /// its version (which it does on boot) and periodically, so any
     /// mismatch heals within one redraw period.
-    pub fn forget_shown(&mut self) {
+    pub fn forget_text(&mut self) {
         self.last_sent = [None, None];
-        self.display_on = None;
     }
 
     /// Switches the display (backlight included) on or off -- see
@@ -482,40 +520,20 @@ impl From<u8> for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd;
 
-    /// An `Lcm` on the slave side of a fresh pty, plus the master side
-    /// standing in for the panel's MCU.
-    fn lcm_on_pty() -> (Lcm, File) {
-        let (mut master, mut slave) = (0, 0);
-        // SAFETY: openpty writes the two fds it creates into the locals
-        // passed; the optional name/termios/winsize pointers may be null.
-        let rc = unsafe {
-            libc::openpty(
-                &raw mut master,
-                &raw mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: `slave` is a valid open fd; ttyname returns a pointer to
-        // a static NUL-terminated buffer, copied out before any other call.
-        let path = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) }
-            .to_string_lossy()
-            .into_owned();
-        let lcm = Lcm::open(&path).unwrap();
-        // SAFETY: both fds are open and owned by nothing else from here.
-        unsafe {
-            libc::close(slave);
-            (lcm, File::from_raw_fd(master))
-        }
+    /// An `Lcm` on one end of a socket pair, the other end standing in
+    /// for the panel's MCU. Framing and timing behave as on the serial
+    /// port; termios (`Lcm::open`) is the only part this skips.
+    fn lcm_pair() -> (Lcm, std::os::unix::net::UnixStream) {
+        let (ours, mcu) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let port = File::from(std::os::fd::OwnedFd::from(ours));
+        (Lcm::with_port(port), mcu)
     }
 
     #[test]
     fn read_frame_skips_bytes_ahead_of_a_frame_start() {
-        let (mut lcm, mut mcu) = lcm_on_pty();
+        let (mut lcm, mut mcu) = lcm_pair();
         // The tail of a frame whose start was lost, then a real key press.
         let mut wire = vec![0x27, 0x04, 0x1d];
         wire.extend(encode(OP_COMMAND, SUB_KEY, &[2]));
@@ -526,8 +544,32 @@ mod tests {
     }
 
     #[test]
+    fn an_ack_too_early_to_be_ours_is_not_taken_for_one() {
+        let (mut lcm, mcu) = lcm_pair();
+        let mut mcu = mcu;
+        let panel = std::thread::spawn(move || {
+            let mut frame = [0u8; 22];
+            // First write: answered before it could have arrived at 115200
+            // baud -- the reply to a merged leftover frame.
+            mcu.read_exact(&mut frame).unwrap();
+            mcu.write_all(&encode(OP_ACK, SUB_SET_TEXT, &[0])).unwrap();
+            // The retry: answered after a realistic delay.
+            mcu.read_exact(&mut frame).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            mcu.write_all(&encode(OP_ACK, SUB_SET_TEXT, &[0])).unwrap();
+        });
+        lcm.last_sent[1] = Some("other line".to_string());
+        assert!(lcm.set_text(0, "hello", 0).unwrap());
+        panel.join().unwrap();
+        assert_eq!(lcm.stats().retries, 1);
+        assert_eq!(lcm.last_sent[0].as_deref(), Some("hello"));
+        // The lost frame may have landed on the other line: redraw it too.
+        assert_eq!(lcm.last_sent[1], None);
+    }
+
+    #[test]
     fn send_waits_out_settle_after_the_mcu_last_spoke() {
-        let (mut lcm, mut mcu) = lcm_on_pty();
+        let (mut lcm, mut mcu) = lcm_pair();
         mcu.write_all(&encode(OP_ACK, SUB_SET_TEXT, &[0])).unwrap();
         lcm.read_frame(Duration::from_millis(500)).unwrap();
         let start = Instant::now();

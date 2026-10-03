@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 /// frame. A fixed 100ms keeps scroll steps and timers responsive without
 /// per-state deadline math; one wakeup per 100ms at idle is negligible.
 const POLL_INTERVAL_MS: i32 = 100;
-/// How often both LCD lines (and the display on/off state) are resent even
-/// if unchanged -- see `Lcm::forget_shown`. Two frames a minute is nothing
+/// How often both LCD lines are resent even
+/// if unchanged -- see `Lcm::forget_text`. Two frames a minute is nothing
 /// on the wire, and bounds how long any stray text can stay up.
 const LCD_REDRAW_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -420,7 +420,7 @@ fn event_loop(
         wol.maybe_enforce();
 
         if last_redraw.elapsed() >= LCD_REDRAW_INTERVAL {
-            lcm.forget_shown();
+            lcm.forget_text();
             last_redraw = Instant::now();
         }
         let effect = state.tick();
@@ -466,7 +466,7 @@ fn event_loop(
 fn note_mcu_boot(frame: &protocol::Frame, lcm: &mut Lcm) {
     if frame.is_unsolicited() && frame.subcmd == SUB_VERSION {
         syslog::notice("LCD panel reported a (re)boot; re-initializing and redrawing");
-        lcm.forget_shown();
+        lcm.forget_text();
         let _ = lcm.init();
     }
 }
