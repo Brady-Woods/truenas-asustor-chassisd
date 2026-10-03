@@ -322,6 +322,18 @@ impl Lcm {
         Ok(false)
     }
 
+    /// Forgets what the panel is confirmed to be showing, so the next
+    /// `set_text`/`set_display` goes out on the wire even if unchanged.
+    /// The caches assume the panel still shows what it last ACKed, which
+    /// stops being true if its MCU resets (it then shows its own boot text
+    /// until told otherwise) -- the caller does this when the MCU reports
+    /// its version (which it does on boot) and periodically, so any
+    /// mismatch heals within one redraw period.
+    pub fn forget_shown(&mut self) {
+        self.last_sent = [None, None];
+        self.display_on = None;
+    }
+
     /// Switches the display (backlight included) on or off -- see
     /// `SUB_DISPLAY`. A no-op if that state is already confirmed.
     pub fn set_display(&mut self, on: bool) -> io::Result<bool> {
