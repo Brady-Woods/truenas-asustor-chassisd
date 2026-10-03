@@ -1,3 +1,4 @@
+mod buzzer;
 mod config;
 mod fan;
 mod fan_calibrate;
@@ -31,6 +32,10 @@ const POLL_INTERVAL_MS: i32 = 100;
 /// How often both LCD lines are resent even
 /// if unchanged -- see `Lcm::forget_text`. Two frames a minute is nothing
 /// on the wire, and bounds how long any stray text can stay up.
+/// A daemon start this soon after boot counts as "boot finished".
+const BOOT_BEEP_WINDOW_SECS: f64 = 300.0;
+/// Minimum gap between alert beeps, so a repeating SHOW doesn't nag.
+const ALERT_BEEP_INTERVAL: Duration = Duration::from_secs(60);
 const LCD_REDRAW_INTERVAL: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
@@ -294,6 +299,12 @@ fn run_daemon(cfg_path: &Path) {
 
     let _ = lcm.init();
 
+    buzzer::init(&cfg.buzzer);
+    // Only at boot, not when the service is restarted by hand or by a deploy.
+    if uptime_secs().is_some_and(|up| up < BOOT_BEEP_WINDOW_SECS) {
+        buzzer::boot_finished();
+    }
+
     // deploy.sh already gates on this before it will even build; this is
     // defense-in-depth for the binary being started some other way. LED
     // writes against a missing driver are harmless no-ops (plain sysfs
@@ -346,6 +357,12 @@ fn run_daemon(cfg_path: &Path) {
         event_loop(&mut state, &mut lcm, &cfg, &fans, &mut wol, &mut power, &rx)
     }));
     fans.shutdown();
+    // The OS stopping this service as part of a shutdown/reboot is the
+    // one power action the daemon doesn't start itself.
+    if shutdown::requested() && system_is_stopping() {
+        buzzer::powering_down();
+        buzzer::flush();
+    }
     // Last chance before a shutdown powers the box off (systemd stops
     // this service on the way down), in case anything reset WOL since the
     // last periodic recheck, or the RTC alarm isn't right yet.
@@ -374,6 +391,7 @@ fn event_loop(
 ) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
     let mut last_redraw = Instant::now();
+    let mut last_alert_beep: Option<Instant> = None;
 
     while !shutdown::requested() {
         // Drain any socket commands that arrived since the last wakeup.
@@ -382,6 +400,21 @@ fn event_loop(
         // status and power schedule too, which live out here alongside
         // `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
+            if (!state.is_asleep()
+                || matches!(
+                    &cmd,
+                    socket::SocketCommand::Show {
+                        level: socket::Level::Critical,
+                        ..
+                    }
+                ))
+                && let socket::SocketCommand::Show { level, .. } = &cmd
+                && *level >= socket::Level::Warn
+                && last_alert_beep.is_none_or(|t| t.elapsed() >= ALERT_BEEP_INTERVAL)
+            {
+                buzzer::alert();
+                last_alert_beep = Some(Instant::now());
+            }
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
                 let _ = resp_tx.send(report::build(
                     state,
@@ -391,6 +424,9 @@ fn event_loop(
                     cfg,
                 ));
                 continue;
+            }
+            if matches!(&cmd, socket::SocketCommand::Locate { bay: None, .. }) {
+                buzzer::find_me();
             }
             state.apply_socket_command(cmd);
         }
@@ -502,6 +538,7 @@ fn apply_effect(effect: Effect, display_on: bool, lcm: &mut Lcm, power: &mut pow
             // window right after a power on time passes (the alarm went
             // off while running, the next one not set yet).
             power.sync_rtc(power::now_epoch());
+            buzzer::powering_down();
             run_action(action);
         }
         Effect::None => {}
@@ -520,6 +557,24 @@ fn run_action(action: Action) {
         Ok(status) => syslog::critical(&format!("systemctl {verb} failed ({status})")),
         Err(e) => syslog::critical(&format!("systemctl {verb} failed to run: {e}")),
     }
+}
+
+/// True while systemd is carrying out a shutdown/reboot (as opposed to
+/// someone restarting just this service).
+fn system_is_stopping() -> bool {
+    std::process::Command::new("systemctl")
+        .arg("is-system-running")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")
+}
+
+fn uptime_secs() -> Option<f64> {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Local wall-clock hour/minute (`[sleep].start`/`.end` are documented as

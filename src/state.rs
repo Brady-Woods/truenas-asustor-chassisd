@@ -299,6 +299,11 @@ impl AppState {
 
     /// Whether the LCD's display should be on: always, except asleep with
     /// `[sleep] lcd_off` -- and even then a chassis locate lights it.
+    /// Inside the sleep window (the panel is dark or blanked).
+    pub fn is_asleep(&self) -> bool {
+        self.sleeping
+    }
+
     pub fn display_wanted(&self) -> bool {
         !(self.sleeping && self.cfg.sleep.lcd_off && self.locate_chassis.is_none())
     }
