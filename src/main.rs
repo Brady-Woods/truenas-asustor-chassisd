@@ -383,7 +383,13 @@ fn event_loop(
         // `state`, not inside it.
         while let Ok(cmd) = rx.try_recv() {
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
-                let _ = resp_tx.send(report::build(state, &fans.status(), power, cfg));
+                let _ = resp_tx.send(report::build(
+                    state,
+                    &fans.status(),
+                    power,
+                    &lcm.stats(),
+                    cfg,
+                ));
                 continue;
             }
             state.apply_socket_command(cmd);

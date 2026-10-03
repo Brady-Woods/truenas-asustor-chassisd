@@ -11,10 +11,17 @@ use crate::config::Config;
 use crate::fan::FanStatus;
 use crate::hal;
 use crate::power::{self, Scheduler};
+use crate::protocol::LinkStats;
 use crate::state::AppState;
 use std::fmt::Write;
 
-pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config) -> String {
+pub fn build(
+    state: &AppState,
+    fans: &FanStatus,
+    power: &Scheduler,
+    lcd: &LinkStats,
+    cfg: &Config,
+) -> String {
     let mut out = String::new();
 
     out.push_str("=== lcm-status report ===\n\n");
@@ -61,6 +68,13 @@ pub fn build(state: &AppState, fans: &FanStatus, power: &Scheduler, cfg: &Config
         let _ = writeln!(out, "  {line}");
     }
     out.push('\n');
+
+    out.push_str("-- LCD link --\n");
+    let _ = writeln!(
+        out,
+        "  {} text writes, {} retried, {} failed\n",
+        lcd.writes, lcd.retries, lcd.failures
+    );
 
     out.push_str("-- Active override --\n");
     let active = state.override_summary();
