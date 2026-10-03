@@ -119,7 +119,7 @@ this -- everything below was derived, not looked up.
 
 | opcode | subcmd | payload | meaning |
 |---|---|---|---|
-| `0xF0` | `0x11` | `[0x01]` | power-on init step 1 |
+| `0xF0` | `0x11` | `[on]` | display on (1) / off (0), backlight included; with 1 it's also power-on init step 1 -- see "LCD power (sleep mode)" |
 | `0xF0` | `0x22` | `[0x00]` | power-on init step 2 (~15ms after step 1) |
 | `0xF0` | `0x27` | `[line][flag][16 ASCII bytes, space-padded]` | set text on `line` (0 or 1) |
 | `0xF0` | `0x80` | `[key_code]` | **unsolicited**, MCU -> host: a button was pressed |
@@ -164,13 +164,18 @@ Toggling it **power-cycles the LCD's own MCU, not just a backlight** --
 confirmed live: zero serial frames (including a button press) arrive from
 the panel for as long as it's held at 0. That makes it unusable for this
 project's actual goal: a schedule-driven "night mode" that a button press
-can still interrupt. So `lcm-status` never touches this GPIO at all --
-`[sleep]` instead blanks both display lines (`state.rs`'s `sleeping` flag)
-while leaving the panel fully powered, which keeps it listening for a
-button the whole time. The trade-off is a dark-but-not-black backlight
-glow, confirmed acceptable live against the physical unit; toggle
-`power:lcd` by hand (as above) if you want it fully dark and don't need
-buttons to wake it.
+can still interrupt. So `lcm-status` never touches this GPIO at all.
+
+Instead, `[sleep]` uses the panel's own **display-off command**, `0x11`
+with payload `0x00` -- the same command whose `0x01` form is init step 1.
+Found by disassembling ADM's `lcmd`, which sends exactly this for its own
+idle timeout, and confirmed live (2026-10-02): the display goes fully
+dark, backlight included, while the MCU stays powered; a button press
+still arrives as its normal key code, and the MCU switches the display
+back on by itself. That first press only wakes the panel -- it's never
+also acted on as UP/DOWN/ENTER. `[sleep] lcd_off = false` goes back to
+the older behavior of only blanking both lines (a dark-but-not-black
+backlight glow).
 
 Per `asustord`'s own `LED-MODES.md`, `power:lcd` should **only** be used
 by this project's own logic if at all -- other LED "night mode" logic
@@ -180,12 +185,30 @@ explicitly avoids it for the same reboot-on-toggle reason.
 
 Everything in `led.rs` is a thin wrapper over the standard Linux LED class
 sysfs interface (`brightness`, `trigger`, `delay_on`, `delay_off`) that
-`asustor-platform-driver` exposes. No `disk_led_ready` module-option
-control is implemented here on purpose: changing it means
-`rmmod asustor && modprobe asustor disk_led_ready=N`, which reloads the
-whole shared LED driver and reboots the LCD as a side effect -- a
-meaningfully bigger action than a sysfs write, left as an operator-set
-`/etc/modprobe.d` option rather than something this daemon touches live.
+`asustor-platform-driver` exposes, plus two things that aren't LED class
+devices at all:
+
+- **Brightness** (`[led] brightness`, `night_brightness`, 0-100): the
+  front LEDs share one brightness control, the IT8625E's **`pwm3`**
+  output, inverted (duty 0 = brightest, 255 = off). Found from ADM's
+  `Hal_Led_Set_Brightness` (its 0-100% slider writes `255 - level` there;
+  ADM's default is 30%) and confirmed live by sweeping it: the power,
+  status, LAN and USB LEDs fade smoothly. **The bay LEDs aren't on it** --
+  they have fixed brightness (`pwm2`, the only other output at the same
+  odd BIOS default, was swept too and does nothing visible). Unset, `pwm3`
+  is never touched (the BIOS leaves it at 51, about 80%).
+  `night_brightness` changes what night mode does to those LEDs: instead
+  of switching them off, they keep showing status at that level (bay
+  green LEDs still go dark). A chassis `LOCATE` at night uses the day
+  level. `lcm-status fan-profile` skips `pwm3`, since sweeping it only
+  flickers the LEDs.
+- **Bay LED style** (`[led] bay_mode`): `"ready"` (factory -- solid green
+  while a disk is present, blinks *off* on access) or `"activity"` (dark,
+  flashes *on* access), through the platform driver's `disk_led_ready`
+  parameter. Applied at startup, only if it differs. Needs the driver's
+  "Make `disk_led_ready` writable at runtime" change; an older driver only
+  reads it at load, and changing it there means reloading `asustor`, which
+  reboots the LCD -- so on an older driver this logs a warning instead.
 
 **Status LED patterns:**
 

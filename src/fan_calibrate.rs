@@ -209,6 +209,14 @@ fn find_pwm_candidates() -> Vec<PwmCandidate> {
             continue;
         }
         for idx in pwm_indices(&hwmon) {
+            // Not a fan header: it's the front LEDs' brightness (see
+            // `led::FRONT_BRIGHTNESS_CHIP`). Sweeping it would only flicker
+            // them -- and leave them dark if interrupted mid-sweep.
+            if chip == crate::led::FRONT_BRIGHTNESS_CHIP && idx == crate::led::FRONT_BRIGHTNESS_PWM
+            {
+                println!("  (skipping {chip} pwm{idx}: front LED brightness, not a fan)");
+                continue;
+            }
             out.push(PwmCandidate {
                 hwmon: hwmon.clone(),
                 chip_name: chip.clone(),

@@ -26,8 +26,16 @@ pub const SUB_KEY: u8 = 0x80;
 pub const SUB_VERSION: u8 = 0x13;
 /// Host command: write one 16-char line of text.
 const SUB_SET_TEXT: u8 = 0x27;
-/// Host commands making up the power-on sequence the stock firmware sends.
-const SUB_INIT_1: u8 = 0x11;
+/// Host command: display on (`[0x01]`) or off (`[0x00]`). Also step 1 of
+/// the stock firmware's power-on sequence (with 1). "Off" darkens the
+/// whole display, backlight included, while the MCU stays powered: it
+/// still reports key presses, and turns the display back on by itself
+/// when one comes in (confirmed live 2026-10-02). ADM's `lcmd` uses it the
+/// same way for its own idle timeout -- unlike cutting `power:lcd`, which
+/// also silences the buttons.
+const SUB_DISPLAY: u8 = 0x11;
+/// Step 2 of the power-on sequence. `lcmd` also sends it leaving its
+/// menu, so probably "edit cursor off".
 const SUB_INIT_2: u8 = 0x22;
 
 /// Longest frame on the wire: header (3) + payload + checksum (1).
@@ -54,6 +62,11 @@ pub struct Lcm {
     /// keeps retrying on every subsequent call with that text instead of
     /// being silently dropped forever.
     last_sent: [Option<String>; 2],
+    /// Display state last *confirmed* by an ACK (`SUB_DISPLAY`), same
+    /// idea as `last_sent`. Can go stale the other way: the MCU switches
+    /// the display on by itself on a key press -- harmless, since the
+    /// caller wakes on that same key press and asks for on anyway.
+    display_on: Option<bool>,
 }
 
 /// One received frame.
@@ -150,13 +163,15 @@ impl Lcm {
             port,
             pending: Vec::new(),
             last_sent: [None, None],
+            display_on: None,
         })
     }
 
     /// Sends the stock firmware's power-on sequence. Returns whether each
     /// of its two steps was ACKed.
     pub fn init(&mut self) -> io::Result<(bool, bool)> {
-        let first = self.send_and_ack(OP_COMMAND, SUB_INIT_1, &[0x01], ACK_TIMEOUT)?;
+        let first = self.send_and_ack(OP_COMMAND, SUB_DISPLAY, &[0x01], ACK_TIMEOUT)?;
+        self.display_on = first.then_some(true);
         std::thread::sleep(SETTLE);
         let second = self.send_and_ack(OP_COMMAND, SUB_INIT_2, &[0x00], ACK_TIMEOUT)?;
         Ok((first, second))
@@ -305,6 +320,19 @@ impl Lcm {
         // this is still the text that should be showing) retries instead
         // of being treated as "already sent".
         Ok(false)
+    }
+
+    /// Switches the display (backlight included) on or off -- see
+    /// `SUB_DISPLAY`. A no-op if that state is already confirmed.
+    pub fn set_display(&mut self, on: bool) -> io::Result<bool> {
+        if self.display_on == Some(on) {
+            return Ok(true);
+        }
+        let acked = self.send_and_ack(OP_COMMAND, SUB_DISPLAY, &[u8::from(on)], ACK_TIMEOUT)?;
+        if acked {
+            self.display_on = Some(on);
+        }
+        Ok(acked)
     }
 
     /// Replies to an unsolicited MCU frame the way lcmd does: ACK with status 0.

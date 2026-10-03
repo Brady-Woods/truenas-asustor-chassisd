@@ -9,6 +9,7 @@ use crate::hal::{self, Screen};
 use crate::led;
 use crate::protocol::Key;
 use crate::socket::{Level, SocketCommand};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,13 @@ pub struct AppState {
     /// The NIC LED problem last logged, if it hasn't cleared since -- see
     /// `note_nic_leds`.
     nic_led_problem: Option<String>,
+    /// Daytime front LED brightness as a raw `pwm3` duty: `[led]
+    /// brightness`, or with only `night_brightness` set, whatever the BIOS
+    /// left at startup (so waking puts back exactly that). `None` when
+    /// neither is configured -- `pwm3` is then never touched.
+    day_brightness: Option<u8>,
+    /// Last duty `apply_front_brightness` wrote, to skip repeat writes.
+    applied_brightness: Cell<Option<u8>>,
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
@@ -205,6 +213,8 @@ impl AppState {
             alert_bay: None,
             locate_bays: BTreeMap::new(),
             locate_chassis: None,
+            day_brightness: None,
+            applied_brightness: Cell::new(None),
             sleeping: false,
             schedule_wants_sleep: false,
             awake_override_until: None,
@@ -230,7 +240,49 @@ impl AppState {
     pub fn init_leds(&mut self) {
         let result = led::set_nic_mode(self.cfg.led.nic_mode);
         self.note_nic_leds(result);
+        if let Some(mode) = self.cfg.led.bay_mode
+            && let Err(e) = led::set_bay_mode(mode)
+        {
+            crate::syslog::warning(&format!("[led] bay_mode not applied: {e}"));
+        }
+        self.day_brightness = match (self.cfg.led.brightness, self.cfg.led.night_brightness) {
+            (Some(pct), _) => Some(led::brightness_pwm(pct)),
+            (None, Some(_)) => led::read_front_brightness(),
+            (None, None) => None,
+        };
+        self.apply_front_brightness();
         self.update_health_leds();
+    }
+
+    /// Whether night mode switches the front (status/power/LAN/USB) LEDs
+    /// off, rather than dimming them to `[led] night_brightness`.
+    fn night_darkens_front(&self) -> bool {
+        self.cfg.led.night_brightness.is_none()
+    }
+
+    /// Writes the front LED brightness for the current state: the night
+    /// level while asleep (if one is configured), except during a chassis
+    /// locate, which is meant to be seen; otherwise the day level.
+    fn apply_front_brightness(&self) {
+        let night = self.cfg.led.night_brightness.map(led::brightness_pwm);
+        let want = match night {
+            Some(n) if self.sleeping && self.locate_chassis.is_none() => Some(n),
+            _ => self.day_brightness,
+        };
+        let Some(pwm) = want else { return };
+        if self.applied_brightness.get() == Some(pwm) {
+            return;
+        }
+        match led::set_front_brightness(pwm) {
+            Ok(()) => self.applied_brightness.set(Some(pwm)),
+            Err(e) => crate::syslog::warning(&format!("front LED brightness not applied: {e}")),
+        }
+    }
+
+    /// Whether the LCD's display should be on: always, except asleep with
+    /// `[sleep] lcd_off` -- and even then a chassis locate lights it.
+    pub fn display_wanted(&self) -> bool {
+        !(self.sleeping && self.cfg.sleep.lcd_off && self.locate_chassis.is_none())
     }
 
     /// Logs a NIC LED failure (see `led::set_nic_mode`) once per distinct
@@ -347,11 +399,13 @@ impl AppState {
     /// Two things sit above that verdict: a chassis `LOCATE` (for its
     /// bounded TTL; the verdict is recomputed fresh the moment it ends) and
     /// night mode, which keeps the LED dark (as `led::enter_night_mode`
-    /// left it) even when something like a `CLEAR` asks for a recompute.
+    /// left it) even when something like a `CLEAR` asks for a recompute --
+    /// unless `[led] night_brightness` dims it instead, in which case it
+    /// keeps showing the verdict.
     fn recompute_status_led(&self) {
         if self.locate_chassis.is_some() {
             led::set_status(led::StatusPattern::Locate);
-        } else if self.sleeping {
+        } else if self.sleeping && self.night_darkens_front() {
             led::set_status(led::StatusPattern::Off);
         } else if let Some(ov) = &self.over
             && let Some(pattern) = led::pattern_for_level(ov.level)
@@ -367,7 +421,7 @@ impl AppState {
     fn apply_power_led(&self) {
         led::set_power(if self.locate_chassis.is_some() {
             led::PowerPattern::Locate
-        } else if self.sleeping {
+        } else if self.sleeping && self.night_darkens_front() {
             led::PowerPattern::Off
         } else {
             led::PowerPattern::On
@@ -413,6 +467,7 @@ impl AppState {
                 self.reset_scroll();
                 self.apply_power_led();
                 self.recompute_status_led();
+                self.apply_front_brightness();
             }
         }
     }
@@ -462,6 +517,7 @@ impl AppState {
             self.reset_scroll();
             self.apply_power_led();
             self.recompute_status_led();
+            self.apply_front_brightness();
         }
     }
 
@@ -956,8 +1012,9 @@ impl AppState {
     /// none of them can restore only some of the LEDs.
     fn wake(&mut self) {
         self.sleeping = false;
-        let result = led::exit_night_mode(self.cfg.led.nic_mode);
+        let result = led::exit_night_mode(self.cfg.led.nic_mode, self.night_darkens_front());
         self.note_nic_leds(result);
+        self.apply_front_brightness();
         self.refresh_all();
         self.reassert_locate_leds();
     }
@@ -986,8 +1043,9 @@ impl AppState {
             && matches!(self.mode, Mode::Status)
         {
             self.sleeping = true;
-            let result = led::enter_night_mode();
+            let result = led::enter_night_mode(self.night_darkens_front());
             self.note_nic_leds(result);
+            self.apply_front_brightness();
             // Night mode just darkened every LED wholesale; a locate in
             // progress keeps blinking straight through it.
             self.reassert_locate_leds();
@@ -1536,6 +1594,127 @@ mod tests {
         assert!(test_writes::wrote("blue:power", "brightness", "0"));
         assert!(test_writes::wrote("green:status", "brightness", "0"));
         assert!(matches!(s.tick(), Effect::Render(a, b) if a.is_empty() && b.is_empty()));
+    }
+
+    fn state_with(edit: impl FnOnce(&mut Config)) -> AppState {
+        let mut cfg = Config::default();
+        edit(&mut cfg);
+        AppState::new(cfg)
+    }
+
+    /// The front LED brightness duty last written, if any.
+    fn front_pwm_written() -> Option<String> {
+        test_writes::take()
+            .into_iter()
+            .rev()
+            .find(|(l, a, _)| l == "front-brightness" && a == "pwm")
+            .map(|(_, _, v)| v)
+    }
+
+    #[test]
+    fn lcd_goes_dark_at_night_unless_configured_or_locating() {
+        let mut s = state();
+        assert!(s.display_wanted());
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert!(s.sleeping);
+        assert!(!s.display_wanted());
+        locate(&mut s, None, 0);
+        assert!(s.display_wanted(), "a chassis locate lights the LCD");
+        locate_off(&mut s, None);
+        assert!(!s.display_wanted());
+        // Any key wakes it (and is not acted on).
+        s.handle_key(Key::Down);
+        assert!(s.display_wanted());
+
+        let mut s = state_with(|c| c.sleep.lcd_off = false);
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert!(s.sleeping);
+        assert!(s.display_wanted(), "lcd_off = false only blanks the text");
+    }
+
+    #[test]
+    fn brightness_is_left_alone_unless_configured() {
+        let mut s = state();
+        test_writes::take();
+        s.init_leds();
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert_eq!(front_pwm_written(), None);
+    }
+
+    #[test]
+    fn day_brightness_applies_at_startup() {
+        let mut s = state_with(|c| c.led.brightness = Some(30));
+        test_writes::take();
+        s.init_leds();
+        assert_eq!(front_pwm_written().as_deref(), Some("179"));
+    }
+
+    #[test]
+    fn night_brightness_dims_front_leds_instead_of_darkening_them() {
+        let mut s = state_with(|c| {
+            c.led.brightness = Some(100);
+            c.led.night_brightness = Some(10);
+        });
+        s.init_leds();
+        test_writes::take();
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert!(s.sleeping);
+        let writes = test_writes::take();
+        let wrote = |l: &str, a: &str, v: &str| {
+            writes
+                .iter()
+                .any(|(wl, wa, wv)| wl == l && wa == a && wv == v)
+        };
+        assert!(wrote("front-brightness", "pwm", "230"));
+        // Front LEDs keep showing; bay greens still go dark.
+        assert!(!wrote("blue:power", "brightness", "0"));
+        assert!(!wrote("green:status", "brightness", "0"));
+        assert!(!wrote("blue:lan", "brightness", "0"));
+        assert!(wrote("sata1:green:disk", "brightness", "0"));
+
+        // A chassis locate is meant to be seen: full day brightness.
+        locate(&mut s, None, 0);
+        assert_eq!(front_pwm_written().as_deref(), Some("0"));
+        locate_off(&mut s, None);
+        assert_eq!(front_pwm_written().as_deref(), Some("230"));
+
+        s.set_schedule_sleep_wanted(false);
+        s.tick();
+        assert!(!s.sleeping);
+        assert_eq!(front_pwm_written().as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn night_brightness_alone_restores_the_bios_level_on_wake() {
+        let mut s = state_with(|c| c.led.night_brightness = Some(0));
+        s.init_leds(); // reads the BIOS level: 51 under cfg(test)
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        assert_eq!(front_pwm_written().as_deref(), Some("255"));
+        s.set_schedule_sleep_wanted(false);
+        s.tick();
+        assert_eq!(front_pwm_written().as_deref(), Some("51"));
+    }
+
+    #[test]
+    fn bay_mode_is_applied_only_when_configured() {
+        let mut s = state();
+        test_writes::take();
+        s.init_leds();
+        assert!(
+            !test_writes::take()
+                .iter()
+                .any(|(l, _, _)| l == "disk_led_ready")
+        );
+
+        let mut s = state_with(|c| c.led.bay_mode = Some(led::BayLedMode::Activity));
+        test_writes::take();
+        s.init_leds();
+        assert!(test_writes::wrote("disk_led_ready", "value", "N"));
     }
 
     #[test]

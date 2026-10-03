@@ -19,6 +19,8 @@ confirm_timeout_secs = 10 # auto-cancel a shutdown/restart/eject confirm screen
 enabled = true
 start = "22:00"
 end = "06:00"
+lcd_off = true            # display fully off at night (backlight too); buttons still
+                          # wake it. false = only blank the text (backlight glows)
 
 # Weekly power schedule, like ADM's Control Panel -> Hardware -> Power ->
 # Power Schedule. One [[power_schedule]] block per rule; none (the
@@ -173,6 +175,18 @@ nic_mode = "link"          # "link" (solid while connected) or "activity" (dark,
 # Front LEDs share [sleep]'s schedule for night mode -- one schedule for
 # both the LCD backlight and the LEDs, not two. Red bay LEDs are always
 # left alone by night mode so a real drive failure still shows.
+#
+# Brightness (0-100) of the power, status, LAN and USB LEDs -- the bay
+# LEDs have no brightness control. Unset leaves the BIOS level (~80%).
+# brightness = 60
+# Set this to keep those LEDs on, dimmed, at night instead of switching
+# them off (bay green LEDs go dark at night either way).
+# night_brightness = 5
+# Bay green LEDs: "ready" (solid while a disk is present, blinks off on
+# access -- factory) or "activity" (dark, flashes on access). Unset leaves
+# the driver's setting alone. Needs the platform driver's runtime-writable
+# disk_led_ready; an older driver logs a warning instead.
+# bay_mode = "activity"
 
 [network]
 # Feeds the status LED (amber/red) from monitored NICs' link state, in
