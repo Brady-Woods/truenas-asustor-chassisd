@@ -238,7 +238,14 @@ impl AppState {
     /// from config, and a first pass of the health-driven status/bay LEDs
     /// so they're not left in whatever the driver's own boot defaults were.
     pub fn init_leds(&mut self) {
-        let result = led::set_nic_mode(self.cfg.led.nic_mode);
+        // The full daytime state, not just the NIC mode: a previous run
+        // stopped mid-night-mode leaves the power LED, LAN rail and USB
+        // LED dark, and nothing else here turns them back on -- only
+        // waking does, and a fresh start was never asleep. (Found live: a
+        // restart at night with `night_brightness` set left power and LAN
+        // dark until morning.) If the schedule wants night mode, the first
+        // tick enters it from here as usual.
+        let result = led::exit_night_mode(self.cfg.led.nic_mode, true);
         self.note_nic_leds(result);
         if let Some(mode) = self.cfg.led.bay_mode
             && let Err(e) = led::set_bay_mode(mode)
@@ -1698,6 +1705,21 @@ mod tests {
         s.set_schedule_sleep_wanted(false);
         s.tick();
         assert_eq!(front_pwm_written().as_deref(), Some("51"));
+    }
+
+    #[test]
+    fn startup_turns_the_front_leds_back_on() {
+        // As a previous run stopped mid-night-mode left them.
+        let mut s = state();
+        test_writes::take();
+        s.init_leds();
+        assert!(test_writes::wrote("blue:power", "brightness", "1"));
+        assert!(test_writes::wrote("blue:lan", "brightness", "1"));
+        assert!(test_writes::wrote(
+            "green:usb",
+            "trigger",
+            "asustor-front-usb"
+        ));
     }
 
     #[test]
