@@ -487,10 +487,15 @@ impl AppState {
             .flatten();
         match bay {
             Some(bay) => {
-                self.locate_bays.insert(bay, until);
+                if self.locate_bays.insert(bay, until).is_none() {
+                    led::prime_locate_bay(bay);
+                }
                 self.apply_bay_led(bay);
             }
             None => {
+                if self.locate_chassis.is_none() {
+                    led::prime_locate_status();
+                }
                 self.locate_chassis = Some(ChassisLocate {
                     until,
                     hostname: hal::hostname().unwrap_or_default(),
@@ -1486,6 +1491,24 @@ mod tests {
         // Back to Standby's slow green blip, red off.
         assert!(test_writes::wrote("sata2:green:disk", "delay_off", "9750"));
         assert!(test_writes::wrote("sata2:red:disk", "brightness", "0"));
+    }
+
+    #[test]
+    fn chassis_locate_goes_amber_before_it_starts_blinking() {
+        let mut s = state();
+        test_writes::take();
+        locate(&mut s, None, 0);
+        let writes = test_writes::take();
+        let at = |led: &str, attr: &str, value: &str| {
+            writes
+                .iter()
+                .position(|(l, a, v)| l == led && a == attr && v == value)
+                .unwrap_or_else(|| panic!("no write of {led} {attr}={value}"))
+        };
+        let amber = at("red:status", "brightness", "1").max(at("green:status", "brightness", "1"));
+        let blink =
+            at("green:status", "trigger", "timer").min(at("red:status", "trigger", "timer"));
+        assert!(amber < blink, "blinking started before both LEDs were on");
     }
 
     #[test]
