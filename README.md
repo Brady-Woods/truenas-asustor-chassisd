@@ -487,6 +487,17 @@ the speaker bits of port `0x61` at ~2 kHz with Super I/O pin GP75 high;
 the stock `pcspkr` driver is silent on this board (the timer clock is
 gated), so `buzzer.rs` does the same through `/dev/port`. Needs root.
 
+## Rear reset button (not used)
+
+The pinhole button on the back is a plain GPIO input, not a hardware
+reset; ADM restores settings after it's held for ~5 s. With the platform
+driver's `adm-parity` branch it shows up as `KEY_VENDOR` (code 360) on the
+`asustor-keys` input device, next to the USB Copy button
+(`sudo evtest`, pick "asustor-keys"). `lcm-status` doesn't read it and
+nothing else on the system acts on it -- deliberately not `KEY_RESTART`,
+which systemd-logind would turn into an instant reboot. Pressing it is
+harmless; it's there if a "hold for N seconds" action is ever wanted.
+
 ## Wake-on-LAN
 
 ```toml
