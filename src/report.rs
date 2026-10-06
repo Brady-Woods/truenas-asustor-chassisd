@@ -74,7 +74,12 @@ pub fn build(
     platform_section(&mut out, cfg);
 
     out.push_str("-- Front panel --\n");
-    let _ = writeln!(out, "  LCD power:      {}\n", platform::lcd_power());
+    let _ = writeln!(out, "  LCD power:      {}", platform::lcd_power());
+    let _ = writeln!(
+        out,
+        "  LED brightness: {}\n",
+        crate::led::front_brightness_status()
+    );
 
     out.push_str("-- Buzzer --\n");
     let _ = writeln!(out, "  {}\n", crate::buzzer::status(&cfg.buzzer));

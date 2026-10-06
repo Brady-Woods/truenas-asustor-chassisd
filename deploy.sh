@@ -37,8 +37,9 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
 #
 # The LED functionality (bay LEDs, status LED) and the buzzer depend on the
 # asustor-platform-driver fork, branch `adm-parity`
-# (https://github.com/Brady-Woods/asustor-platform-driver). Stock TrueNAS
-# SCALE does not ship it. Check for its actual effects (the kernel module,
+# (https://github.com/Brady-Woods/asustor-platform-driver), and front LED
+# brightness on its vendored `it87` loaded with `led_pwm=3 led_pwm_invert=1`.
+# Stock TrueNAS SCALE ships neither. Check for its actual effects (the kernel module,
 # the asustor platform device, the LED class devices) rather than trusting
 # a version string, since what matters is whether the sysfs interface this
 # project uses actually exists.
@@ -71,6 +72,8 @@ check_driver() {
         [ -d "/sys/class/leds/$led" ] || fail "expected LED class device /sys/class/leds/$led not found -- asustor-platform-driver may be an older or incomplete build. Need the fork's adm-parity branch."
     done
     log "asustor-platform-driver OK (module loaded, platform device and expected LED class devices present)."
+    # Only needed for [led] brightness / night_brightness, so not fatal.
+    [ -d "/sys/class/leds/front_panel::brightness" ] || log "WARNING: /sys/class/leds/front_panel::brightness not found -- front LED brightness ([led] brightness/night_brightness) needs the fork's it87 loaded with led_pwm=3 led_pwm_invert=1."
 }
 check_driver
 

@@ -178,6 +178,9 @@ nic_mode = "link"          # "link" (solid while connected) or "activity" (dark,
 #
 # Brightness (0-100) of the power, status, LAN and USB LEDs -- the bay
 # LEDs have no brightness control. Unset leaves the BIOS level (~80%).
+# Needs the fork's it87 loaded with led_pwm=3 led_pwm_invert=1 (the
+# /sys/class/leds/front_panel::brightness LED); without it, a WARNING is
+# logged once and brightness is left alone.
 # brightness = 60
 # Set this to keep those LEDs on, dimmed, at night instead of switching
 # them off (bay green LEDs go dark at night either way).

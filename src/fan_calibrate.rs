@@ -208,15 +208,13 @@ fn find_pwm_candidates() -> Vec<PwmCandidate> {
         if chip.is_empty() {
             continue;
         }
+        // The IT8625E's pwm3 (the front LEDs' brightness, not a fan) used
+        // to be skipped here. With the it87 parameters this daemon now
+        // needs (`led_pwm=3`, see `led::FRONT_LED`) it isn't a hwmon pwm
+        // output any more, so it's never swept. Loaded without them, pwm3
+        // is back, gets swept like any output, and only flickers the
+        // front LEDs (its original value is restored afterwards).
         for idx in pwm_indices(&hwmon) {
-            // Not a fan header: it's the front LEDs' brightness (see
-            // `led::FRONT_BRIGHTNESS_CHIP`). Sweeping it would only flicker
-            // them -- and leave them dark if interrupted mid-sweep.
-            if chip == crate::led::FRONT_BRIGHTNESS_CHIP && idx == crate::led::FRONT_BRIGHTNESS_PWM
-            {
-                println!("  (skipping {chip} pwm{idx}: front LED brightness, not a fan)");
-                continue;
-            }
             out.push(PwmCandidate {
                 hwmon: hwmon.clone(),
                 chip_name: chip.clone(),

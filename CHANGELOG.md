@@ -4,6 +4,16 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
 
 ## Unreleased
 
+### Requirements
+- The asustor-platform-driver fork, `adm-parity` branch
+  (https://github.com/Brady-Woods/asustor-platform-driver), which replaces
+  the upstream `nas-deploy` build: LEDs, the "ASUSTOR Buzzer" device,
+  `lcd_power`, `eup`/`ac_power_resume`.
+- Its vendored `it87` (`it87.ko`, replacing the kernel's and the old
+  `asustor_it87`) loaded with `led_pwm=3 led_pwm_invert=1` (plus
+  `force_pwm=1` on the AS6704T for fan control), for front LED brightness.
+  Fan control is unchanged: `pwm1` on the hwmon device named `it8625`.
+
 ### Changed
 - Buzzer: now driven only through the platform driver's own buzzer input
   device, "ASUSTOR Buzzer" (asustor-platform-driver fork, `adm-parity`
@@ -26,6 +36,19 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
   driver). The daemon still never switches LCD power; night mode keeps
   using the panel's display-off command. `lcm-status status` shows
   `lcd_power` under "Front panel".
+- Front LED brightness (`[led] brightness` / `night_brightness`): now the
+  `/sys/class/leds/front_panel::brightness` LED that the fork's `it87`
+  creates with `led_pwm=3 led_pwm_invert=1`, instead of the inverted hwmon
+  `pwm3` (which no longer exists then). Percent is written as
+  `round(percent * max_brightness / 100)` (0 = off, not inverted; the
+  driver keeps the output in manual mode); with only `night_brightness`
+  set, the level read at startup is put back on wake. If the LED is
+  missing, one WARNING says it needs that `it87` (logged again only if the
+  reason changes; a NOTICE when it applies again), and nothing else is
+  written -- there's no fallback to `pwm3`. `lcm-status status` shows the
+  level under "Front panel"; `deploy.sh` warns if the LED is missing.
+- `lcm-status fan-profile` no longer special-cases `pwm3` (it isn't a
+  hwmon output with `led_pwm=3`).
 
 ### Removed
 - 1.4.0's way of beeping: toggling port 0x61 through `/dev/port` with
@@ -35,8 +58,13 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
   no longer touches `/dev/port` or `/sys/class/gpio` at all.
 
 ### Upgrading from 1.4.0
-- Deploy the platform driver first (its `deploy.sh` removes 1.4.0's
-  stale `it87_gp75` export), then this version.
+- Deploy the platform driver first -- the fork's `adm-parity` `asustor`
+  modules and its `it87` with `led_pwm=3 led_pwm_invert=1` -- then this
+  version. The driver's `deploy.sh` also removes 1.4.0's stale `it87_gp75`
+  export. This version's `deploy.sh` refuses to build without
+  `/sys/devices/platform/asustor` (which older drivers only created on
+  some boards), and the daemon can't beep or set brightness with an older
+  driver or `it87` (it says why in the journal).
 
 ### Added
 - EuP / AC-loss check: reads the driver's

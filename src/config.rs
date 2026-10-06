@@ -322,8 +322,9 @@ pub struct LedConfig {
     /// governs both the LCD backlight and the front LEDs, not two.
     pub nic_mode: crate::led::NicLedMode,
     /// Front LED brightness, 0-100 (power, status, LAN, USB -- not the bay
-    /// LEDs, which have no brightness control). Unset leaves the BIOS
-    /// level alone (about 80%).
+    /// LEDs, which have no brightness control), through the
+    /// `front_panel::brightness` LED (`it87` with `led_pwm=3
+    /// led_pwm_invert=1`). Unset leaves the BIOS level alone (about 80%).
     pub brightness: Option<u8>,
     /// Brightness for those same LEDs during night mode, 0-100. Unset
     /// (default) switches them off at night instead; set, they keep

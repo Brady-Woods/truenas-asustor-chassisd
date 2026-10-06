@@ -9,7 +9,7 @@ use crate::hal::{self, Screen};
 use crate::led;
 use crate::protocol::Key;
 use crate::socket::{Level, SocketCommand};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -163,13 +163,16 @@ pub struct AppState {
     /// The NIC LED problem last logged, if it hasn't cleared since -- see
     /// `note_nic_leds`.
     nic_led_problem: Option<String>,
-    /// Daytime front LED brightness as a raw `pwm3` duty: `[led]
-    /// brightness`, or with only `night_brightness` set, whatever the BIOS
-    /// left at startup (so waking puts back exactly that). `None` when
-    /// neither is configured -- `pwm3` is then never touched.
+    /// Daytime front LED brightness in percent: `[led] brightness`, or
+    /// with only `night_brightness` set, whatever the BIOS left at startup
+    /// (so waking puts that back). `None` when neither is configured --
+    /// the brightness LED is then never touched.
     day_brightness: Option<u8>,
-    /// Last duty `apply_front_brightness` wrote, to skip repeat writes.
+    /// Last level `apply_front_brightness` wrote, to skip repeat writes.
     applied_brightness: Cell<Option<u8>>,
+    /// Why the last brightness write failed, if it did, so a missing LED
+    /// device is logged once rather than at every night-mode change.
+    brightness_problem: RefCell<Option<String>>,
     /// Status LED pattern last written by `recompute_status_led`, so an
     /// unchanged verdict isn't rewritten -- rewriting a blinking pattern
     /// restarts its blink. `None` after anything else wrote the status
@@ -223,6 +226,7 @@ impl AppState {
             locate_chassis: None,
             day_brightness: None,
             applied_brightness: Cell::new(None),
+            brightness_problem: RefCell::new(None),
             status_shown: Cell::new(None),
             led_inputs: None,
             sleeping: false,
@@ -264,7 +268,7 @@ impl AppState {
             crate::syslog::warning(&format!("[led] bay_mode not applied: {e}"));
         }
         self.day_brightness = match (self.cfg.led.brightness, self.cfg.led.night_brightness) {
-            (Some(pct), _) => Some(led::brightness_pwm(pct)),
+            (Some(pct), _) => Some(pct.min(100)),
             (None, Some(_)) => led::read_front_brightness(),
             (None, None) => None,
         };
@@ -282,18 +286,28 @@ impl AppState {
     /// level while asleep (if one is configured), except during a chassis
     /// locate, which is meant to be seen; otherwise the day level.
     fn apply_front_brightness(&self) {
-        let night = self.cfg.led.night_brightness.map(led::brightness_pwm);
-        let want = match night {
-            Some(n) if self.sleeping && self.locate_chassis.is_none() => Some(n),
+        let want = match self.cfg.led.night_brightness {
+            Some(n) if self.sleeping && self.locate_chassis.is_none() => Some(n.min(100)),
             _ => self.day_brightness,
         };
-        let Some(pwm) = want else { return };
-        if self.applied_brightness.get() == Some(pwm) {
+        let Some(percent) = want else { return };
+        if self.applied_brightness.get() == Some(percent) {
             return;
         }
-        match led::set_front_brightness(pwm) {
-            Ok(()) => self.applied_brightness.set(Some(pwm)),
-            Err(e) => crate::syslog::warning(&format!("front LED brightness not applied: {e}")),
+        let mut problem = self.brightness_problem.borrow_mut();
+        match led::set_front_brightness(percent) {
+            Ok(()) => {
+                self.applied_brightness.set(Some(percent));
+                if problem.take().is_some() {
+                    crate::syslog::notice("front LED brightness applied normally again");
+                }
+            }
+            Err(e) => {
+                if problem.as_ref() != Some(&e) {
+                    crate::syslog::warning(&format!("front LED brightness not applied: {e}"));
+                    *problem = Some(e);
+                }
+            }
         }
     }
 
@@ -1676,18 +1690,22 @@ mod tests {
         assert!(matches!(s.tick(), Effect::Render(a, b) if a.is_empty() && b.is_empty()));
     }
 
+    /// A state with `edit` applied to its config, and the it87 front LED
+    /// present as the BIOS leaves it (204/255, 80%).
     fn state_with(edit: impl FnOnce(&mut Config)) -> AppState {
+        test_writes::preset(led::FRONT_LED, "max_brightness", "255");
+        test_writes::preset(led::FRONT_LED, "brightness", "204");
         let mut cfg = Config::default();
         edit(&mut cfg);
         AppState::new(cfg)
     }
 
-    /// The front LED brightness duty last written, if any.
-    fn front_pwm_written() -> Option<String> {
+    /// The front LED brightness value last written, if any.
+    fn front_brightness_written() -> Option<String> {
         test_writes::take()
             .into_iter()
             .rev()
-            .find(|(l, a, _)| l == "front-brightness" && a == "pwm")
+            .find(|(l, a, _)| l == led::FRONT_LED && a == "brightness")
             .map(|(_, _, v)| v)
     }
 
@@ -1716,12 +1734,12 @@ mod tests {
 
     #[test]
     fn brightness_is_left_alone_unless_configured() {
-        let mut s = state();
+        let mut s = state_with(|_| {});
         test_writes::take();
         s.init_leds();
         s.set_schedule_sleep_wanted(true);
         s.tick();
-        assert_eq!(front_pwm_written(), None);
+        assert_eq!(front_brightness_written(), None);
     }
 
     #[test]
@@ -1729,7 +1747,7 @@ mod tests {
         let mut s = state_with(|c| c.led.brightness = Some(30));
         test_writes::take();
         s.init_leds();
-        assert_eq!(front_pwm_written().as_deref(), Some("179"));
+        assert_eq!(front_brightness_written().as_deref(), Some("77"));
     }
 
     #[test]
@@ -1749,7 +1767,7 @@ mod tests {
                 .iter()
                 .any(|(wl, wa, wv)| wl == l && wa == a && wv == v)
         };
-        assert!(wrote("front-brightness", "pwm", "230"));
+        assert!(wrote(led::FRONT_LED, "brightness", "26"));
         // Front LEDs keep showing; bay greens still go dark.
         assert!(!wrote("blue:power", "brightness", "0"));
         assert!(!wrote("green:status", "brightness", "0"));
@@ -1758,26 +1776,49 @@ mod tests {
 
         // A chassis locate is meant to be seen: full day brightness.
         locate(&mut s, None, 0);
-        assert_eq!(front_pwm_written().as_deref(), Some("0"));
+        assert_eq!(front_brightness_written().as_deref(), Some("255"));
         locate_off(&mut s, None);
-        assert_eq!(front_pwm_written().as_deref(), Some("230"));
+        assert_eq!(front_brightness_written().as_deref(), Some("26"));
 
         s.set_schedule_sleep_wanted(false);
         s.tick();
         assert!(!s.sleeping);
-        assert_eq!(front_pwm_written().as_deref(), Some("0"));
+        assert_eq!(front_brightness_written().as_deref(), Some("255"));
     }
 
     #[test]
     fn night_brightness_alone_restores_the_bios_level_on_wake() {
         let mut s = state_with(|c| c.led.night_brightness = Some(0));
-        s.init_leds(); // reads the BIOS level: 51 under cfg(test)
+        s.init_leds(); // reads the BIOS level: 204/255 = 80%
         s.set_schedule_sleep_wanted(true);
         s.tick();
-        assert_eq!(front_pwm_written().as_deref(), Some("255"));
+        assert_eq!(front_brightness_written().as_deref(), Some("0"));
         s.set_schedule_sleep_wanted(false);
         s.tick();
-        assert_eq!(front_pwm_written().as_deref(), Some("51"));
+        assert_eq!(front_brightness_written().as_deref(), Some("204"));
+    }
+
+    #[test]
+    fn missing_brightness_led_is_reported_once_and_never_falls_back() {
+        // No front_panel::brightness (it87 without led_pwm=3).
+        let mut s = state();
+        s.cfg.led.brightness = Some(30);
+        s.cfg.led.night_brightness = Some(10);
+        test_writes::take();
+        s.init_leds();
+        let problem = s.brightness_problem.borrow().clone().expect("a problem");
+        assert!(problem.contains("led_pwm=3"), "{problem}");
+        s.set_schedule_sleep_wanted(true);
+        s.tick();
+        // Same problem, so not logged again; nothing written anywhere.
+        assert_eq!(s.brightness_problem.borrow().as_deref(), Some(&*problem));
+        assert_eq!(front_brightness_written(), None);
+        // The LED shows up (it87 reloaded): applied, and the problem clears.
+        test_writes::preset(led::FRONT_LED, "max_brightness", "255");
+        s.set_schedule_sleep_wanted(false);
+        s.tick();
+        assert_eq!(front_brightness_written().as_deref(), Some("77"));
+        assert_eq!(*s.brightness_problem.borrow(), None);
     }
 
     #[test]

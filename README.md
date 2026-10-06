@@ -28,6 +28,13 @@ daemon anyway -- see "Fan control" below for why.)
   `/sys/devices/platform/asustor` and the expected LED class devices
   present) before doing anything else, and refuses to proceed if it's
   missing.
+- **The fork's vendored `it87`** (built as `it87.ko`, replacing the
+  kernel's), loaded with `force_pwm=1 led_pwm=3 led_pwm_invert=1`
+  (e.g. `options it87 force_pwm=1 led_pwm=3 led_pwm_invert=1` in
+  `/etc/modprobe.d/it87.conf`): fan control (`pwm1` on the `it8625` hwmon
+  device, found by its hwmon name) and front LED brightness
+  (`front_panel::brightness`). Only brightness needs `led_pwm`; without it
+  everything else works.
 - Docker (TrueNAS's own Apps/Docker subsystem) -- used only to build in a
   throwaway `rust:alpine` container. Nothing is installed on the host
   toolchain-wise.
@@ -230,19 +237,25 @@ sysfs interface (`brightness`, `trigger`, `delay_on`, `delay_off`) that
 devices at all:
 
 - **Brightness** (`[led] brightness`, `night_brightness`, 0-100): the
-  front LEDs share one brightness control, the IT8625E's **`pwm3`**
-  output, inverted (duty 0 = brightest, 255 = off). Found from ADM's
-  `Hal_Led_Set_Brightness` (its 0-100% slider writes `255 - level` there;
-  ADM's default is 30%) and confirmed live by sweeping it: the power,
-  status, LAN and USB LEDs fade smoothly. **The bay LEDs aren't on it** --
-  they have fixed brightness (`pwm2`, the only other output at the same
-  odd BIOS default, was swept too and does nothing visible). Unset, `pwm3`
-  is never touched (the BIOS leaves it at 51, about 80%).
+  front LEDs share one brightness control, the IT8625E's PWM3 output.
+  Found from ADM's `Hal_Led_Set_Brightness` (its 0-100% slider writes
+  `255 - level` to that output's duty; ADM's default is 30%) and confirmed
+  live by sweeping it: the power, status, LAN and USB LEDs fade smoothly.
+  **The bay LEDs aren't on it** -- they have fixed brightness. The fork's
+  vendored `it87`, loaded with **`led_pwm=3 led_pwm_invert=1`**, turns
+  that output into an LED class device, `/sys/class/leds/front_panel::brightness`
+  (`brightness` 0 = off to `max_brightness` 255, not inverted, kept in
+  manual mode by the driver), and there's no hwmon `pwm3` any more. The
+  daemon writes `round(percent * max_brightness / 100)` there. Without
+  that LED (`it87` loaded without `led_pwm=3`) brightness isn't set at
+  all: one WARNING says so, and there's deliberately no fallback to
+  `pwm3`. Unset, the LED is never touched (the BIOS leaves it at 204, 80%);
+  `lcm-status status` shows the current level under "Front panel".
   `night_brightness` changes what night mode does to those LEDs: instead
   of switching them off, they keep showing status at that level (bay
   green LEDs still go dark). A chassis `LOCATE` at night uses the day
-  level. `lcm-status fan-profile` skips `pwm3`, since sweeping it only
-  flickers the LEDs.
+  level. (`lcm-status fan-profile` used to skip `pwm3`; with `led_pwm=3`
+  it no longer exists, so there's nothing to skip.)
 - **Bay LED style** (`[led] bay_mode`): `"ready"` (factory -- solid green
   while a disk is present, blinks *off* on access) or `"activity"` (dark,
   flashes *on* access), through the platform driver's `disk_led_ready`
@@ -452,7 +465,9 @@ measures what happens:
    `pwm1` wired to an actual fan header. The other five "detect" a
    response under a naive check purely because the one real fan is still
    drifting toward steady-state from whichever pwm was tested *previously*
-   -- they do nothing at all when actually tested causally.
+   -- they do nothing at all when actually tested causally. (With `it87`
+   loaded with `led_pwm=3`, as this daemon needs, `pwm3` is the front LED
+   brightness LED instead and isn't listed at all.)
 2. For each pwm output that does control a real fan, ramps it down to find
    where it stalls (empirical `min_stop_pwm`) and back up to find where it
    restarts (empirical `min_start_pwm`). Some fans (this board's included)
@@ -922,6 +937,7 @@ the active socket override if any:
 
 -- Front panel --
   LCD power:      on (lcd_power = 1, held by the driver)
+  LED brightness: 30% (77/255, front_panel::brightness)
 
 -- Buzzer --
   ready: 2000 Hz tones to /dev/input/event7 (ASUSTOR Buzzer)

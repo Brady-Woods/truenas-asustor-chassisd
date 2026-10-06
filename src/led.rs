@@ -3,9 +3,10 @@
 //! class devices under /sys/class/leds -- see the asustord project's
 //! LED-MODES.md for the reference this was built against.
 //!
-//! Also here: front LED brightness (the IT8625E's `pwm3`, see
-//! `FRONT_BRIGHTNESS_CHIP`) and the bay LEDs' idle style (the platform
-//! driver's `disk_led_ready` parameter, see `set_bay_mode`).
+//! Also here: front LED brightness (the `front_panel::brightness` LED that
+//! the fork's `it87` makes of the IT8625E's PWM3, see `FRONT_LED`) and the
+//! bay LEDs' idle style (the platform driver's `disk_led_ready` parameter,
+//! see `set_bay_mode`).
 
 use crate::socket::Level;
 use serde::Deserialize;
@@ -20,10 +21,19 @@ const LEDS: &str = "/sys/class/leds";
 /// `apply_nic_port` for why the write's own error isn't the right signal
 /// there.
 fn write_attr(led: &str, attr: &str, value: &str) {
+    let _ = try_write_attr(led, attr, value);
+}
+
+/// `write_attr`, for the callers that do want the error.
+#[cfg_attr(test, allow(clippy::unnecessary_wraps))]
+fn try_write_attr(led: &str, attr: &str, value: &str) -> std::io::Result<()> {
     #[cfg(not(test))]
-    let _ = std::fs::write(format!("{LEDS}/{led}/{attr}"), value);
+    return std::fs::write(format!("{LEDS}/{led}/{attr}"), value);
     #[cfg(test)]
-    test_writes::record(led, attr, value);
+    {
+        test_writes::record(led, attr, value);
+        Ok(())
+    }
 }
 
 /// Trimmed contents of an LED attribute, `None` if it doesn't exist (e.g.
@@ -547,71 +557,74 @@ fn trigger_selected(led: &str, name: &str) -> bool {
     read_attr(led, "trigger").is_some_and(|t| t.split_whitespace().any(|w| w == selected))
 }
 
-/// hwmon chip whose `FRONT_BRIGHTNESS_PWM` output sets the front LEDs'
-/// brightness. Found from ADM's `Hal_Led_Set_Brightness` (libnhal), which
-/// on this platform writes `255 - level` to the IT8625E's PWM3 duty
-/// register, and confirmed live (2026-10-02): sweeping `pwm3` smoothly
-/// dims the power, status, LAN and USB LEDs -- not the bay LEDs, which
-/// stay at fixed brightness (`pwm2`, the other output at the same odd
-/// BIOS default, was swept too and does nothing visible).
-pub const FRONT_BRIGHTNESS_CHIP: &str = "it8625";
-/// See `FRONT_BRIGHTNESS_CHIP`. Inverted: 0 = brightest, 255 = off.
-pub const FRONT_BRIGHTNESS_PWM: u32 = 3;
+/// The front LEDs' shared brightness control (power, status, LAN and USB
+/// -- not the bay LEDs, which have fixed brightness). It's the IT8625E's
+/// PWM3 output: found from ADM's `Hal_Led_Set_Brightness` (libnhal),
+/// which writes `255 - level` to its duty register, and confirmed live
+/// (2026-10-02) by sweeping it. The asustor-platform-driver fork's
+/// vendored `it87`, loaded with `led_pwm=3 led_pwm_invert=1`, makes it
+/// this LED class device instead of hwmon `pwm3`: `brightness` 0 (off) to
+/// `max_brightness` (255), not inverted, and kept in manual mode by the
+/// driver. Without those parameters there is no such LED, and brightness
+/// isn't set at all (there is deliberately no fallback to `pwm3`).
+pub const FRONT_LED: &str = "front_panel::brightness";
 
-/// `percent` (0-100, clamped) as the inverted `pwm3` duty. 0% is 255,
-/// which it87 treats as "full speed" and flips `pwm3_enable` to 0 for --
-/// still full duty, so still off; `set_front_brightness` puts manual mode
-/// back before every later write.
-pub fn brightness_pwm(percent: u8) -> u8 {
-    let lit = u16::from(percent.min(100)) * 255 / 100;
-    255 - u8::try_from(lit).unwrap_or(255)
+/// `percent` (0-100, clamped) of `max`, rounded.
+pub fn brightness_value(percent: u8, max: u32) -> u32 {
+    let scaled = (u64::from(percent.min(100)) * u64::from(max) + 50) / 100;
+    u32::try_from(scaled).unwrap_or(max)
 }
 
-#[cfg_attr(test, allow(dead_code))]
-fn front_brightness_hwmon() -> Option<String> {
-    crate::hal::glob_hwmon(FRONT_BRIGHTNESS_CHIP)?
-        .into_iter()
-        .next()
-}
-
-/// The front LEDs' current brightness as a raw (inverted) duty, so a
-/// day level can be put back after night mode dims it when only
-/// `[led] night_brightness` is configured.
-pub fn read_front_brightness() -> Option<u8> {
-    #[cfg(not(test))]
-    return std::fs::read_to_string(format!(
-        "{}/pwm{FRONT_BRIGHTNESS_PWM}",
-        front_brightness_hwmon()?
-    ))
-    .ok()?
-    .trim()
-    .parse()
-    .ok();
-    #[cfg(test)]
-    return test_writes::value("front-brightness", "pwm")
-        .and_then(|v| v.parse().ok())
-        .or(Some(51));
-}
-
-/// Sets the front LEDs' brightness to raw (inverted) duty `pwm`. Manual
-/// mode (`pwm3_enable` = 1) goes first every time: the BIOS leaves it
-/// manual, but a 255 write (0%) flips it to 0, and in automatic mode the
-/// duty would follow the chip's own (unconnected) temp inputs instead.
-#[cfg_attr(test, allow(clippy::unnecessary_wraps))]
-pub fn set_front_brightness(pwm: u8) -> Result<(), String> {
-    #[cfg(not(test))]
-    {
-        let hwmon = front_brightness_hwmon()
-            .ok_or_else(|| format!("no {FRONT_BRIGHTNESS_CHIP} hwmon found"))?;
-        let base = format!("{hwmon}/pwm{FRONT_BRIGHTNESS_PWM}");
-        std::fs::write(format!("{base}_enable"), "1")
-            .and_then(|()| std::fs::write(&base, pwm.to_string()))
-            .map_err(|e| format!("{base}: {e}"))
+/// `value` (clamped to `max`) as a percentage of `max`, rounded.
+pub fn brightness_percent(value: u32, max: u32) -> u8 {
+    if max == 0 {
+        return 0;
     }
-    #[cfg(test)]
-    {
-        test_writes::record("front-brightness", "pwm", &pwm.to_string());
-        Ok(())
+    let (value, max) = (u64::from(value.min(max)), u64::from(max));
+    u8::try_from((value * 100 + max / 2) / max).unwrap_or(100)
+}
+
+/// `FRONT_LED`'s `max_brightness`, or why there's no front LED brightness.
+fn front_max_brightness() -> Result<u32, String> {
+    read_attr(FRONT_LED, "max_brightness")
+        .and_then(|v| v.parse().ok())
+        .filter(|&max| max > 0)
+        .ok_or_else(|| {
+            format!(
+                "no {LEDS}/{FRONT_LED} LED -- front LED brightness needs the \
+                 asustor-platform-driver fork's it87 loaded with led_pwm=3 led_pwm_invert=1"
+            )
+        })
+}
+
+/// The front LEDs' current brightness in percent, so a day level can be
+/// put back after night mode dims it when only `[led] night_brightness`
+/// is configured.
+pub fn read_front_brightness() -> Option<u8> {
+    let max = front_max_brightness().ok()?;
+    let value = read_attr(FRONT_LED, "brightness")?.parse().ok()?;
+    Some(brightness_percent(value, max))
+}
+
+/// Sets the front LEDs' brightness to `percent` (0 = off).
+pub fn set_front_brightness(percent: u8) -> Result<(), String> {
+    let max = front_max_brightness()?;
+    let value = brightness_value(percent, max);
+    try_write_attr(FRONT_LED, "brightness", &value.to_string())
+        .map_err(|e| format!("{LEDS}/{FRONT_LED}/brightness: {e}"))
+}
+
+/// One line for `lcm-status status`.
+pub fn front_brightness_status() -> String {
+    match front_max_brightness() {
+        Err(e) => format!("not available: {e}"),
+        Ok(max) => match read_attr(FRONT_LED, "brightness").and_then(|v| v.parse().ok()) {
+            Some(value) => format!(
+                "{}% ({value}/{max}, {FRONT_LED})",
+                brightness_percent(value, max)
+            ),
+            None => format!("unreadable ({FRONT_LED})"),
+        },
     }
 }
 
@@ -727,16 +740,50 @@ pub fn driver_present() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn brightness_percent_maps_to_inverted_pwm() {
-        assert_eq!(brightness_pwm(100), 0);
-        assert_eq!(brightness_pwm(0), 255);
-        assert_eq!(brightness_pwm(30), 179); // ADM's default
-        assert_eq!(brightness_pwm(80), 51); // about where the BIOS leaves it
-        assert_eq!(brightness_pwm(200), 0);
+    fn brightness_percent_maps_to_the_led_range() {
+        assert_eq!(brightness_value(100, 255), 255);
+        assert_eq!(brightness_value(0, 255), 0);
+        assert_eq!(brightness_value(30, 255), 77); // ADM's default, 76.5 rounded
+        assert_eq!(brightness_value(80, 255), 204); // about where the BIOS leaves it
+        assert_eq!(brightness_value(200, 255), 255);
+        assert_eq!(brightness_value(50, 1), 1);
+        // And back, without drifting.
+        for percent in 0..=100 {
+            assert_eq!(
+                brightness_percent(brightness_value(percent, 255), 255),
+                percent
+            );
+        }
+        assert_eq!(brightness_percent(204, 255), 80);
+        assert_eq!(brightness_percent(300, 255), 100);
+        assert_eq!(brightness_percent(5, 0), 0);
     }
 
-    use super::*;
+    #[test]
+    fn front_brightness_goes_to_the_led_class_device() {
+        test_writes::preset(FRONT_LED, "max_brightness", "255");
+        test_writes::preset(FRONT_LED, "brightness", "204");
+        assert_eq!(read_front_brightness(), Some(80));
+        test_writes::take();
+        assert_eq!(set_front_brightness(30), Ok(()));
+        assert_eq!(
+            test_writes::take(),
+            vec![(FRONT_LED.into(), "brightness".into(), "77".into())]
+        );
+        assert!(front_brightness_status().starts_with("30% (77/255"));
+    }
+
+    #[test]
+    fn missing_front_led_is_an_error_naming_the_fix() {
+        assert_eq!(read_front_brightness(), None);
+        let err = set_front_brightness(30).unwrap_err();
+        assert!(err.contains("led_pwm=3"), "{err}");
+        assert!(test_writes::take().is_empty(), "nothing written");
+        assert!(front_brightness_status().contains("led_pwm=3"));
+    }
 
     /// Presets `port`'s two front channels as the kernel would show them
     /// with `netdev` already selected and offloaded in `state`.
