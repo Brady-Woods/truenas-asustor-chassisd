@@ -3,8 +3,8 @@
 //!
 //! The speaker (the PC speaker, PIT channel 2) sits behind a gate, Super
 //! I/O pin GP75: with it low, nothing is audible (which is why the stock
-//! `pcspkr` is silent on the AS6704T). The forked `asustor.ko`
-//! (`adm-parity` branch) claims GP75 itself and registers an input device,
+//! `pcspkr` is silent on the AS6704T). The forked `asustor.ko` (v0.3 or
+//! later) claims GP75 itself and registers an input device,
 //! "ASUSTOR Buzzer" (phys `asustor/input0`), that plays tones on the PC
 //! speaker and opens the gate while one plays. It reports whether that
 //! works in `buzzer_gate` (`active`, `disabled` with `buzzer=0`,
@@ -248,13 +248,14 @@ fn availability(enabled: bool, gate: &Gate, speaker: Option<PathBuf>) -> Result<
         Gate::Active => speaker.ok_or_else(|| {
             format!(
                 "buzzer_gate is active but there is no \"{BUZZER_NAME}\" input device: \
-                 the asustor driver is too old (an earlier adm-parity build that gated \
+                 the asustor driver is too old (a fork build from before v0.3 that gated \
                  pcspkr instead); update it and reload asustor.ko"
             )
         }),
         Gate::Absent => Err(format!(
             "the platform driver has no buzzer gate (no buzzer_gate attribute); needs the \
-             asustor-platform-driver fork (adm-parity branch) with its \"{BUZZER_NAME}\" device"
+             asustor-platform-driver fork (https://github.com/Brady-Woods/asustor-platform-driver), \
+             main, v0.3 or later, with its \"{BUZZER_NAME}\" device"
         )),
         Gate::Disabled => Err("the platform driver's buzzer gate is disabled (asustor.ko \
                                loaded with buzzer=0)"
@@ -478,29 +479,29 @@ B: SND=6
         let reason =
             |enabled, gate: Gate, device| availability(enabled, &gate, device).unwrap_err();
         assert!(reason(false, Gate::Active, device()).contains("enabled = false"));
-        // Gate active but no device: an older adm-parity driver that gated
-        // pcspkr. The fix is the driver, not pcspkr.
+        // Gate active but no device: a fork driver from before v0.3 that
+        // gated pcspkr. The fix is the driver, not pcspkr.
         let old = reason(true, Gate::Active, None);
         assert!(
             old.contains("too old") && old.contains("reload asustor.ko"),
             "{old}"
         );
         assert!(!old.contains("modprobe"), "{old}");
-        assert!(reason(true, Gate::Absent, device()).contains("adm-parity"));
+        assert!(reason(true, Gate::Absent, device()).contains("main, v0.3 or later"));
         assert!(reason(true, Gate::Disabled, device()).contains("buzzer=0"));
         let stale = reason(true, Gate::Unavailable, device());
         assert!(stale.contains("it87_gp75") && stale.contains("reload asustor.ko"));
         assert!(reason(true, Gate::parse("on"), device()).contains("\"on\", not \"active\""));
         // Without a gate, that's what's reported, device or not: it's the
         // driver that needs changing first.
-        assert!(reason(true, Gate::Absent, None).contains("adm-parity"));
+        assert!(reason(true, Gate::Absent, None).contains("main, v0.3 or later"));
     }
 
     #[test]
     fn check_reads_the_gate_and_finds_the_buzzer() {
         let root = scratch("check");
         let p = paths(&root);
-        assert!(p.check(true).unwrap_err().contains("adm-parity"));
+        assert!(p.check(true).unwrap_err().contains("main, v0.3 or later"));
         write(&p.gate, "active\n");
         assert!(p.check(true).unwrap_err().contains("too old"));
         write(&p.input_devices, PROC_INPUT_DEVICES);

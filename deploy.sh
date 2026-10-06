@@ -36,7 +36,7 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
 # --- 1. Kernel driver dependency check, before anything else -------------
 #
 # The LED functionality (bay LEDs, status LED) and the buzzer depend on the
-# asustor-platform-driver fork, branch `adm-parity`
+# asustor-platform-driver fork, `main`, v0.3 or later
 # (https://github.com/Brady-Woods/asustor-platform-driver), and front LED
 # brightness on its vendored `it87` loaded with `led_pwm=3 led_pwm_invert=1`.
 # Stock TrueNAS SCALE ships neither. Check for its actual effects (the kernel module,
@@ -44,7 +44,7 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
 # a version string, since what matters is whether the sysfs interface this
 # project uses actually exists.
 check_driver() {
-    log "Checking for asustor-platform-driver (adm-parity branch)..."
+    log "Checking for asustor-platform-driver (fork main, v0.3 or later)..."
     # This and the platform driver's own Post Init script (see
     # truenas-asustor-deploy/components/platform-driver/) both run as
     # POSTINIT Init/Shutdown Scripts, and TrueNAS doesn't guarantee which
@@ -60,16 +60,16 @@ check_driver() {
     if ! lsmod | grep -q '^asustor_gpio_it87'; then
         fail "asustor_gpio_it87 kernel module not loaded (waited ${wait_secs}s).
   lcm-status's LED support (bay LEDs, status LED) and buzzer require the
-  asustor-platform-driver fork, branch adm-parity:
+  asustor-platform-driver fork, main, v0.3 or later:
     https://github.com/Brady-Woods/asustor-platform-driver
   Install that driver first, then re-run this script."
     fi
     # The asustor platform device's directory exists whenever the module is
     # loaded on a supported board. (/sys/class/leds/power:lcd, checked here
     # before, no longer exists: LCD power is now the driver's lcd_power.)
-    [ -d /sys/devices/platform/asustor ] || fail "/sys/devices/platform/asustor not found -- the asustor module isn't loaded, or this board isn't supported. Need the asustor-platform-driver fork, branch adm-parity."
+    [ -d /sys/devices/platform/asustor ] || fail "/sys/devices/platform/asustor not found -- the asustor module isn't loaded, or this board isn't supported. Need the asustor-platform-driver fork (https://github.com/Brady-Woods/asustor-platform-driver), main, v0.3 or later."
     for led in sata1:red:disk green:status red:status; do
-        [ -d "/sys/class/leds/$led" ] || fail "expected LED class device /sys/class/leds/$led not found -- asustor-platform-driver may be an older or incomplete build. Need the fork's adm-parity branch."
+        [ -d "/sys/class/leds/$led" ] || fail "expected LED class device /sys/class/leds/$led not found -- asustor-platform-driver may be an older or incomplete build. Need the asustor-platform-driver fork (https://github.com/Brady-Woods/asustor-platform-driver), main, v0.3 or later."
     done
     log "asustor-platform-driver OK (module loaded, platform device and expected LED class devices present)."
     # Only needed for [led] brightness / night_brightness, so not fatal.

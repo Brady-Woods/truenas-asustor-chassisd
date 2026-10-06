@@ -314,8 +314,9 @@ fn run_daemon(cfg_path: &Path) {
     // instead of silently invisible.
     if !led::driver_present() {
         eprintln!(
-            "WARNING: asustor-platform-driver (fork, adm-parity branch: \
-             https://github.com/Brady-Woods/asustor-platform-driver) not detected -- \
+            "WARNING: asustor-platform-driver (fork: \
+             https://github.com/Brady-Woods/asustor-platform-driver, main, v0.3 or later) \
+             not detected -- \
              LED control (bay/status LEDs) will silently no-op. \
              LCD text/menu still works. Run deploy.sh, which checks this before building."
         );

@@ -720,8 +720,8 @@ fn trigger_registered(name: &str) -> bool {
     })
 }
 
-/// Checks for the same asustor-platform-driver (fork, `adm-parity`
-/// branch) effects `deploy.sh` gates on before building at all: the
+/// Checks for the same asustor-platform-driver (fork, `main`, v0.3 or
+/// later) effects `deploy.sh` gates on before building at all: the
 /// `asustor` platform device's directory (always there while the module
 /// is loaded on a supported board) and the LEDs this daemon drives. This
 /// is defense-in-depth for the case where the binary gets started some

@@ -15,7 +15,7 @@ daemon anyway -- see "Fan control" below for why.)
 
 ## Requirements
 
-- **The [asustor-platform-driver fork](https://github.com/Brady-Woods/asustor-platform-driver), branch `adm-parity`**
+- **The [asustor-platform-driver fork](https://github.com/Brady-Woods/asustor-platform-driver), `main`, v0.3 or later**
   (a fork of [mafredri/asustor-platform-driver](https://github.com/mafredri/asustor-platform-driver):
   upstream plus [PR #46](https://github.com/mafredri/asustor-platform-driver/pull/46),
   [#47](https://github.com/mafredri/asustor-platform-driver/pull/47),
@@ -503,7 +503,7 @@ Same sounds as ADM, a ~2 kHz tone: one long beep (800 ms) when the daemon
 starts during boot, one short beep (200 ms) before a shutdown/restart,
 when a chassis LOCATE starts, and on alerts.
 
-**Requirements:** the asustor-platform-driver fork, `adm-parity` branch.
+**Requirements:** the asustor-platform-driver fork (`main`, v0.3 or later).
 The speaker sits behind Super I/O pin GP75; the driver claims that pin
 and registers its own buzzer input device, **"ASUSTOR Buzzer"** (phys
 `asustor/input0`), which plays tones on the PC speaker and opens the gate
@@ -522,10 +522,10 @@ same under "Buzzer"):
 
 | Warning says | Do |
 |---|---|
-| no buzzer gate ... needs the asustor-platform-driver fork | install the fork's `adm-parity` driver |
+| no buzzer gate ... needs the asustor-platform-driver fork | install the fork's driver (`main`, v0.3 or later) |
 | buzzer gate is disabled (`buzzer=0`) | reload `asustor.ko` without `buzzer=0` |
 | could not claim GP75 ... stale `/sys/class/gpio` export (`it87_gp75`) | unexport it and reload `asustor.ko` (the driver's `deploy.sh` does both) |
-| `buzzer_gate` is active but there is no "ASUSTOR Buzzer" input device | the loaded `asustor.ko` is an earlier `adm-parity` build that gated `pcspkr` instead; update the driver and reload it |
+| `buzzer_gate` is active but there is no "ASUSTOR Buzzer" input device | the loaded `asustor.ko` is a fork build from before v0.3 that gated `pcspkr` instead; update the driver and reload it |
 
 Both are re-checked before every beep, so fixing either takes effect
 without restarting the daemon (logged when the buzzer becomes ready).
@@ -534,7 +534,7 @@ without restarting the daemon (logged when the buzzer becomes ready).
 
 The pinhole button on the back is a plain GPIO input, not a hardware
 reset; ADM restores settings after it's held for ~5 s. With the platform
-driver's `adm-parity` branch it shows up as `KEY_VENDOR` (code 360) on the
+driver fork (v0.3 or later) it shows up as `KEY_VENDOR` (code 360) on the
 `asustor-keys` input device, next to the USB Copy button
 (`sudo evtest`, pick "asustor-keys"). `lcm-status` doesn't read it and
 nothing else on the system acts on it -- deliberately not `KEY_RESTART`,
@@ -577,7 +577,7 @@ up to the board:
 - **BIOS:** ErP/EuP (deep power saving) must be **off**, and wake on
   PCIe/PCI-E device or LAN **enabled**. With ErP on, the NICs lose standby
   power in soft-off and nothing can wake the box.
-  With the platform driver's `adm-parity` branch, the daemon reads
+  With the platform driver fork (v0.3 or later), the daemon reads
   `/sys/devices/platform/asustor/eup` (never writes it) and logs a WARNING
   at startup if EuP is on while `[wol] nics` or a `power_on` rule needs
   wake from soft-off; `lcm-status status` shows it (and

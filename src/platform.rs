@@ -1,5 +1,5 @@
 //! The board's power-related BIOS settings, as the platform driver
-//! (`adm-parity` branch) exposes them under `/sys/devices/platform/asustor`:
+//! fork (v0.3 or later) exposes them under `/sys/devices/platform/asustor`:
 //! `ac_power_resume` (`off`/`last`/`on`, what happens when power returns
 //! after a loss) and `eup` (`0`/`1`, ErP/EuP deep power saving).
 //!
