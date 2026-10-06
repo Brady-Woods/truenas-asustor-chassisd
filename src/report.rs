@@ -119,13 +119,13 @@ pub fn build(
 /// The BIOS power settings the platform driver exposes, if it does.
 fn platform_section(out: &mut String, cfg: &Config) {
     let settings = platform::PowerSettings::read();
-    let lines = settings.describe();
-    if lines.is_empty() {
+    let fields = settings.fields();
+    if fields.is_empty() {
         return;
     }
     out.push_str("-- Platform power (BIOS) --\n");
-    for line in lines {
-        let _ = writeln!(out, "  {line}");
+    for (label, value) in fields {
+        let _ = writeln!(out, "  {:<16} {value}", format!("{label}:"));
     }
     if let Some(warning) = platform::eup_warning(&settings, &platform::wake_sources(cfg)) {
         let _ = writeln!(out, "  WARNING: {warning}");

@@ -70,8 +70,9 @@ impl PowerSettings {
         self.eup.as_deref() == Some("1")
     }
 
-    /// Report lines; empty when the driver exposes neither file.
-    pub fn describe(&self) -> Vec<String> {
+    /// `(label, value)` per setting the driver exposes; empty when it
+    /// exposes neither file. `lcm-status status` aligns the values.
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         if let Some(resume) = &self.ac_power_resume {
             let meaning = match resume.as_str() {
@@ -80,7 +81,7 @@ impl PowerSettings {
                 "on" => " (power on when power returns)",
                 _ => "",
             };
-            out.push(format!("AC power resume: {resume}{meaning}"));
+            out.push(("AC power resume", format!("{resume}{meaning}")));
         }
         if let Some(eup) = &self.eup {
             let meaning = match eup.as_str() {
@@ -88,9 +89,17 @@ impl PowerSettings {
                 "1" => " (on: no standby power in soft-off)",
                 _ => "",
             };
-            out.push(format!("EuP:             {eup}{meaning}"));
+            out.push(("EuP", format!("{eup}{meaning}")));
         }
         out
+    }
+
+    /// One `label: value` line per setting, as the startup log shows them.
+    pub fn describe(&self) -> Vec<String> {
+        self.fields()
+            .into_iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect()
     }
 }
 
@@ -150,8 +159,13 @@ mod tests {
         assert_eq!(settings.ac_power_resume.as_deref(), Some("last"));
         assert_eq!(settings.eup.as_deref(), Some("0"));
         let lines = settings.describe();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("AC power resume: last"));
+        assert_eq!(
+            lines,
+            [
+                "AC power resume: last (return to the state before the power loss)",
+                "EuP: 0 (off)",
+            ]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
