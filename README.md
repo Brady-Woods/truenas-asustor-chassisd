@@ -481,11 +481,36 @@ alerts = true     # short beep on warn/error/critical alerts (max 1/min; only cr
 find_me = true    # short beep when a chassis LOCATE starts
 ```
 
-Same patterns as ADM: one long beep (800 ms) at boot, one short beep
-(200 ms) for power actions and alerts. ADM drives the speaker by toggling
-the speaker bits of port `0x61` at ~2 kHz with Super I/O pin GP75 high;
-the stock `pcspkr` driver is silent on this board (the timer clock is
-gated), so `buzzer.rs` does the same through `/dev/port`. Needs root.
+Same sounds as ADM, a ~2 kHz tone: one long beep (800 ms) when the daemon
+starts during boot, one short beep (200 ms) before a shutdown/restart,
+when a chassis LOCATE starts, and on alerts.
+
+**Requirements:** the asustor-platform-driver fork, `adm-parity` branch.
+The speaker sits behind Super I/O pin GP75; the driver claims that pin
+and registers its own buzzer input device, **"ASUSTOR Buzzer"** (phys
+`asustor/input0`), which plays tones on the PC speaker and opens the gate
+while one plays. `cat /sys/devices/platform/asustor/buzzer_gate` should
+say `active`. The stock `pcspkr` module isn't needed (if it's loaded, its
+"PC Speaker" device stays silent: the gate only opens for the driver's).
+
+Each beep is an `EV_SND`/`SND_TONE` 2000 Hz event to the ASUSTOR Buzzer's
+`/dev/input/eventN` (found by name in `/proc/bus/input/devices`, else
+`/sys/class/input`), a wait, and `SND_TONE` 0 (always sent). The daemon
+never touches GP75 itself.
+
+Otherwise it doesn't beep, and logs one warning saying why
+(`journalctl -u lcm-status | grep buzzer`; `lcm-status status` shows the
+same under "Buzzer"):
+
+| Warning says | Do |
+|---|---|
+| no buzzer gate ... needs the asustor-platform-driver fork | install the fork's `adm-parity` driver |
+| buzzer gate is disabled (`buzzer=0`) | reload `asustor.ko` without `buzzer=0` |
+| could not claim GP75 ... stale `/sys/class/gpio` export (`it87_gp75`) | unexport it and reload `asustor.ko` (the driver's `deploy.sh` does both) |
+| `buzzer_gate` is active but there is no "ASUSTOR Buzzer" input device | the loaded `asustor.ko` is an earlier `adm-parity` build that gated `pcspkr` instead; update the driver and reload it |
+
+Both are re-checked before every beep, so fixing either takes effect
+without restarting the daemon (logged when the buzzer becomes ready).
 
 ## Rear reset button (not used)
 
@@ -856,8 +881,8 @@ for every connected temp sensor (with its resolved threshold and current
 level), every pool, every drive bay's SMART state, and every physical
 NIC's link/monitoring status and Wake-on-LAN state, plus the power
 schedule's next events and RTC wake alarm (and a running shutdown
-countdown, if any), and the active
-socket override if any:
+countdown, if any), whether the buzzer can beep (and if not, why), and
+the active socket override if any:
 
 ```
 === lcm-status report ===
@@ -891,6 +916,9 @@ socket override if any:
   next power on:   Mon 2026-10-05 07:30 (in 2d 14h 55m, #1 power on weekdays 07:30)
   next power off:  Fri 2026-10-02 23:30 (in 6h 55m, #3 shutdown daily 23:30)
   RTC wake alarm:  set for Mon 2026-10-05 07:30
+
+-- Buzzer --
+  ready: 2000 Hz tones to /dev/input/event7 (ASUSTOR Buzzer)
 
 -- LCD link --
   412 text writes, 0 retried, 0 failed

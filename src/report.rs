@@ -73,6 +73,9 @@ pub fn build(
 
     platform_section(&mut out, cfg);
 
+    out.push_str("-- Buzzer --\n");
+    let _ = writeln!(out, "  {}\n", crate::buzzer::status(&cfg.buzzer));
+
     out.push_str("-- LCD link --\n");
     let _ = writeln!(
         out,

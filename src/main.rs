@@ -372,8 +372,10 @@ fn run_daemon(cfg_path: &Path) {
     // one power action the daemon doesn't start itself.
     if shutdown::requested() && system_is_stopping() {
         buzzer::powering_down();
-        buzzer::flush();
     }
+    // Waits out any queued beep, so none is cut short (or left sounding)
+    // by the exit.
+    buzzer::flush();
     // Last chance before a shutdown powers the box off (systemd stops
     // this service on the way down), in case anything reset WOL since the
     // last periodic recheck, or the RTC alarm isn't right yet.

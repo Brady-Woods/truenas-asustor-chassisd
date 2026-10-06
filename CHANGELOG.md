@@ -4,6 +4,33 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
 
 ## Unreleased
 
+### Changed
+- Buzzer: now driven only through the platform driver's own buzzer input
+  device, "ASUSTOR Buzzer" (asustor-platform-driver fork, `adm-parity`
+  branch). Each beep is an `EV_SND`/`SND_TONE` 2000 Hz event to it, a
+  wait, and `SND_TONE` 0 (always sent); the driver opens the GP75 gate by
+  itself while the tone plays. `pcspkr` isn't needed. Same patterns
+  and `[buzzer]` keys as 1.4.0.
+- Beeps only when `/sys/devices/platform/asustor/buzzer_gate` reads
+  `active` and the "ASUSTOR Buzzer" device exists (found by name).
+  Otherwise one WARNING names why (no gate: older driver; `disabled`:
+  `buzzer=0`; `unavailable`: a stale `it87_gp75` GPIO export when
+  `asustor.ko` loaded; gate active but no device: an earlier `adm-parity`
+  build, update and reload the driver). Re-checked before every beep, and
+  logged when the buzzer becomes ready. `lcm-status status` shows it under
+  "Buzzer".
+
+### Removed
+- 1.4.0's way of beeping: toggling port 0x61 through `/dev/port` with
+  GP75 exported through `/sys/class/gpio` for the daemon's lifetime. That
+  export kept the platform driver from claiming GP75 (so its gate could
+  never work), and the busy-wait tied up a CPU for each beep. The daemon
+  no longer touches `/dev/port` or `/sys/class/gpio` at all.
+
+### Upgrading from 1.4.0
+- Deploy the platform driver first (its `deploy.sh` removes 1.4.0's
+  stale `it87_gp75` export), then this version.
+
 ### Added
 - EuP / AC-loss check: reads the driver's
   `/sys/devices/platform/asustor/eup` and `ac_power_resume` (read-only;
