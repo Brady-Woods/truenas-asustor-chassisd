@@ -5,6 +5,7 @@ mod fan_calibrate;
 mod hal;
 mod led;
 mod monitor;
+mod platform;
 mod power;
 mod protocol;
 mod report;
@@ -348,6 +349,16 @@ fn run_daemon(cfg_path: &Path) {
             power.rules().len(),
             power.describe(power::now_epoch(), false).join("; ")
         ));
+    }
+
+    // Read-only: the daemon never changes these BIOS settings.
+    let platform = platform::PowerSettings::read();
+    let platform_lines = platform.describe();
+    if !platform_lines.is_empty() {
+        syslog::info(&format!("platform: {}", platform_lines.join("; ")));
+    }
+    if let Some(warning) = platform::eup_warning(&platform, &platform::wake_sources(&cfg)) {
+        syslog::warning(&warning);
     }
 
     // A panic in the event loop is caught only long enough to hand the

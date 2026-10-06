@@ -523,6 +523,11 @@ up to the board:
 - **BIOS:** ErP/EuP (deep power saving) must be **off**, and wake on
   PCIe/PCI-E device or LAN **enabled**. With ErP on, the NICs lose standby
   power in soft-off and nothing can wake the box.
+  With the platform driver's `adm-parity` branch, the daemon reads
+  `/sys/devices/platform/asustor/eup` (never writes it) and logs a WARNING
+  at startup if EuP is on while `[wol] nics` or a `power_on` rule needs
+  wake from soft-off; `lcm-status status` shows it (and
+  `ac_power_resume`) under "Platform power (BIOS)".
 - Works from **soft-off** (a normal shutdown -- the panel's SHUTDOWN, the
   TrueNAS UI, `poweroff`) and from suspend. Not after the power has been
   cut entirely (unplugged, a power failure) -- that's the BIOS's "restore

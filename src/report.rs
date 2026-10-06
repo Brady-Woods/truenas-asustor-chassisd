@@ -2,14 +2,16 @@
 //! (`lcm-status status`, see `socket.rs`/`main.rs`). Ties together
 //! `AppState::health_summary()` (the same computation that drives the
 //! status LED), live fan status lines, the power schedule's next events,
-//! and `hal::` reads for temps/bays/network -- all in one place, so this
-//! and the LED itself can never disagree about what's currently true.
+//! the platform driver's BIOS power settings, and `hal::` reads for
+//! temps/bays/network -- all in one place, so this and the LED itself can
+//! never disagree about what's currently true.
 
 // `write!` to a `String` can't fail, so its `fmt::Result` is ignored below.
 
 use crate::config::Config;
 use crate::fan::FanStatus;
 use crate::hal;
+use crate::platform;
 use crate::power::{self, Scheduler};
 use crate::protocol::LinkStats;
 use crate::state::AppState;
@@ -69,6 +71,8 @@ pub fn build(
     }
     out.push('\n');
 
+    platform_section(&mut out, cfg);
+
     out.push_str("-- LCD link --\n");
     let _ = writeln!(
         out,
@@ -99,6 +103,23 @@ pub fn build(
     );
 
     out
+}
+
+/// The BIOS power settings the platform driver exposes, if it does.
+fn platform_section(out: &mut String, cfg: &Config) {
+    let settings = platform::PowerSettings::read();
+    let lines = settings.describe();
+    if lines.is_empty() {
+        return;
+    }
+    out.push_str("-- Platform power (BIOS) --\n");
+    for line in lines {
+        let _ = writeln!(out, "  {line}");
+    }
+    if let Some(warning) = platform::eup_warning(&settings, &platform::wake_sources(cfg)) {
+        let _ = writeln!(out, "  WARNING: {warning}");
+    }
+    out.push('\n');
 }
 
 fn temperatures_section(out: &mut String, cfg: &Config) {

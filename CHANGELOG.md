@@ -2,6 +2,17 @@
 
 Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
 
+## Unreleased
+
+### Added
+- EuP / AC-loss check: reads the driver's
+  `/sys/devices/platform/asustor/eup` and `ac_power_resume` (read-only;
+  never written). Logs a WARNING at startup when EuP is on while
+  Wake-on-LAN or a `power_on` schedule rule needs wake from soft-off, and
+  shows both values (and that warning) in `lcm-status status` under
+  "Platform power (BIOS)". Nothing changes with a driver that doesn't
+  provide them.
+
 ## 1.4.0 -- 2026-10-02
 
 ### Added
