@@ -707,14 +707,20 @@ fn trigger_registered(name: &str) -> bool {
     })
 }
 
-/// Checks for the same asustor-platform-driver (nas-deploy branch: main +
-/// PRs #46/#47/#48) effects `deploy.sh` gates on before building at all.
-/// This is defense-in-depth for the case where the binary gets started
-/// some other way than `deploy.sh` (e.g. by hand, or a differently-set-up
+/// Checks for the same asustor-platform-driver (fork, `adm-parity`
+/// branch) effects `deploy.sh` gates on before building at all: the
+/// `asustor` platform device's directory (always there while the module
+/// is loaded on a supported board) and the LEDs this daemon drives. This
+/// is defense-in-depth for the case where the binary gets started some
+/// other way than `deploy.sh` (e.g. by hand, or a differently-set-up
 /// systemd unit) -- everything here should already be guaranteed by the
 /// time deploy.sh's own check has passed.
+///
+/// (`/sys/class/leds/power:lcd` used to be the marker. The driver no
+/// longer has it: the LCD's power is a rail now, `lcd_power`, switched on
+/// and held by the driver -- see `crate::platform::lcd_power`.)
 pub fn driver_present() -> bool {
-    Path::new("/sys/class/leds/power:lcd").is_dir()
+    Path::new(crate::platform::PLATFORM_DIR).is_dir()
         && Path::new("/sys/class/leds/sata1:red:disk").is_dir()
         && Path::new("/sys/class/leds/green:status").is_dir()
 }

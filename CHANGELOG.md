@@ -19,6 +19,13 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
   build, update and reload the driver). Re-checked before every beep, and
   logged when the buzzer becomes ready. `lcm-status status` shows it under
   "Buzzer".
+- Platform driver detection (startup warning and `deploy.sh`): by the
+  `/sys/devices/platform/asustor` directory instead of the
+  `/sys/class/leds/power:lcd` LED, which the `adm-parity` driver no longer
+  has (LCD power is now its `lcd_power` rail, switched on and held by the
+  driver). The daemon still never switches LCD power; night mode keeps
+  using the panel's display-off command. `lcm-status status` shows
+  `lcd_power` under "Front panel".
 
 ### Removed
 - 1.4.0's way of beeping: toggling port 0x61 through `/dev/port` with

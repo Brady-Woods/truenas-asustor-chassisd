@@ -13,7 +13,33 @@
 use crate::config::Config;
 use std::path::Path;
 
-const PLATFORM_DIR: &str = "/sys/devices/platform/asustor";
+/// The `asustor` platform device. Exists whenever the module is loaded on
+/// a supported board, so it's also how the driver is detected (see
+/// `led::driver_present`).
+pub const PLATFORM_DIR: &str = "/sys/devices/platform/asustor";
+
+/// The LCD power rail, as `lcm-status status` shows it: the driver's
+/// `lcd_power` (`1`/`0`), which it switches on and holds. **Never
+/// written here** -- `0` cuts the whole LCD module, its MCU and so the
+/// front-panel buttons included; night mode uses the panel's own
+/// display-off command instead.
+pub fn lcd_power() -> String {
+    lcd_power_in(Path::new(PLATFORM_DIR))
+}
+
+fn lcd_power_in(dir: &Path) -> String {
+    if !dir.is_dir() {
+        return "unknown (platform driver not loaded)".into();
+    }
+    match std::fs::read_to_string(dir.join("lcd_power")) {
+        Ok(v) => match v.trim() {
+            "1" => "on (lcd_power = 1, held by the driver)".into(),
+            "0" => "OFF (lcd_power = 0: the panel and its buttons are dead)".into(),
+            other => format!("lcd_power = {other}"),
+        },
+        Err(_) => "not exposed by this driver (no lcd_power)".into(),
+    }
+}
 
 /// What the driver reports; `None` where a file doesn't exist (an older
 /// driver, or a board it doesn't know these for).
@@ -126,6 +152,19 @@ mod tests {
         let lines = settings.describe();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("AC power resume: last"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lcd_power_is_read_not_written() {
+        assert!(lcd_power_in(Path::new("/nonexistent")).contains("not loaded"));
+        let dir = std::env::temp_dir().join(format!("lcm-status-lcd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(lcd_power_in(&dir).contains("not exposed"));
+        std::fs::write(dir.join("lcd_power"), "1\n").unwrap();
+        assert!(lcd_power_in(&dir).starts_with("on"));
+        std::fs::write(dir.join("lcd_power"), "0\n").unwrap();
+        assert!(lcd_power_in(&dir).starts_with("OFF"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

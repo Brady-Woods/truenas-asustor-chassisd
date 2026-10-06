@@ -1117,9 +1117,10 @@ impl AppState {
             // spin up sleeping drives.
             self.refresh_stale();
             // Blanks the text but leaves the panel's own MCU powered --
-            // unlike cutting power:lcd, which also kills the MCU (and so,
-            // its ability to report a button press at all: confirmed live,
-            // zero serial frames arrive while power:lcd is 0). This is the
+            // unlike cutting the LCD power rail (`lcd_power`), which also
+            // kills the MCU (and so, its ability to report a button press
+            // at all: confirmed live, zero serial frames arrive while it's
+            // 0). This is the
             // whole point: night mode has to stay wakeable by a button.
             // A chassis locate is the one thing shown anyway, without
             // waking the rest of the panel.

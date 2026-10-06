@@ -314,9 +314,9 @@ fn run_daemon(cfg_path: &Path) {
     // instead of silently invisible.
     if !led::driver_present() {
         eprintln!(
-            "WARNING: asustor-platform-driver (nas-deploy branch: main + PRs #46/#47/#48, \
-             https://github.com/mafredri/asustor-platform-driver/pulls) not detected -- \
-             LED control (bay/status LEDs, LCD sleep) will silently no-op. \
+            "WARNING: asustor-platform-driver (fork, adm-parity branch: \
+             https://github.com/Brady-Woods/asustor-platform-driver) not detected -- \
+             LED control (bay/status LEDs) will silently no-op. \
              LCD text/menu still works. Run deploy.sh, which checks this before building."
         );
     }
@@ -508,7 +508,8 @@ fn event_loop(
 }
 
 /// The MCU reports its firmware version unprompted when it boots -- after a
-/// power blip on `power:lcd` (e.g. the platform driver being reloaded), or
+/// power blip on the LCD's power rail (e.g. an older platform driver being
+/// reloaded), or
 /// a reset of its own. It then shows its own boot text and has forgotten
 /// the init sequence, while `Lcm`'s caches still think our text is up: so
 /// redo the init and forget the caches, and the next render redraws.

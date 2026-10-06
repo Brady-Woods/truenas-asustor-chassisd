@@ -2,9 +2,9 @@
 //! (`lcm-status status`, see `socket.rs`/`main.rs`). Ties together
 //! `AppState::health_summary()` (the same computation that drives the
 //! status LED), live fan status lines, the power schedule's next events,
-//! the platform driver's BIOS power settings, and `hal::` reads for
-//! temps/bays/network -- all in one place, so this and the LED itself can
-//! never disagree about what's currently true.
+//! the platform driver's BIOS power settings and LCD power rail, and
+//! `hal::` reads for temps/bays/network -- all in one place, so this and
+//! the LED itself can never disagree about what's currently true.
 
 // `write!` to a `String` can't fail, so its `fmt::Result` is ignored below.
 
@@ -72,6 +72,9 @@ pub fn build(
     out.push('\n');
 
     platform_section(&mut out, cfg);
+
+    out.push_str("-- Front panel --\n");
+    let _ = writeln!(out, "  LCD power:      {}\n", platform::lcd_power());
 
     out.push_str("-- Buzzer --\n");
     let _ = writeln!(out, "  {}\n", crate::buzzer::status(&cfg.buzzer));

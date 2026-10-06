@@ -247,7 +247,8 @@ pub struct SleepConfig {
     pub end: String,
     /// Switch the LCD's display (backlight included) off while asleep,
     /// rather than only blanking its text and leaving the backlight glow.
-    /// Uses the panel's own display-off command, not `power:lcd`, so the
+    /// Uses the panel's own display-off command, not the LCD power rail
+    /// (the platform driver's `lcd_power`, never written here), so the
     /// panel's MCU stays powered and a button press still wakes it.
     pub lcd_off: bool,
 }

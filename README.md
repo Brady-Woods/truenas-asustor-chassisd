@@ -15,12 +15,19 @@ daemon anyway -- see "Fan control" below for why.)
 
 ## Requirements
 
-- **[mafredri/asustor-platform-driver](https://github.com/mafredri/asustor-platform-driver), branch `nas-deploy`** (main + [PR #46](https://github.com/mafredri/asustor-platform-driver/pull/46), [#47](https://github.com/mafredri/asustor-platform-driver/pull/47), [#48](https://github.com/mafredri/asustor-platform-driver/pull/48)).
-  All of the LED functionality (bay LEDs, status LED, LCD power/sleep) goes
-  through the `/sys/class/leds` interface this driver creates. Stock TrueNAS
-  SCALE does not include it. `deploy.sh` checks for it (kernel module
-  loaded + expected LED class devices present) before doing anything else,
-  and refuses to proceed if it's missing.
+- **The [asustor-platform-driver fork](https://github.com/Brady-Woods/asustor-platform-driver), branch `adm-parity`**
+  (a fork of [mafredri/asustor-platform-driver](https://github.com/mafredri/asustor-platform-driver):
+  upstream plus [PR #46](https://github.com/mafredri/asustor-platform-driver/pull/46),
+  [#47](https://github.com/mafredri/asustor-platform-driver/pull/47),
+  [#48](https://github.com/mafredri/asustor-platform-driver/pull/48) and the
+  ADM-parity changes: buzzer device, LCD power rail, power settings, reset
+  button). All of the LED functionality (bay LEDs, status LED) goes through
+  the `/sys/class/leds` interface this driver creates, and the buzzer
+  through its "ASUSTOR Buzzer" input device. Stock TrueNAS SCALE does not
+  include it. `deploy.sh` checks for it (kernel module loaded,
+  `/sys/devices/platform/asustor` and the expected LED class devices
+  present) before doing anything else, and refuses to proceed if it's
+  missing.
 - Docker (TrueNAS's own Apps/Docker subsystem) -- used only to build in a
   throwaway `rust:alpine` container. Nothing is installed on the host
   toolchain-wise.
@@ -179,19 +186,19 @@ serial opcode for "start scrolling" anywhere in the protocol. ADM's own
 ## LCD power (sleep mode)
 
 The LCD's power is **not** part of the serial protocol at all -- it's a
-separate GPIO line, already exposed cleanly by the platform driver as a
-standard LED-class device:
+separate GPIO line, a power rail that the platform driver switches on when
+it loads and holds on. It shows it as
+`/sys/devices/platform/asustor/lcd_power` (`1`/`0`); older driver builds
+had it as the LED `/sys/class/leds/power:lcd` instead, which no longer
+exists.
 
-```sh
-echo 0 > /sys/class/leds/power:lcd/brightness   # off
-echo 1 > /sys/class/leds/power:lcd/brightness   # on
-```
-
-Toggling it **power-cycles the LCD's own MCU, not just a backlight** --
+Cutting it **power-cycles the LCD's own MCU, not just a backlight** --
 confirmed live: zero serial frames (including a button press) arrive from
-the panel for as long as it's held at 0. That makes it unusable for this
+the panel for as long as it's off. That makes it unusable for this
 project's actual goal: a schedule-driven "night mode" that a button press
-can still interrupt. So `lcm-status` never touches this GPIO at all.
+can still interrupt. So `lcm-status` never writes it; `lcm-status status`
+only shows it, under "Front panel" (`LCD power: on (lcd_power = 1, held by
+the driver)`).
 
 Instead, `[sleep]` uses the panel's own **display-off command**, `0x11`
 with payload `0x00` -- the same command whose `0x01` form is init step 1.
@@ -214,10 +221,6 @@ the panel is showing. To keep that from drifting -- e.g. the panel's MCU
 resetting and showing its own boot text -- both lines are resent every
 60s regardless, and when the MCU reports its firmware version (which it
 does on boot) the init sequence is redone and everything redrawn.
-
-Per `asustord`'s own `LED-MODES.md`, `power:lcd` should **only** be used
-by this project's own logic if at all -- other LED "night mode" logic
-explicitly avoids it for the same reboot-on-toggle reason.
 
 ## Front LEDs
 
@@ -881,7 +884,7 @@ for every connected temp sensor (with its resolved threshold and current
 level), every pool, every drive bay's SMART state, and every physical
 NIC's link/monitoring status and Wake-on-LAN state, plus the power
 schedule's next events and RTC wake alarm (and a running shutdown
-countdown, if any), whether the buzzer can beep (and if not, why), and
+countdown, if any), the LCD power rail, whether the buzzer can beep (and if not, why), and
 the active socket override if any:
 
 ```
@@ -916,6 +919,9 @@ the active socket override if any:
   next power on:   Mon 2026-10-05 07:30 (in 2d 14h 55m, #1 power on weekdays 07:30)
   next power off:  Fri 2026-10-02 23:30 (in 6h 55m, #3 shutdown daily 23:30)
   RTC wake alarm:  set for Mon 2026-10-05 07:30
+
+-- Front panel --
+  LCD power:      on (lcd_power = 1, held by the driver)
 
 -- Buzzer --
   ready: 2000 Hz tones to /dev/input/event7 (ASUSTOR Buzzer)

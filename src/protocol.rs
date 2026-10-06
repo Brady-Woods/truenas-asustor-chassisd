@@ -31,8 +31,9 @@ const SUB_SET_TEXT: u8 = 0x27;
 /// whole display, backlight included, while the MCU stays powered: it
 /// still reports key presses, and turns the display back on by itself
 /// when one comes in (confirmed live 2026-10-02). ADM's `lcmd` uses it the
-/// same way for its own idle timeout -- unlike cutting `power:lcd`, which
-/// also silences the buttons.
+/// same way for its own idle timeout -- unlike cutting the LCD's power
+/// rail (the platform driver's `lcd_power`), which also silences the
+/// buttons.
 const SUB_DISPLAY: u8 = 0x11;
 /// Step 2 of the power-on sequence. `lcmd` also sends it leaving its
 /// menu, so probably "edit cursor off".
