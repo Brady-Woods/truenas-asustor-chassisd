@@ -205,6 +205,22 @@ pub enum StatusPattern {
     Off,
 }
 
+impl StatusPattern {
+    /// How alarming a pattern is, for picking the most critical of several
+    /// active alarms (`alarm::most_critical`). Not `Level` order: the
+    /// factory RAID-degraded pattern sits between amber and solid red.
+    /// 0 for the patterns that aren't alarms at all.
+    pub fn severity(self) -> u8 {
+        match self {
+            StatusPattern::Ok | StatusPattern::Locate | StatusPattern::Off => 0,
+            StatusPattern::Warning => 1,
+            StatusPattern::Degraded => 2,
+            StatusPattern::Failed => 3,
+            StatusPattern::CriticalFlashing => 4,
+        }
+    }
+}
+
 pub fn set_status(pattern: StatusPattern) {
     match pattern {
         StatusPattern::Ok => {

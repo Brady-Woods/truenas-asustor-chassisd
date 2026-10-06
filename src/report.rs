@@ -91,6 +91,16 @@ pub fn build(
         lcd.writes, lcd.retries, lcd.failures
     );
 
+    out.push_str("-- On the LCD and LED --\n");
+    let _ = writeln!(
+        out,
+        "  {}\n",
+        state
+            .alarm_summary()
+            .as_deref()
+            .unwrap_or("no alarm: the status screens rotate")
+    );
+
     out.push_str("-- Active override --\n");
     let active = state.override_summary();
     let _ = writeln!(out, "  {}\n", active.as_deref().unwrap_or("none"));
@@ -112,6 +122,9 @@ pub fn build(
         summary.pool_faulted,
         summary.bay_failed,
     );
+    for a in &summary.alarms {
+        let _ = writeln!(out, "  alarm [{:?}]: {} / {}", a.level, a.line0, a.line1);
+    }
 
     out
 }

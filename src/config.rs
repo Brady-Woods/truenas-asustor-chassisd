@@ -623,13 +623,13 @@ impl Default for TempThresholdOverride {
 ///   own ceiling, not a margin below it, since composite temp already *is*
 ///   the number WD says not to exceed.
 ///
-/// **Not included, deliberately:** the AQC113 NIC's board-level PHY/MAC
-/// temperature sensors. No public datasheet with a numeric junction/case
-/// limit was found for this chip (Marvell's technical datasheets aren't
-/// publicly indexed the way Intel's/WD's are) -- rather than fabricate a
-/// specific-looking number with no real source, this chip falls back to
-/// the global `warn_threshold`/`critical_threshold` default. Worth
-/// revisiting if Marvell's actual datasheet ever turns up.
+/// - **enp9s0** (Marvell/Aquantia AQC113 10GbE card, `atlantic` driver):
+///   its PHY and MAC temperature sensors share one hwmon device that the
+///   driver names after the interface, so this is the card's interface name
+///   on this board. No public datasheet with a numeric limit was found, so
+///   these are ADM's own LAN-chip temperature curve for platforms that read
+///   one (70/80/100C, emergency above 101C; see the teardown's
+///   `emboardmand.md`): warn at 80C, critical at 100C.
 pub fn default_temp_thresholds() -> Vec<TempThresholdOverride> {
     vec![
         TempThresholdOverride {
@@ -646,6 +646,11 @@ pub fn default_temp_thresholds() -> Vec<TempThresholdOverride> {
             chip: "nvme".to_string(),
             warn_threshold: 60.0,
             critical_threshold: 70.0,
+        },
+        TempThresholdOverride {
+            chip: "enp9s0".to_string(),
+            warn_threshold: 80.0,
+            critical_threshold: 100.0,
         },
     ]
 }
@@ -676,9 +681,7 @@ impl Default for TemperatureConfig {
         TemperatureConfig {
             units: TempUnits::C,
             // Fallback for whatever `thresholds` doesn't cover -- mainly
-            // the ACPI thermal zone and the AQC113 NIC's sensors on this
-            // board (see default_temp_thresholds() for why the NIC has no
-            // dedicated, datasheet-sourced entry of its own). Observed
+            // the ACPI thermal zone and the board's IT8625 sensors. Observed
             // live (2026-09-23): CPU package temp normally sits 57-67C
             // under everyday load -- since CPU now has its own
             // datasheet-sourced entry in `thresholds`, that observation no
@@ -904,6 +907,17 @@ pub fn default_fans() -> Vec<FanProfile> {
                 min_resample_secs: Some(30),
                 min_temp_c: Some(60.0),
                 max_temp_c: Some(70.0),
+                ..Default::default()
+            },
+            // The AQC113 10GbE card's PHY/MAC (one hwmon device, named
+            // after the interface; the max of the two counts). ADM's own
+            // LAN-chip curve starts at 70C and reaches full speed at
+            // 100C, which is also this chip's critical threshold.
+            SensorSelector {
+                chip: "enp9s0".to_string(),
+                min_resample_secs: Some(10),
+                min_temp_c: Some(70.0),
+                max_temp_c: Some(100.0),
                 ..Default::default()
             },
         ],
@@ -1349,5 +1363,18 @@ mod tests {
 
         assert!(!window("22:00", "nope").contains((23, 0)));
         assert!(!window("10:00", "10:00").contains((10, 0)));
+    }
+
+    #[test]
+    fn the_aqc113_has_thresholds_and_a_fan_sensor() {
+        let cfg = Config::default();
+        assert_eq!(
+            resolve_temp_threshold(&cfg.temperature, "enp9s0"),
+            (80.0, 100.0)
+        );
+        let sensor = cfg.fans[0].sensors.iter().find(|s| s.chip == "enp9s0");
+        let sensor = sensor.expect("AQC113 sensor on the default fan");
+        // Full speed exactly at its critical threshold.
+        assert_eq!(sensor.max_temp_c, Some(100.0));
     }
 }

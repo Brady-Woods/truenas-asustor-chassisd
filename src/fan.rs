@@ -44,7 +44,13 @@
 //! goes through the same kick/stall/RPM-health handling, still holds
 //! `max_pwm` if every sensor stops reading, and still goes to `max_pwm`
 //! while any of its sensors is at a critical temperature (see
-//! `fixed_target`).
+//! `update_critical_override`).
+//!
+//! That critical override applies in both modes: whatever the curve (or
+//! the fixed speed) says, a sensor at or above its critical threshold
+//! pegs the fan at `max_pwm` until everything is back below warning. A
+//! curve's own endpoints may be tuned to hit `max_pwm` there anyway, but
+//! the guarantee shouldn't depend on them being kept in sync.
 //!
 //! `lcm-status fan-profile` (`fan_calibrate.rs`) is the discovery
 //! counterpart to `pwmconfig`: it finds which pwm outputs and sensors
@@ -190,8 +196,8 @@ pub struct FanController {
     /// selector's chip, resolved once from `[temperature]` -- what a
     /// fixed-mode fan's critical override goes by.
     thresholds: Vec<(f32, f32)>,
-    /// Fixed mode only: true while a critical temperature has the fan
-    /// overridden to `max_pwm` -- see `fixed_target`.
+    /// True while a critical temperature has the fan overridden to
+    /// `max_pwm` -- see `update_critical_override`.
     critical_override: bool,
     /// When this fan's own curve was last (re)evaluated -- each profile
     /// has its own `update_secs`, so this is owned per-controller rather
@@ -226,10 +232,11 @@ impl FanController {
                 .map_or_else(|| "--".to_string(), |r| format!("{r:.0}rpm")),
             _ => "--".to_string(),
         };
-        let mode = match self.profile.mode {
-            FanMode::Curve => "",
-            FanMode::Fixed if self.critical_override => " fixed, critical-temp override",
-            FanMode::Fixed => " fixed",
+        let mode = match (self.profile.mode, self.critical_override) {
+            (FanMode::Curve, false) => "",
+            (FanMode::Curve, true) => " critical-temp override",
+            (FanMode::Fixed, false) => " fixed",
+            (FanMode::Fixed, true) => " fixed, critical-temp override",
         };
         format!(
             "{} (pwm{}): pwm={pwm} ({pct}%) {rpm} [{:?}]{mode}",
@@ -440,6 +447,45 @@ impl FanController {
         }
     }
 
+    /// Pegs the fan at `max_pwm` from the moment any sensor reaches its
+    /// critical threshold until every sensor is back below its *warning*
+    /// threshold. The gap between the two is hysteresis, so a sensor
+    /// hovering at its critical point doesn't flip the fan between quiet
+    /// and full speed every few seconds -- and once something has gotten
+    /// that hot, it should be properly cooled, not just nudged back under
+    /// the line. Logged on both transitions. Returns whether it's active.
+    fn update_critical_override(&mut self, readings: &[(usize, f32)]) -> bool {
+        let hot = readings
+            .iter()
+            .copied()
+            .find(|&(i, t)| t >= self.thresholds[i].1);
+        if let Some((i, temp_c)) = hot {
+            if !self.critical_override {
+                self.critical_override = true;
+                let what = match self.profile.mode {
+                    FanMode::Curve => "the curve",
+                    FanMode::Fixed => "fixed pwm",
+                };
+                crate::syslog::warning(&format!(
+                    "fan '{}' (pwm{}): {} at {temp_c:.1}C, at/above its critical {:.1}C -- \
+                     overriding {what} to max_pwm until everything is below warning",
+                    self.profile.name,
+                    self.profile.pwm_index,
+                    self.profile.sensors[i].chip,
+                    self.thresholds[i].1
+                ));
+            }
+        } else if self.critical_override && readings.iter().all(|&(i, t)| t < self.thresholds[i].0)
+        {
+            self.critical_override = false;
+            crate::syslog::notice(&format!(
+                "fan '{}' (pwm{}): all sensors below warning, back to normal control",
+                self.profile.name, self.profile.pwm_index
+            ));
+        }
+        self.critical_override
+    }
+
     /// Rereads each sensor selector whose own resample interval is up --
     /// fast for CPU, which can spike quickly; slower for drive/NVMe temps,
     /// which change slowly and don't need hammering.
@@ -482,9 +528,17 @@ impl FanController {
     /// raw temperature first) is what makes that actually work: a drive at
     /// 61C against a 45-90C shared curve would only compute to a modest
     /// partial speed, nowhere near the full-speed response its own 60C
-    /// critical threshold warrants.
-    fn curve_target(&self) -> Option<u8> {
-        self.readings()
+    /// critical threshold warrants. On top of that, a sensor at its critical
+    /// threshold pegs the fan regardless (`update_critical_override`).
+    fn curve_target(&mut self) -> Option<u8> {
+        let readings = self.readings();
+        if readings.is_empty() {
+            return None;
+        }
+        if self.update_critical_override(&readings) {
+            return Some(self.profile.max_pwm);
+        }
+        readings
             .into_iter()
             .map(|(i, temp_c)| {
                 let sel = &self.profile.sensors[i];
@@ -495,43 +549,14 @@ impl FanController {
             .max()
     }
 
-    /// Fixed mode: `fixed_pwm`, overridden to `max_pwm` from the moment
-    /// any sensor reaches its critical threshold until every sensor is
-    /// back below its *warning* threshold. The gap between the two is
-    /// hysteresis, so a drive hovering at its critical point doesn't flip
-    /// the fan between quiet and full speed every few seconds -- and once
-    /// something has gotten that hot, it should be properly cooled, not
-    /// just nudged back under the line. Logged on both transitions.
+    /// Fixed mode: `fixed_pwm`, unless a critical temperature has
+    /// `update_critical_override` pegging the fan at `max_pwm`.
     fn fixed_target(&mut self) -> Option<u8> {
         let readings = self.readings();
         if readings.is_empty() {
             return None;
         }
-        let hot = readings
-            .iter()
-            .copied()
-            .find(|&(i, t)| t >= self.thresholds[i].1);
-        if let Some((i, temp_c)) = hot {
-            if !self.critical_override {
-                self.critical_override = true;
-                crate::syslog::warning(&format!(
-                    "fan '{}' (pwm{}): {} at {temp_c:.1}C, at/above its critical {:.1}C -- \
-                     overriding fixed pwm to max_pwm until everything is below warning",
-                    self.profile.name,
-                    self.profile.pwm_index,
-                    self.profile.sensors[i].chip,
-                    self.thresholds[i].1
-                ));
-            }
-        } else if self.critical_override && readings.iter().all(|&(i, t)| t < self.thresholds[i].0)
-        {
-            self.critical_override = false;
-            crate::syslog::notice(&format!(
-                "fan '{}' (pwm{}): all sensors below warning, back to fixed pwm",
-                self.profile.name, self.profile.pwm_index
-            ));
-        }
-        Some(if self.critical_override {
+        Some(if self.update_critical_override(&readings) {
             self.profile.max_pwm
         } else {
             // Validated present for an enabled fixed-mode fan; full speed
@@ -933,6 +958,70 @@ mod tests {
         // The CPU's critical point is its own (100C), not the drive's.
         assert_eq!(fixed_with(&mut c, Some(40.0), Some(99.0)), Some(100));
         assert_eq!(fixed_with(&mut c, Some(40.0), Some(100.0)), Some(255));
+    }
+
+    /// A curve-mode fan whose drive endpoints are deliberately *above* the
+    /// drive's critical threshold (60C), so only the override can peg it.
+    fn curve_controller() -> FanController {
+        new_controller(FanProfile {
+            sensors: vec![
+                SensorSelector {
+                    chip: "drivetemp".into(),
+                    min_temp_c: Some(50.0),
+                    max_temp_c: Some(80.0),
+                    ..SensorSelector::default()
+                },
+                SensorSelector {
+                    chip: "coretemp".into(),
+                    ..SensorSelector::default()
+                },
+            ],
+            ..cfg()
+        })
+    }
+
+    fn curve_with(c: &mut FanController, drive: Option<f32>, cpu: Option<f32>) -> Option<u8> {
+        c.sensor_cache = vec![(Some(Instant::now()), drive), (Some(Instant::now()), cpu)];
+        c.curve_target()
+    }
+
+    #[test]
+    fn curve_mode_pegs_at_a_critical_temp_whatever_the_curve_endpoints() {
+        let mut c = curve_controller();
+        let below = curve_with(&mut c, Some(59.0), Some(40.0)).unwrap();
+        assert!(below < 255, "got {below}");
+        assert_eq!(curve_with(&mut c, Some(60.0), Some(40.0)), Some(255));
+        assert!(c.status_line().contains("critical-temp override"));
+        // Still pegged under critical but above the drive's 50C warning...
+        assert_eq!(curve_with(&mut c, Some(55.0), Some(40.0)), Some(255));
+        // ...and back on the curve once everything is below warning.
+        let after = curve_with(&mut c, Some(49.0), Some(40.0)).unwrap();
+        assert!(after < 255, "got {after}");
+        assert!(!c.status_line().contains("override"));
+    }
+
+    #[test]
+    fn a_hot_nic_pegs_the_default_fan() {
+        // The AQC113's PHY/MAC sensor: critical at 100C, ADM's LAN curve.
+        let cfg = crate::config::Config::default();
+        let temperature = &cfg.temperature;
+        let mut c = FanController::new(cfg.fans[0].clone(), temperature);
+        let nic = cfg
+            .fans[0]
+            .sensors
+            .iter()
+            .position(|s| s.chip == "enp9s0")
+            .expect("default fan has an AQC113 sensor");
+        let mut feed = |temp: Option<f32>| {
+            let mut cache = vec![(Some(Instant::now()), None); c.sensor_cache.len()];
+            cache[nic] = (Some(Instant::now()), temp);
+            c.sensor_cache = cache;
+            c.curve_target()
+        };
+        let warm = feed(Some(72.0)).unwrap();
+        assert!(warm < 255, "got {warm}");
+        assert_eq!(feed(Some(100.0)), Some(255));
+        assert_eq!(feed(Some(85.0)), Some(255)); // above warning: stays pegged
     }
 
     #[test]

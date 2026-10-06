@@ -1,3 +1,4 @@
+mod alarm;
 mod buzzer;
 mod config;
 mod fan;

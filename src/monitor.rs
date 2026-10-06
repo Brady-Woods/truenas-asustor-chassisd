@@ -21,12 +21,20 @@ use crate::socket::Level;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// One sensor as of the last sweep.
+#[derive(Debug, Clone)]
+struct TempState {
+    level: Level,
+    chip: String,
+    temp_c: f32,
+}
+
 pub struct HealthMonitor {
     /// Keyed by the same description string `all_connected_temps` logs
     /// with -- fine as a map key (stable per sensor across calls; only
     /// changes if the sensor's label/chip itself changes, which would
     /// mean it's a different sensor anyway).
-    temp_levels: HashMap<String, Level>,
+    temps: HashMap<String, TempState>,
     pool_healths: HashMap<String, String>,
     bay_states: HashMap<u32, BayState>,
     /// Temp monitoring runs on its own clock (`maybe_check_temps`),
@@ -40,7 +48,7 @@ pub struct HealthMonitor {
 impl HealthMonitor {
     pub fn new() -> Self {
         HealthMonitor {
-            temp_levels: HashMap::new(),
+            temps: HashMap::new(),
             pool_healths: HashMap::new(),
             bay_states: HashMap::new(),
             last_temp_check: None,
@@ -50,17 +58,20 @@ impl HealthMonitor {
     /// Call every tick; a no-op except once every `temperature_min_secs`
     /// (reusing that floor for monitoring cadence even though, unlike the
     /// temperature *screen*, this never skips based on `cfg.screens.*`).
-    pub fn maybe_check_temps(&mut self, cfg: &crate::config::Config) {
+    /// Returns whether it checked, i.e. whether the readings may have
+    /// changed.
+    pub fn maybe_check_temps(&mut self, cfg: &crate::config::Config) -> bool {
         let interval = Duration::from_secs(cfg.refresh.temperature_min_secs.max(1));
         let due = match self.last_temp_check {
             None => true,
             Some(t) => t.elapsed() >= interval,
         };
         if !due {
-            return;
+            return false;
         }
         self.last_temp_check = Some(Instant::now());
         self.check_temps(&cfg.temperature);
+        true
     }
 
     /// Every currently-connected temp sensor on the box (not just what a
@@ -69,36 +80,52 @@ impl HealthMonitor {
     /// `critical_threshold` fallback -- see `config::default_temp_thresholds`
     /// for why a CPU/HDD/NVMe shouldn't share one pair. A sensor that drops
     /// out of the connected set entirely (module reload, disk removed)
-    /// just stops being tracked -- not treated as a return to "normal",
-    /// since it isn't a real reading.
+    /// stops being tracked -- not treated as a return to "normal", since
+    /// it isn't a real reading, and its last reading mustn't keep alarming.
     fn check_temps(&mut self, cfg: &TemperatureConfig) {
-        for (chip, label, temp_c) in all_connected_temps() {
+        let temps = all_connected_temps();
+        self.temps
+            .retain(|label, _| temps.iter().any(|(_, l, _)| l == label));
+        for (chip, label, temp_c) in temps {
             let (warn, crit) = crate::config::resolve_temp_threshold(cfg, &chip);
+            self.note_temp(&label, &chip, temp_c, (warn, crit));
+        }
+    }
 
-            let level = if temp_c >= crit {
-                Level::Critical
-            } else if temp_c >= warn {
-                Level::Warn
-            } else {
-                Level::Info
-            };
-            let prev = self.temp_levels.insert(label.clone(), level);
-            if prev == Some(level) {
-                continue; // no change
-            }
-            match level {
-                Level::Critical => crate::syslog::critical(&format!(
-                    "{label}: {temp_c:.1}C, at or above critical threshold ({crit:.1}C)"
-                )),
-                Level::Warn => crate::syslog::warning(&format!(
-                    "{label}: {temp_c:.1}C, at or above warning threshold ({warn:.1}C)"
-                )),
-                _ => {
-                    if prev.is_some() {
-                        crate::syslog::notice(&format!(
-                            "{label}: back to {temp_c:.1}C, below warning threshold"
-                        ));
-                    }
+    /// Records one sensor's reading against its `(warn, crit)` thresholds,
+    /// logging the transition if its level changed.
+    pub fn note_temp(&mut self, label: &str, chip: &str, temp_c: f32, (warn, crit): (f32, f32)) {
+        let level = if temp_c >= crit {
+            Level::Critical
+        } else if temp_c >= warn {
+            Level::Warn
+        } else {
+            Level::Info
+        };
+        let prev = self.temps.insert(
+            label.to_string(),
+            TempState {
+                level,
+                chip: chip.to_string(),
+                temp_c,
+            },
+        );
+        let prev = prev.map(|p| p.level);
+        if prev == Some(level) {
+            return; // no change
+        }
+        match level {
+            Level::Critical => crate::syslog::critical(&format!(
+                "{label}: {temp_c:.1}C, at or above critical threshold ({crit:.1}C)"
+            )),
+            Level::Warn => crate::syslog::warning(&format!(
+                "{label}: {temp_c:.1}C, at or above warning threshold ({warn:.1}C)"
+            )),
+            _ => {
+                if prev.is_some() {
+                    crate::syslog::notice(&format!(
+                        "{label}: back to {temp_c:.1}C, below warning threshold"
+                    ));
                 }
             }
         }
@@ -109,11 +136,20 @@ impl HealthMonitor {
     /// transition-gated like the logging above (the LED always reflects
     /// "right now", syslog is specifically for "something changed").
     pub fn worst_temp_level(&self) -> Level {
-        self.temp_levels
+        self.worst_temp().map_or(Level::Info, |(level, _, _)| level)
+    }
+
+    /// The sensor behind `worst_temp_level` -- the highest level, and of
+    /// those the hottest -- as (level, chip name, degrees C).
+    pub fn worst_temp(&self) -> Option<(Level, &str, f32)> {
+        self.temps
             .values()
-            .copied()
-            .max()
-            .unwrap_or(Level::Info)
+            .max_by(|a, b| {
+                a.level
+                    .cmp(&b.level)
+                    .then(a.temp_c.total_cmp(&b.temp_c))
+            })
+            .map(|t| (t.level, t.chip.as_str(), t.temp_c))
     }
 
     /// Whether any bay currently reports a confirmed SMART failure --
@@ -175,5 +211,23 @@ impl HealthMonitor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worst_temp_is_the_highest_level_then_the_hottest() {
+        let mut m = HealthMonitor::new();
+        assert_eq!(m.worst_temp(), None);
+        m.note_temp("a", "coretemp", 90.0, (85.0, 100.0)); // warn
+        m.note_temp("b", "drivetemp", 61.0, (50.0, 60.0)); // critical
+        m.note_temp("c", "nvme", 65.0, (60.0, 70.0)); // warn
+        assert_eq!(m.worst_temp(), Some((Level::Critical, "drivetemp", 61.0)));
+        assert_eq!(m.worst_temp_level(), Level::Critical);
+        m.note_temp("b", "drivetemp", 40.0, (50.0, 60.0));
+        assert_eq!(m.worst_temp(), Some((Level::Warn, "coretemp", 90.0)));
     }
 }

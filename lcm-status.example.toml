@@ -136,8 +136,7 @@ units = "c"                 # "c" or "f" for the CPU and HDD screens (display on
 # highlights the temperature screen's "!" and, via syslog
 # (monitor::HealthMonitor), logs a WARNING/CRITICAL on the transition into
 # and back out of threshold. Mainly hits the ACPI thermal zone and the
-# AQC113 NIC's sensors on this board (see the thresholds below for why
-# those two don't have their own datasheet-sourced entry).
+# IT8625's sensors on this board.
 warn_threshold = 75.0
 critical_threshold = 85.0
 
@@ -163,6 +162,11 @@ critical_threshold = 60.0
 chip = "nvme"                # WD Black SN750: datasheet operating (composite) temp is 0-70C
 warn_threshold = 60.0
 critical_threshold = 70.0
+
+[[temperature.thresholds]]
+chip = "enp9s0"              # AQC113 10GbE PHY/MAC (hwmon is named after the interface); ADM's LAN-chip curve: 70/80/100C
+warn_threshold = 80.0
+critical_threshold = 100.0
 
 [docker]
 ignore = []                # container names to exclude from health checks
@@ -307,3 +311,10 @@ min_resample_secs = 30
 # [[temperature.thresholds]] entry.
 min_temp_c = 60.0
 max_temp_c = 70.0
+
+[[fans.sensors]]
+chip = "enp9s0"          # AQC113 10GbE card (PHY/MAC, whichever is hotter)
+min_resample_secs = 10
+# ADM's LAN-chip curve, full speed at this chip's critical threshold.
+min_temp_c = 70.0
+max_temp_c = 100.0

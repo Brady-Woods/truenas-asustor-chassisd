@@ -4,6 +4,7 @@
 //! but not a confirm screen") are enforced in one spot, not scattered
 //! across the event loop.
 
+use crate::alarm::{self, Alarm};
 use crate::config::{Category, Config};
 use crate::hal::{self, Screen};
 use crate::led;
@@ -181,6 +182,12 @@ pub struct AppState {
     /// Fan health and worst temperature level as of the last status LED
     /// recompute -- see the end of `refresh_stale`.
     led_inputs: Option<(Level, Level)>,
+    /// The most critical active alarm (health checks and error/critical
+    /// socket messages), as of the last status LED recompute: it decides
+    /// the LED pattern, and its text is what the LCD shows in place of the
+    /// rotating screens -- see `render`. Cached here because working it
+    /// out runs `ip`, which a 100ms render loop must not.
+    alarm: Option<Alarm>,
 }
 
 /// Everything that feeds the status LED, plus the resulting verdict --
@@ -194,6 +201,9 @@ pub struct HealthSummary {
     pub network_level: Level,
     pub fan_health: Level,
     pub overall: Level,
+    /// Every active health alarm, in the order ties between equally severe
+    /// ones are broken. `pattern` is the most critical one's.
+    pub alarms: Vec<Alarm>,
     pub pattern: led::StatusPattern,
 }
 
@@ -229,6 +239,7 @@ impl AppState {
             brightness_problem: RefCell::new(None),
             status_shown: Cell::new(None),
             led_inputs: None,
+            alarm: None,
             sleeping: false,
             schedule_wants_sleep: false,
             awake_override_until: None,
@@ -429,35 +440,53 @@ impl AppState {
 
     /// The single "is anything wrong" indicator: pool health (factory
     /// patterns, unchanged), plus everything `HealthMonitor`/
-    /// `FanController` track -- temps, fan health, SMART, and monitored
-    /// NIC links -- folded into one severity via `Level`. Found live that
-    /// this was needed: the LED previously only ever reflected pool
-    /// health + a too-broad network check, so it could show amber (or
-    /// miss a real problem) while completely disconnected from what the
-    /// rest of the daemon was actually observing.
+    /// `FanController` track -- temps, fan health, SMART, monitored NIC
+    /// links -- each an `Alarm`, and
+    /// error/critical socket messages too. The most critical one decides
+    /// the LED pattern *and* what the LCD shows (`render`), so the two
+    /// can't disagree. Found live that this was needed: the LED previously
+    /// only ever reflected pool health + a too-broad network check, so it
+    /// could show amber (or miss a real problem) while completely
+    /// disconnected from what the rest of the daemon was actually
+    /// observing.
     ///
-    /// Two things sit above that verdict: a chassis `LOCATE` (for its
-    /// bounded TTL; the verdict is recomputed fresh the moment it ends) and
-    /// night mode, which keeps the LED dark (as `led::enter_night_mode`
-    /// left it) even when something like a `CLEAR` asks for a recompute --
-    /// unless `[led] night_brightness` dims it instead, in which case it
-    /// keeps showing the verdict.
-    fn recompute_status_led(&self) {
+    /// Two things sit above that verdict on the LED: a chassis `LOCATE`
+    /// (for its bounded TTL; the verdict is recomputed fresh the moment it
+    /// ends) and night mode, which keeps the LED dark (as
+    /// `led::enter_night_mode` left it) even when something like a `CLEAR`
+    /// asks for a recompute -- unless `[led] night_brightness` dims it
+    /// instead, in which case it keeps showing the verdict.
+    fn recompute_status_led(&mut self) {
+        // The socket message first, so it wins a tie with a health alarm.
+        let pushed = self.over.as_ref().and_then(|ov| {
+            led::pattern_for_level(ov.level)
+                .map(|p| Alarm::with_pattern(ov.level, p, &ov.line0, &ov.line1))
+        });
+        self.alarm = alarm::most_critical(pushed.into_iter().chain(self.health_summary().alarms));
+
         let pattern = if self.locate_chassis.is_some() {
             led::StatusPattern::Locate
         } else if self.sleeping && self.night_darkens_front() {
             led::StatusPattern::Off
-        } else if let Some(ov) = &self.over
-            && let Some(pattern) = led::pattern_for_level(ov.level)
-        {
-            pattern
         } else {
-            self.health_summary().pattern
+            self.alarm
+                .as_ref()
+                .map_or(led::StatusPattern::Ok, |a| a.pattern)
         };
         if self.status_shown.get() != Some(pattern) {
             led::set_status(pattern);
             self.status_shown.set(Some(pattern));
         }
+    }
+
+    /// The alarm the LCD should be showing right now, if any: the most
+    /// critical one, unless someone is paging through the status screens
+    /// by hand -- a peek that lasts `[rotation] resume_after_secs`, except
+    /// for a critical alarm, which is never paged away from.
+    fn lcd_alarm(&self) -> Option<&Alarm> {
+        self.alarm
+            .as_ref()
+            .filter(|a| self.auto_rotate || a.level == Level::Critical)
     }
 
     /// The power LED: flashing during a chassis `LOCATE`, otherwise dark at
@@ -583,17 +612,25 @@ impl AppState {
         use led::StatusPattern;
 
         let pool_healths = self.pool_healths();
+        let pools_where = |wanted: fn(&str) -> bool| -> String {
+            let names: Vec<&str> = pool_healths
+                .iter()
+                .filter(|(_, h)| wanted(h))
+                .map(|(n, _)| n.as_str())
+                .collect();
+            names.join(",")
+        };
+        let faulted = |h: &str| matches!(h, "FAULTED" | "UNAVAIL" | "OFFLINE");
         let pool_degraded = pool_healths.iter().any(|(_, h)| h == "DEGRADED");
-        let pool_faulted = pool_healths
-            .iter()
-            .any(|(_, h)| matches!(h.as_str(), "FAULTED" | "UNAVAIL" | "OFFLINE"));
+        let pool_faulted = pool_healths.iter().any(|(_, h)| faulted(h));
         let bay_failed = self.monitor.any_bay_failed();
         let temp_level = self.monitor.worst_temp_level();
-        let network_level = self.network_health_level();
+        let network = self.network_alarm();
+        let network_level = network.as_ref().map_or(Level::Info, |a| a.level);
 
         // Worst of: this fan's health (pushed in from main.rs each tick,
         // since FanControllers live outside AppState), every currently-
-        // connected temp sensor, monitored NIC link state, and whether any
+        // connected temp sensor, monitored NIC link state, whether any
         // bay is a confirmed SMART failure (Error -- a failed drive is
         // serious, same tier as a solid-red pool fault, even though it
         // doesn't necessarily mean the pool itself has degraded yet).
@@ -611,21 +648,54 @@ impl AppState {
         .max()
         .unwrap_or(Level::Info);
 
-        let pattern = if general == Level::Critical {
-            StatusPattern::CriticalFlashing
-        } else if pool_faulted || general == Level::Error {
-            StatusPattern::Failed
-        } else if pool_degraded {
-            // Factory-documented RAID-degraded pattern takes this slot
-            // specifically (between Error and Warn) as long as nothing
-            // worse is also true -- kept distinguishable from the generic
-            // Warning amber above.
-            StatusPattern::Degraded
-        } else if general == Level::Warn {
-            StatusPattern::Warning
-        } else {
-            StatusPattern::Ok
-        };
+        // In the order ties between equally severe alarms are broken.
+        let mut alarms: Vec<Alarm> = Vec::new();
+        if let Some((level, chip, temp_c)) = self.monitor.worst_temp() {
+            let (val, unit) = hal::display_temp(temp_c, self.cfg.temperature.units);
+            alarms.extend(Alarm::new(
+                level,
+                &format!("TEMP {}", level_word(level)),
+                &format!("{} {val:.0}{unit}", alarm::short_chip_name(chip)),
+            ));
+        }
+        alarms.extend(Alarm::new(
+            self.fan_health,
+            &format!("FAN {}", level_word(self.fan_health)),
+            "check fan",
+        ));
+        if pool_faulted {
+            alarms.extend(Alarm::new(
+                Level::Error,
+                "POOL FAULTED",
+                &pools_where(faulted),
+            ));
+        }
+        if bay_failed {
+            let bays: Vec<String> = self
+                .bay_states()
+                .into_iter()
+                .filter(|&(_, s)| s == led::BayState::Failed)
+                .map(|(bay, _)| bay.to_string())
+                .collect();
+            let (what, which) = match bays.as_slice() {
+                [] => ("DRIVE FAILED", "SMART".to_string()),
+                [one] => ("DRIVE FAILED", format!("BAY {one}")),
+                many => ("DRIVES FAILED", format!("BAYS {}", many.join(","))),
+            };
+            alarms.extend(Alarm::new(Level::Error, what, &which));
+        }
+        alarms.extend(network);
+        if pool_degraded {
+            alarms.push(Alarm::with_pattern(
+                Level::Warn,
+                StatusPattern::Degraded,
+                "POOL DEGRADED",
+                &pools_where(|h| h == "DEGRADED"),
+            ));
+        }
+
+        let pattern = alarm::most_critical(alarms.iter().cloned())
+            .map_or(StatusPattern::Ok, |a| a.pattern);
 
         HealthSummary {
             pool_healths,
@@ -636,8 +706,18 @@ impl AppState {
             network_level,
             fan_health: self.fan_health,
             overall: general,
+            alarms,
             pattern,
         }
+    }
+
+    /// The alarm deciding the LED and LCD, as last computed -- which
+    /// includes error/critical socket messages, unlike `health_summary`.
+    /// For the `status` report.
+    pub fn alarm_summary(&self) -> Option<String> {
+        self.alarm
+            .as_ref()
+            .map(|a| format!("{:?}: {} / {}", a.level, a.line0, a.line1))
     }
 
     /// Human-readable description of the active socket override, if any --
@@ -676,23 +756,25 @@ impl AppState {
     /// `monitored_nics` list, or (default, empty list) whatever
     /// `hal::configured_nics()` currently returns, so it auto-adjusts as
     /// interfaces are configured/unconfigured rather than needing the
-    /// config updated to match.
-    fn network_health_level(&self) -> Level {
+    /// config updated to match. `None` when nothing's down (or the
+    /// configured level for it is `info`).
+    fn network_alarm(&self) -> Option<Alarm> {
         let net = &self.cfg.network;
         if !net.enabled {
-            return Level::Info;
+            return None;
         }
         let monitored = hal::monitored_nics(net);
-        if monitored.is_empty() {
-            return Level::Info; // nothing configured/in-service to check
-        }
-        let down = monitored.iter().filter(|i| hal::link_is_down(i)).count();
-        if down == 0 {
-            Level::Info
-        } else if down == monitored.len() {
-            net.all_down_level.into()
+        let down: Vec<&str> = monitored
+            .iter()
+            .map(String::as_str)
+            .filter(|i| hal::link_is_down(i))
+            .collect();
+        if down.is_empty() {
+            None
+        } else if down.len() == monitored.len() {
+            Alarm::new(net.all_down_level.into(), "NETWORK DOWN", &down.join(","))
         } else {
-            net.some_down_level.into()
+            Alarm::new(net.some_down_level.into(), "LINK DOWN", &down.join(","))
         }
     }
 
@@ -775,7 +857,7 @@ impl AppState {
         }
         // Independent of the temperature screen/cache above -- see
         // HealthMonitor::maybe_check_temps.
-        self.monitor.maybe_check_temps(&self.cfg);
+        let readings_checked = self.monitor.maybe_check_temps(&self.cfg);
         if self.cfg.screens.docker
             && self
                 .docker_cache
@@ -816,10 +898,12 @@ impl AppState {
         // `pools_min_secs` later -- found live: a critical temperature
         // alert logged straight away, but the LED stayed green until
         // then.) `recompute_status_led` only writes on an actual change.
+        // A fresh temperature sweep recomputes too, even at an unchanged
+        // level: the alarm's text carries the reading.
         let led_inputs = (self.fan_health, self.monitor.worst_temp_level());
         if pools_due || hdd_due {
             self.update_health_leds();
-        } else if network_due || self.led_inputs != Some(led_inputs) {
+        } else if network_due || readings_checked || self.led_inputs != Some(led_inputs) {
             self.recompute_status_led();
         }
         self.led_inputs = Some(led_inputs);
@@ -1197,6 +1281,7 @@ impl AppState {
         // is currently scrolling (don't cut a scroll cycle short).
         if matches!(self.mode, Mode::Status)
             && self.over.is_none()
+            && self.alarm.is_none()
             && self.locate_chassis.is_none()
             && self.auto_rotate
             && !self.screens.is_empty()
@@ -1232,7 +1317,16 @@ impl AppState {
                 // and shows again the moment the locate ends.
                 if let Some(locate) = &self.locate_chassis {
                     locate.screen()
-                } else if let Some(ov) = &self.over {
+                } else if let Some(a) = self.lcd_alarm() {
+                    // Whatever is changing the status LED, in place of
+                    // the rotating screens.
+                    (a.line0.clone(), a.line1.clone())
+                } else if self.alarm.is_none()
+                    && let Some(ov) = &self.over
+                {
+                    // An info/warn message: no LED change, so it gives
+                    // way to any alarm. (Only ever absent an alarm here
+                    // unless someone is paging by hand.)
                     (ov.line0.clone(), ov.line1.clone())
                 } else if let Some(s) = self.screens.get(self.index) {
                     (s.line0.clone(), s.line1.clone())
@@ -1320,6 +1414,16 @@ impl AppState {
             window.push(if pos < chars.len() { chars[pos] } else { ' ' });
         }
         window
+    }
+}
+
+/// An alarm's severity as an upper-case word for its LCD heading.
+fn level_word(level: Level) -> &'static str {
+    match level {
+        Level::Info => "OK",
+        Level::Warn => "WARNING",
+        Level::Error => "ERROR",
+        Level::Critical => "CRITICAL",
     }
 }
 
@@ -2021,5 +2125,111 @@ mod tests {
             "wake key must not open the menu"
         );
         assert!(test_writes::wrote("blue:power", "brightness", "1"));
+    }
+
+    fn with_screens(s: &mut AppState) {
+        s.screens = vec![Screen {
+            line0: "NETWORK".into(),
+            line1: "enp2s0 up".into(),
+        }];
+    }
+
+    fn shown(s: &mut AppState) -> (String, String) {
+        lines(s.render())
+    }
+
+    /// A warning-level alarm: the CPU at 90C (warn 85C / critical 100C).
+    fn warm_cpu(s: &mut AppState, temp_c: f32) {
+        s.monitor
+            .note_temp("coretemp temp1", "coretemp", temp_c, (85.0, 100.0));
+        s.recompute_status_led();
+    }
+
+    #[test]
+    fn a_warning_alarm_shows_on_led_and_lcd_until_it_clears() {
+        let mut s = state();
+        with_screens(&mut s);
+        assert_eq!(shown(&mut s).0, "NETWORK");
+
+        test_writes::take();
+        warm_cpu(&mut s, 90.0);
+        assert_eq!(s.health_summary().pattern, led::StatusPattern::Warning);
+        assert!(test_writes::wrote("red:status", "brightness", "1"));
+        assert_eq!(
+            shown(&mut s),
+            ("TEMP WARNING".to_string(), "CPU 90C".to_string())
+        );
+
+        warm_cpu(&mut s, 60.0);
+        assert!(s.alarm.is_none());
+        assert_eq!(shown(&mut s).0, "NETWORK");
+    }
+
+    #[test]
+    fn the_most_critical_alarm_controls_led_and_lcd() {
+        let mut s = state();
+        with_screens(&mut s);
+        warm_cpu(&mut s, 90.0);
+        s.monitor
+            .note_temp("enp9s0 temp1", "enp9s0", 101.0, (80.0, 100.0));
+        test_writes::take();
+        s.recompute_status_led();
+        assert_eq!(
+            s.health_summary().pattern,
+            led::StatusPattern::CriticalFlashing
+        );
+        assert!(test_writes::wrote("red:status", "delay_on", "1000"));
+        assert_eq!(
+            shown(&mut s),
+            ("TEMP CRITICAL".to_string(), "enp9s0 101C".to_string())
+        );
+
+        // The NIC recovers: the next most critical takes over.
+        s.monitor
+            .note_temp("enp9s0 temp1", "enp9s0", 60.0, (80.0, 100.0));
+        s.recompute_status_led();
+        assert_eq!(shown(&mut s).0, "TEMP WARNING");
+    }
+
+    #[test]
+    fn pushed_error_does_not_hide_a_worse_health_alarm() {
+        let mut s = state();
+        s.monitor
+            .note_temp("coretemp temp1", "coretemp", 101.0, (85.0, 100.0));
+        show(&mut s, Level::Error, "DISK");
+        assert_eq!(shown(&mut s).0, "TEMP CRITICAL");
+        // A pushed critical wins the tie with the health one.
+        show(&mut s, Level::Critical, "FIRE");
+        assert_eq!(shown(&mut s).0, "FIRE");
+    }
+
+    #[test]
+    fn info_message_gives_way_to_an_alarm() {
+        let mut s = state();
+        show(&mut s, Level::Info, "hello");
+        assert_eq!(shown(&mut s).0, "hello");
+        warm_cpu(&mut s, 90.0);
+        assert_eq!(shown(&mut s).0, "TEMP WARNING");
+    }
+
+    #[test]
+    fn paging_peeks_past_a_warning_but_not_a_critical_alarm() {
+        let mut s = state();
+        with_screens(&mut s);
+        warm_cpu(&mut s, 90.0);
+        s.handle_key(Key::Down);
+        assert_eq!(shown(&mut s).0, "NETWORK");
+
+        warm_cpu(&mut s, 101.0);
+        assert_eq!(shown(&mut s).0, "TEMP CRITICAL");
+    }
+
+    #[test]
+    fn temp_alarm_text_follows_the_configured_units() {
+        let mut s = state_with(|c| c.temperature.units = crate::config::TempUnits::F);
+        s.monitor
+            .note_temp("nvme temp1", "nvme", 70.0, (60.0, 70.0));
+        s.recompute_status_led();
+        assert_eq!(shown(&mut s).1, "NVMe 158F");
     }
 }

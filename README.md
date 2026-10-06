@@ -620,13 +620,39 @@ and sources:
 | `coretemp` (Intel Celeron N5105) | 85C | 100C | Intel ARK: TjMax (throttle point) = 105C |
 | `drivetemp` (WD Ultrastar DC HC550) | 50C | 60C | WD datasheet: operating range 5-60C |
 | `nvme` (WD Black SN750) | 60C | 70C | WD datasheet: operating (composite) temp 0-70C |
+| `enp9s0` (AQC113 10GbE, PHY/MAC) | 80C | 100C | ADM's own LAN-chip curve (70/80/100C, emergency above 101C) |
 
-The AQC113 NIC's board-level PHY/MAC sensors deliberately have no entry
-of their own -- no public datasheet with a numeric junction/case limit
-was found for that chip (Marvell's technical datasheets aren't publicly
-indexed the way Intel's/WD's are), so fabricating a specific-looking
-number would be worse than just falling back to the generic default.
-Worth adding if Marvell's actual datasheet ever turns up.
+The AQC113's `atlantic` driver names its hwmon device after the interface
+(`enp9s0` here), which is why that is the chip name. No public datasheet
+with a numeric limit was found, so these borrow ADM's curve for platforms
+that read a LAN-chip sensor. The fan follows it too: the default fan has a
+`enp9s0` sensor ramping from 70C to full speed at 100C.
+
+### A critical temperature pegs the fan
+
+Whatever the curve says, any sensor feeding a fan that reaches its
+critical threshold pushes that fan to `max_pwm` (100%) and keeps it there
+until every one of its sensors is back below its *warning* threshold -- the
+gap is hysteresis, so a sensor hovering at critical doesn't make the fan
+surge up and down. This applies to curve and fixed mode alike. Both
+transitions are logged.
+
+### Alarms: the LED and the LCD agree
+
+Everything that can turn the status LED away from green is an *alarm*:
+temperatures (any sensor, including the AQC113's), fan health, pool faults
+and degradation, failed drives, monitored NICs being down, and `SHOW error`/`SHOW critical` messages. The most
+critical active alarm sets the LED pattern **and** replaces the rotating
+status screens on the LCD with its message (e.g. `TEMP CRITICAL` /
+`enp9s0 101C`) for as long as it lasts. Ties go to the pushed message, then
+to the order temperature, fan, pool fault, drive, network, pool degraded. When it clears, the next most critical takes over, or the
+screens resume. `lcm-status status` lists every active alarm and which one
+the panel is showing.
+
+Pressing UP/DOWN peeks at the status screens for `[rotation]
+resume_after_secs`, then the alarm returns -- except for a critical alarm,
+which can't be paged away from. A chassis `LOCATE` still outranks all of
+it, and info/warn `SHOW` messages give way to an alarm.
 
 ### Status LED reflects all of the above, not just pool/network
 

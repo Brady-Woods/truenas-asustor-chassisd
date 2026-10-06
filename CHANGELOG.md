@@ -2,6 +2,24 @@
 
 Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
 
+## Unreleased
+
+### Added
+- AQC113 10GbE temperature (hwmon `enp9s0`, PHY/MAC): warn 80C / critical
+  100C (ADM's LAN-chip curve) and a default fan sensor ramping 70C to full
+  speed at 100C.
+- A critical temperature on any of a fan's sensors pegs it at `max_pwm`
+  until all are below warning, in curve mode as well as fixed.
+
+### Changed
+- The most critical active alarm (health checks and pushed error/critical
+  messages) now decides both the status LED and the LCD, whose rotating
+  screens give way to the alarm's message while it lasts. UP/DOWN peeks at
+  the screens, except under a critical alarm. A pushed error no longer
+  hides a worse health alarm's LED. `status` lists the active alarms.
+- A temperature sensor that disappears is dropped from monitoring instead
+  of keeping its last level forever.
+
 ## 2.0.0 -- 2026-10-06
 
 Breaking: needs the asustor-platform-driver fork v0.3 or later; the

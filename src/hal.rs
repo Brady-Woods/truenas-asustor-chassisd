@@ -473,7 +473,7 @@ pub fn cpu_and_fan(cfg: &Config) -> Vec<Screen> {
 }
 
 /// Converts for display only -- thresholds are always compared in C.
-fn display_temp(celsius: f32, units: TempUnits) -> (f32, &'static str) {
+pub fn display_temp(celsius: f32, units: TempUnits) -> (f32, &'static str) {
     match units {
         TempUnits::C => (celsius, "C"),
         TempUnits::F => (celsius * 9.0 / 5.0 + 32.0, "F"),
