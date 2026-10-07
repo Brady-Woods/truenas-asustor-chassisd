@@ -9,6 +9,11 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-06
+
+Major because the socket protocol changed (see **BREAKING** below), the
+minimum Rust is now 1.89, and the LCM serial port is opened exclusively.
+
 ### Added
 
 - MIT license (`LICENSE`, also in the release tarball).
@@ -35,6 +40,13 @@ were reconstructed from git history.
   not get the daemon killed, but a wedged fan thread or main loop does); the
   unit gets `WatchdogSec=60` and `NotifyAccess=main`. A no-op without
   `NOTIFY_SOCKET`.
+- **`lcm-status fan-failsafe [CONFIG]`** forces every enabled fan to manual
+  mode at full speed (time-bounded, logged, no serial port or socket). It
+  exits 0 when no fan chip exists and non-zero when a present fan could not
+  be set. `lcm-status.service` runs it from `ExecStopPost`, so a daemon
+  stopped by the watchdog, SIGKILL, the OOM killer or a crash no longer
+  leaves the fan at its last manual PWM (on this board BIOS automatic mode
+  stops the fan). `TimeoutStopSec=20`; `WatchdogSignal` stays at SIGABRT.
 - **Service sandboxing.** `NoNewPrivileges`, `RestrictSUIDSGID`,
   `LockPersonality`, `PrivateTmp`, `ProtectHome`, `RestrictAddressFamilies`
   and a fixed `PATH`. `ProtectSystem`, `ProtectKernel*`, `PrivateDevices`
@@ -51,6 +63,16 @@ were reconstructed from git history.
 
 ### Changed
 
+- **The control socket's default group is now `builtin_administrators`**
+  (gid 544, always present on TrueNAS SCALE) instead of a purpose-made
+  `lcm-status` group, so administrators can use `lcm-status status` and
+  `lcm-status locate` with no setup. `[socket] group` is still configurable.
+  Existing installs need no action: a config that says
+  `group = "lcm-status"` keeps working while that group exists, and the old
+  group is never removed. A group missing from `/etc/group` still leaves
+  the socket root-only, with a syslog warning. `deploy.sh` no longer
+  creates a group (no more `midclt group.create`/`groupadd`); it only warns
+  when the configured group is not found.
 - The rear reset button is documented as a deliberate non-goal: TrueNAS has
   nothing to bind it to.
 - Docs and comments no longer point at the private deployment repository.
@@ -117,6 +139,14 @@ were reconstructed from git history.
 
 ### Fixed
 
+- Commands the daemon spawns (`zpool`, `smartctl`, `ip`, `docker`,
+  `udevadm`, `modprobe`, `systemctl`) no longer inherit `NOTIFY_SOCKET` and
+  the watchdog variables, which made systemd log a "notification message
+  from PID ..., but reception only permitted for main PID" line for every
+  one of them.
+- `fan-failsafe` log lines carry the `lcm-status` program name.
+- Builds cleanly under Rust 1.99's clippy (`assert_is_empty`, the
+  deprecated `AtomicUsize::fetch_update`).
 - The fan is taken over within about 500ms of start instead of one
   `update_secs` later (the first control pass waits briefly for the first
   sensor samples), and `[[fans]] update_secs` is clamped to 1..=60 with a
@@ -345,7 +375,8 @@ Upgrading from 1.4.0:
 - Initial release: portable ASUSTOR LCM/LED driver for TrueNAS SCALE, fan
   control, deploy script.
 
-[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.3.0...v1.4.0
