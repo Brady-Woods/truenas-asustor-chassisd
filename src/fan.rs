@@ -434,48 +434,163 @@ impl FanService {
     }
 }
 
+/// What happened to one enabled fan during a forced full-speed pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FullSpeedOutcome {
+    /// Manual mode, pwm 255 written.
+    Forced,
+    /// No hwmon chip matches the profile's `pwm_chip`: nothing to write to
+    /// (the platform driver isn't loaded, or this isn't the board the
+    /// profile was written for).
+    ChipAbsent,
+    /// The chip is there but a write failed.
+    Failed(String),
+    /// The pass ran out of time before this fan reported.
+    TimedOut,
+}
+
+/// A forced full-speed pass over every enabled fan: `(name, pwm index,
+/// outcome)` in profile order.
+#[derive(Debug, Default)]
+pub struct FullSpeedReport(pub Vec<(String, u32, FullSpeedOutcome)>);
+
+impl FullSpeedReport {
+    /// False only when a fan whose chip exists could not be set (failed or
+    /// timed out). A chip that is absent altogether is not an error here:
+    /// there is no fan on it for the BIOS to stop, and failing the unit's
+    /// stop hook on a machine without the driver would only add noise.
+    pub fn all_present_fans_set(&self) -> bool {
+        self.0
+            .iter()
+            .all(|(_, _, o)| matches!(o, FullSpeedOutcome::Forced | FullSpeedOutcome::ChipAbsent))
+    }
+
+    /// One syslog line per fan; failures are critical, an absent chip a
+    /// warning, success info.
+    pub fn log(&self) {
+        for (name, n, outcome) in &self.0 {
+            Self::log_one(name, *n, outcome);
+        }
+    }
+
+    fn log_one(name: &str, n: u32, outcome: &FullSpeedOutcome) {
+        match outcome {
+            FullSpeedOutcome::Forced => crate::syslog::info(&format!(
+                "fan '{name}' (pwm{n}): forced to manual, full speed"
+            )),
+            FullSpeedOutcome::ChipAbsent => crate::syslog::warning(&format!(
+                "fan '{name}' (pwm{n}): pwm chip not found; nothing to force"
+            )),
+            FullSpeedOutcome::Failed(e) => crate::syslog::critical(&format!(
+                "fan '{name}' (pwm{n}): could not force full speed: {e}"
+            )),
+            FullSpeedOutcome::TimedOut => crate::syslog::critical(&format!(
+                "fan '{name}' (pwm{n}): forcing full speed timed out"
+            )),
+        }
+    }
+}
+
 /// Last-resort fail-safe for a wedged fan thread: manual mode at full
 /// speed on every enabled fan, written from a helper thread so a sysfs
 /// write that hangs too can't hang the caller beyond `FAILSAFE_TIMEOUT`.
 fn force_full_speed(root: PathBuf, profiles: Vec<FanProfile>) {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let spawned = thread::Builder::new()
-        .name("fan-failsafe".into())
-        .spawn(move || {
-            for p in profiles.iter().filter(|p| p.enabled) {
-                if let Err(e) = write_full_speed(&root, p) {
-                    crate::syslog::critical(&format!(
-                        "fan '{}' (pwm{}): could not force full speed: {e}",
-                        p.name, p.pwm_index
-                    ));
-                }
-            }
-            // The receiver may have given up already; nothing to do then.
-            done_tx.send(()).ok();
-        });
-    match spawned {
-        Ok(_) => {
-            if done_rx.recv_timeout(FAILSAFE_TIMEOUT).is_err() {
-                crate::syslog::critical("forcing fans to full speed timed out");
-            }
+    let report = force_full_speed_bounded(root, profiles, FAILSAFE_TIMEOUT, write_full_speed);
+    for (name, n, outcome) in &report.0 {
+        if matches!(
+            outcome,
+            FullSpeedOutcome::Failed(_) | FullSpeedOutcome::TimedOut
+        ) {
+            FullSpeedReport::log_one(name, *n, outcome);
         }
-        Err(e) => crate::syslog::critical(&format!("could not start the fan fail-safe: {e}")),
     }
 }
 
+/// `lcm-status fan-failsafe`: forces every enabled fan in `profiles` to
+/// manual mode at full speed (bounded by `FAILSAFE_TIMEOUT`), logs every
+/// outcome, and returns the report. Runs from the unit's `ExecStopPost`, so
+/// it holds nothing exclusive -- no serial port, no socket.
+pub fn force_full_speed_all(profiles: Vec<FanProfile>) -> FullSpeedReport {
+    let report = force_full_speed_bounded(
+        PathBuf::from(DEFAULT_HWMON_ROOT),
+        profiles,
+        FAILSAFE_TIMEOUT,
+        write_full_speed,
+    );
+    report.log();
+    report
+}
+
+/// The bounded core of both entry points. `write` does one fan's
+/// resolve-and-write and is injected so tests can wedge it. Each fan's
+/// outcome is sent as it completes, so a wedge on one fan still reports
+/// the ones before it; the rest are `TimedOut` once `timeout` elapses.
+fn force_full_speed_bounded<W>(
+    root: PathBuf,
+    profiles: Vec<FanProfile>,
+    timeout: Duration,
+    write: W,
+) -> FullSpeedReport
+where
+    W: Fn(&Path, &FanProfile) -> FullSpeedOutcome + Send + 'static,
+{
+    let enabled: Vec<FanProfile> = profiles.into_iter().filter(|p| p.enabled).collect();
+    let mut outcomes: Vec<FullSpeedOutcome> = vec![FullSpeedOutcome::TimedOut; enabled.len()];
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, FullSpeedOutcome)>();
+    let worker_profiles = enabled.clone();
+    let spawned = thread::Builder::new()
+        .name("fan-failsafe".into())
+        .spawn(move || {
+            for (i, p) in worker_profiles.iter().enumerate() {
+                // The receiver may have given up already; nothing to do then.
+                tx.send((i, write(&root, p))).ok();
+            }
+        });
+    match spawned {
+        Ok(_) => {
+            let deadline = Instant::now() + timeout;
+            for _ in 0..enabled.len() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok((i, outcome)) => {
+                        if let Some(slot) = outcomes.get_mut(i) {
+                            *slot = outcome;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(e) => {
+            crate::syslog::critical(&format!("could not start the fan fail-safe: {e}"));
+            outcomes = vec![
+                FullSpeedOutcome::Failed(format!("could not start helper thread: {e}"));
+                enabled.len()
+            ];
+        }
+    }
+    FullSpeedReport(
+        enabled
+            .into_iter()
+            .zip(outcomes)
+            .map(|(p, o)| (p.name, p.pwm_index, o))
+            .collect(),
+    )
+}
+
 /// Manual mode, full speed, for one profile's pwm output under `root`.
-fn write_full_speed(root: &Path, profile: &FanProfile) -> std::io::Result<()> {
-    let hwmon = glob_hwmon_in(root, &profile.pwm_chip)
-        .and_then(|v| v.into_iter().next())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("pwm chip '{}' not found", profile.pwm_chip),
-            )
-        })?;
+fn write_full_speed(root: &Path, profile: &FanProfile) -> FullSpeedOutcome {
+    let Some(hwmon) = glob_hwmon_in(root, &profile.pwm_chip).and_then(|v| v.into_iter().next())
+    else {
+        return FullSpeedOutcome::ChipAbsent;
+    };
     let n = profile.pwm_index;
-    std::fs::write(format!("{hwmon}/pwm{n}_enable"), "1")?;
-    std::fs::write(format!("{hwmon}/pwm{n}"), u8::MAX.to_string())
+    let result = std::fs::write(format!("{hwmon}/pwm{n}_enable"), "1")
+        .and_then(|()| std::fs::write(format!("{hwmon}/pwm{n}"), u8::MAX.to_string()));
+    match result {
+        Ok(()) => FullSpeedOutcome::Forced,
+        Err(e) => FullSpeedOutcome::Failed(e.to_string()),
+    }
 }
 
 fn worst_health(fans: &[FanController]) -> Level {
@@ -2161,7 +2276,122 @@ mod tests {
     #[test]
     fn forcing_full_speed_reports_a_missing_chip() {
         let empty = crate::hal::HwmonTree::new("failsafe-none");
-        let err = write_full_speed(&empty.0, &coretemp_fan()).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            write_full_speed(&empty.0, &coretemp_fan()),
+            FullSpeedOutcome::ChipAbsent
+        );
+    }
+
+    fn bounded(root: &Path, profiles: Vec<FanProfile>, timeout: Duration) -> FullSpeedReport {
+        force_full_speed_bounded(root.to_path_buf(), profiles, timeout, write_full_speed)
+    }
+
+    fn outcomes(r: &FullSpeedReport) -> Vec<FullSpeedOutcome> {
+        r.0.iter().map(|(_, _, o)| o.clone()).collect()
+    }
+
+    #[test]
+    fn failsafe_pass_forces_enabled_fans_and_skips_disabled() {
+        let tree = it8625_tree("failsafe-pass");
+        let hw = tree.0.join("hwmon0");
+        std::fs::write(hw.join("pwm2"), "77").unwrap();
+        std::fs::write(hw.join("pwm2_enable"), "2").unwrap();
+        let profiles = vec![
+            coretemp_fan(),
+            FanProfile {
+                pwm_index: 2,
+                enabled: false,
+                ..coretemp_fan()
+            },
+        ];
+        let report = bounded(&tree.0, profiles, Duration::from_secs(3));
+        assert_eq!(outcomes(&report), vec![FullSpeedOutcome::Forced]);
+        assert!(report.all_present_fans_set());
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+        assert_eq!(
+            std::fs::read_to_string(hw.join("pwm1_enable")).unwrap(),
+            "1"
+        );
+        assert_eq!(std::fs::read_to_string(hw.join("pwm2")).unwrap(), "77");
+    }
+
+    #[test]
+    fn failsafe_pass_with_no_chip_is_not_an_error() {
+        let empty = crate::hal::HwmonTree::new("failsafe-nochip");
+        let report = bounded(&empty.0, vec![coretemp_fan()], Duration::from_secs(3));
+        assert_eq!(outcomes(&report), vec![FullSpeedOutcome::ChipAbsent]);
+        assert!(report.all_present_fans_set());
+        // No enabled fans at all is likewise fine.
+        assert!(bounded(&empty.0, Vec::new(), Duration::from_secs(3)).all_present_fans_set());
+    }
+
+    #[test]
+    fn failsafe_pass_reports_a_write_failure_and_keeps_going() {
+        let tree = it8625_tree("failsafe-wfail");
+        let hw = tree.0.join("hwmon0");
+        // pwm2_enable is a directory, so writing it fails; pwm1 still works.
+        std::fs::create_dir(hw.join("pwm2_enable")).unwrap();
+        let profiles = vec![
+            FanProfile {
+                pwm_index: 2,
+                ..coretemp_fan()
+            },
+            coretemp_fan(),
+        ];
+        let report = bounded(&tree.0, profiles, Duration::from_secs(3));
+        assert!(matches!(report.0[0].2, FullSpeedOutcome::Failed(_)));
+        assert_eq!(report.0[1].2, FullSpeedOutcome::Forced);
+        assert!(!report.all_present_fans_set());
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+    }
+
+    #[test]
+    fn failsafe_pass_is_bounded_when_a_write_wedges() {
+        let tree = it8625_tree("failsafe-wedge");
+        let started = Instant::now();
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+        let wedge = Mutex::new(wedge);
+        let profiles = vec![
+            FanProfile {
+                name: "ok".into(),
+                ..coretemp_fan()
+            },
+            FanProfile {
+                name: "wedge".into(),
+                ..coretemp_fan()
+            },
+            FanProfile {
+                name: "after".into(),
+                ..coretemp_fan()
+            },
+        ];
+        let report = force_full_speed_bounded(
+            tree.0.clone(),
+            profiles,
+            Duration::from_millis(200),
+            move |_, p| {
+                if p.name == "wedge"
+                    && let Ok(rx) = wedge.lock()
+                {
+                    rx.recv().ok();
+                }
+                FullSpeedOutcome::Forced
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcomes(&report),
+            vec![
+                FullSpeedOutcome::Forced,
+                FullSpeedOutcome::TimedOut,
+                FullSpeedOutcome::TimedOut
+            ]
+        );
+        assert!(!report.all_present_fans_set());
+        drop(release);
     }
 }

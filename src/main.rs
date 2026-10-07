@@ -53,6 +53,8 @@ usage: lcm-status [daemon] [CONFIG]       run the daemon (default config: /etc/l
        lcm-status hal-test [CONFIG]       print every screen rendered with that config
        lcm-status fan-profile [-y] [CONFIG]
                                           discover and calibrate fans (stops the daemon)
+       lcm-status fan-failsafe [CONFIG]   force every enabled fan to manual, full speed
+                                          (the unit's ExecStopPost; needs no daemon)
        lcm-status init                    send the LCD power-on sequence
        lcm-status settext LINE TEXT       write up to 16 chars to line 0 or 1
        lcm-status listen [SECS]           print unsolicited panel frames";
@@ -76,6 +78,8 @@ enum Cli {
         config: PathBuf,
         assume_yes: bool,
     },
+    /// `fan-failsafe`: forces every enabled fan to full speed and exits.
+    FanFailsafe(PathBuf),
     /// `init` / `settext` / `listen`: low-level panel probes, which parse
     /// their own remaining arguments.
     Probe(String),
@@ -108,6 +112,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 assume_yes,
             })
         }
+        ["fan-failsafe", tail @ ..] => config_arg(tail).map(Cli::FanFailsafe),
         [cmd @ ("init" | "settext" | "listen"), ..] => Ok(Cli::Probe((*cmd).to_string())),
         ["help" | "-h" | "--help", ..] => Ok(Cli::Help),
         [path]
@@ -214,6 +219,14 @@ fn main() -> ExitCode {
             );
         }
         Cli::Probe(cmd) => run_probe_command(&cmd, &args),
+        Cli::FanFailsafe(path) => {
+            // Deliberately no serial port, socket or LCD: this runs from
+            // ExecStopPost, possibly right after the daemon was killed.
+            let cfg = Config::load(&path);
+            if !fan::force_full_speed_all(cfg.fans).all_present_fans_set() {
+                return ExitCode::FAILURE;
+            }
+        }
         Cli::FanProfile { config, assume_yes } => fan_calibrate::run(&config, assume_yes),
         Cli::Status(path) => {
             let reply = socket_request(&Config::load(&path).socket.path, "STATUS");
@@ -886,6 +899,20 @@ mod tests {
                 assume_yes: true
             })
         );
+    }
+
+    #[test]
+    fn fan_failsafe_takes_an_optional_config() {
+        assert_eq!(
+            parse(&["fan-failsafe"]),
+            Ok(Cli::FanFailsafe(default_path()))
+        );
+        assert_eq!(
+            parse(&["fan-failsafe", "/tmp/c.toml"]),
+            Ok(Cli::FanFailsafe("/tmp/c.toml".into()))
+        );
+        assert!(parse(&["fan-failsafe", "-y"]).is_err());
+        assert!(parse(&["fan-failsafe", "a.toml", "b.toml"]).is_err());
     }
 
     #[test]
