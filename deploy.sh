@@ -177,6 +177,20 @@ while :; do
     trust_dir="$(dirname "$trust_dir")"
 done
 
+# lcm-status.service has ProtectHome=yes, which hides /home, /root and
+# /run/user from the service: a checkout under them makes systemd fail the
+# unit with status 203/EXEC. Warn only (never fail, see above).
+check_not_in_home() {
+    case "$1" in
+        /home|/home/*|/root|/root/*)
+            log "WARNING: the checkout is under $1, but the unit sets ProtectHome=yes, so the service will fail to start (203/EXEC). Move the checkout (e.g. under a dataset such as /mnt/<pool>/...) or remove ProtectHome from the unit."
+            ;;
+    esac
+}
+check_not_in_home "$SCRIPT_DIR"
+physical_dir="$(cd "$SCRIPT_DIR" && pwd -P 2>/dev/null)" || physical_dir=""
+[ "$physical_dir" = "$SCRIPT_DIR" ] || check_not_in_home "$physical_dir"
+
 # --- 3. Group for socket access --------------------------------------------
 #
 # TrueNAS regenerates /etc/group from its config database at boot, so a
