@@ -618,24 +618,16 @@ fn uptime_secs() -> Option<f64> {
 }
 
 /// Local wall-clock hour/minute (`[sleep].start`/`.end` are documented as
-/// local time, see config.rs). Needs `libc::localtime_r` -- computing this
-/// from `SystemTime`/`UNIX_EPOCH` directly gives UTC, not local time, which
-/// silently shifted the sleep window by the system's UTC offset (e.g. 7
-/// hours early on a Pacific-time box) with no error or indication anything
-/// was wrong.
+/// local time, see config.rs). Goes through `power::LocalTime`, i.e.
+/// libc's `localtime_r` -- computing this from `SystemTime`/`UNIX_EPOCH`
+/// directly gives UTC, not local time, which silently shifted the sleep
+/// window by the system's UTC offset (e.g. 7 hours early on a Pacific-time
+/// box) with no error or indication anything was wrong. If libc can't
+/// convert the time, `LocalTime` falls back to UTC (and says so once in
+/// the log).
 fn now_hhmm() -> (u32, u32) {
-    // SAFETY: `time` accepts a null output pointer; `tm` is plain data for
-    // which all-zeroes is valid, and both pointers passed to the reentrant
-    // `localtime_r` are to locals that outlive the call.
-    let tm = unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&raw const t, &raw mut tm);
-        tm
-    };
-    // localtime_r yields 0-23 / 0-59; fall back to midnight if not.
-    let field = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
-    (field(tm.tm_hour), field(tm.tm_min))
+    let now = power::LocalTime::from_epoch(power::now_epoch());
+    (now.hour, now.minute)
 }
 
 fn run_probe_command(cmd: &str, args: &[String]) {
@@ -788,5 +780,11 @@ mod tests {
                 assume_yes: true
             })
         );
+    }
+
+    #[test]
+    fn now_hhmm_is_a_valid_time_of_day() {
+        let (hour, minute) = now_hhmm();
+        assert!(hour < 24 && minute < 60, "{hour}:{minute}");
     }
 }
