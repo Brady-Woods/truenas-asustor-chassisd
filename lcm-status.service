@@ -22,5 +22,25 @@ NotifyAccess=main
 # systemctl poweroff/reboot for the panel's shutdown/restart action and
 # the power schedule, and /sys/class/rtc/rtc0/wakealarm for its power on.
 
+# Sandboxing. Deliberately conservative: only directives that cannot get
+# in the way of what the daemon does (write sysfs/hwmon/LED/rtc, open
+# /dev/ttyS1 and /dev/input/event*, run modprobe, systemctl, zpool,
+# smartctl, docker, ip and udevadm). ProtectSystem, ProtectKernel*,
+# PrivateDevices and Capability* are NOT set for that reason.
+#
+# The daemon never gains privileges it doesn't already have, nor creates
+# setuid files; a compromised child can't escalate through a setuid binary.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Private /tmp, and no access to home directories.
+PrivateTmp=yes
+ProtectHome=yes
+# The daemon talks to the Unix socket, the middleware/dbus, and netlink
+# (link state); nothing else (no AF_PACKET, AF_BLUETOOTH, ...).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Fixed lookup path for the subprocesses it spawns by bare name.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 [Install]
 WantedBy=multi-user.target

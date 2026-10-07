@@ -1092,6 +1092,39 @@ back to its default, without affecting the other screens. Fallback screens
 templated. `lcm-status hal-test [path]` renders every screen using that
 config, so you can preview edits before restarting the daemon.
 
+## Security model
+
+- **The daemon runs as root**, on purpose: it drives `/dev/ttyS1`, writes
+  sysfs/hwmon/LED/RTC attributes, loads modules and calls
+  `systemctl poweroff`/`reboot`.
+- **Members of the `lcm-status` socket group are trusted.** The socket
+  (`0660`, `root:lcm-status`) has no authentication beyond that. A member
+  can put arbitrary text and alerts on the LCD, drive the status/bay
+  LEDs, the buzzer and the locate blinks, and ask for the `STATUS` report
+  (live health details). It cannot run commands or change the
+  config through the socket, but it can hide a real alarm behind its own
+  message for as long as it keeps sending. Only add accounts and services
+  you'd trust with the front panel; anything that can reach the socket
+  (a bind-mounted `/run`, for example) has the same power.
+- **Root runs a binary straight from the checkout** (`target/release/lcm-status`;
+  `deploy.sh` also runs from there at every boot). Whoever can write to the
+  checkout, or to a directory above it, can run code as root. Keep the
+  checkout root-owned and not group- or world-writable, don't export it
+  over SMB/NFS, and don't bind-mount it (or its dataset) into a container
+  or app. `deploy.sh` logs a warning when it finds the checkout, `target/`,
+  or the binary owned by someone else or writable by group/others.
+- **Sandboxing in the unit file** is deliberately conservative, because
+  the daemon needs most of the system: `NoNewPrivileges`,
+  `RestrictSUIDSGID`, `LockPersonality`, `PrivateTmp`, `ProtectHome`,
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` and a fixed
+  `PATH` for the helper programs it runs (`modprobe`, `systemctl`,
+  `zpool`, `smartctl`, `docker`, `ip`, `udevadm`). It does not use
+  `ProtectSystem`, `ProtectKernel*`, `PrivateDevices` or capability
+  bounding, which would block the sysfs writes, module loading and
+  serial/input access the daemon exists to do.
+- CI checks the locked dependencies against the RustSec advisory
+  database, and GitHub Actions are pinned by commit SHA.
+
 ## Deploying, and surviving TrueNAS upgrades
 
 ```sh

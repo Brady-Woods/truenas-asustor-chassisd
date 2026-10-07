@@ -33,6 +33,14 @@ GROUP=lcm-status
 log() { echo "==> $*"; }
 fail() { echo "FAILED: $*" >&2; exit 1; }
 
+# Escape a string for use inside a JSON string literal (backslash, double
+# quote) so a path or name with those characters can't break out of the
+# midclt arguments below.
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+# Escape a string for use as the replacement side of a sed s||| command
+# (backslash, the | delimiter, and &).
+sed_escape() { printf '%s' "$1" | sed 's/[\\|&]/\\&/g'; }
+
 # --- 1. Kernel driver dependency check, before anything else -------------
 #
 # The LED functionality (bay LEDs, status LED) and the buzzer depend on the
@@ -131,6 +139,44 @@ else
     fi
 fi
 
+# --- 2b. Trust check on the checkout ---------------------------------------
+#
+# The systemd unit runs target/release/lcm-status as root straight out of
+# this checkout, and this script is a root Post Init script, so anyone who
+# can write to the checkout (or to a directory above it) can run code as
+# root. Warn, don't fail: failing would stop the unit and the Post Init
+# registration below on a box where the owner has accepted that.
+check_trusted() {
+    path="$1"
+    [ -e "$path" ] || return 0
+    info="$(stat -c '%u %A' "$path" 2>/dev/null)" || {
+        log "WARNING: couldn't stat $path to check its ownership"
+        return 0
+    }
+    owner="${info%% *}"
+    perm="${info#* }"
+    if [ "$owner" != 0 ]; then
+        log "WARNING: $path is owned by uid $owner, not root -- root runs code from this checkout, so it should be root-owned."
+    fi
+    case "$perm" in
+        ?????w????|????????w?)
+            log "WARNING: $path is group- or world-writable ($perm) -- anyone who can write there can run code as root."
+            ;;
+    esac
+}
+log "Checking the checkout is root-owned and not writable by group/others..."
+check_trusted "$SCRIPT_DIR/deploy.sh"
+check_trusted "$SCRIPT_DIR/target"
+check_trusted "$BIN_PATH"
+check_trusted "$SCRIPT_DIR/src"
+check_trusted "$SCRIPT_DIR/lcm-status.service"
+trust_dir="$SCRIPT_DIR"
+while :; do
+    check_trusted "$trust_dir"
+    [ "$trust_dir" = / ] && break
+    trust_dir="$(dirname "$trust_dir")"
+done
+
 # --- 3. Group for socket access --------------------------------------------
 #
 # TrueNAS regenerates /etc/group from its config database at boot, so a
@@ -139,9 +185,10 @@ fi
 # it's in that database; plain groupadd only where there's no middleware.
 ensure_group() {
     if command -v midclt >/dev/null 2>&1; then
-        existing="$(midclt call group.query "[[\"group\", \"=\", \"$GROUP\"]]" 2>/dev/null || echo error)"
+        json_group="$(json_escape "$GROUP")"
+        existing="$(midclt call group.query "[[\"group\", \"=\", \"$json_group\"]]" 2>/dev/null || echo error)"
         if [ "$existing" = "[]" ]; then
-            if midclt call group.create "{\"name\": \"$GROUP\", \"smb\": false}" >/dev/null 2>&1; then
+            if midclt call group.create "{\"name\": \"$json_group\", \"smb\": false}" >/dev/null 2>&1; then
                 log "Created group '$GROUP' in the TrueNAS config database (persists across reboots)."
             else
                 log "WARNING: creating group '$GROUP' through the TrueNAS middleware failed; adding it to /etc/group only (lost at the next reboot)."
@@ -171,7 +218,7 @@ fi
 # Substitute the real binary path (this checkout, see $BIN_PATH above) in
 # place of the @LCM_STATUS_BIN@ placeholder the checked-in unit carries.
 log "Installing systemd unit..."
-sed "s|@LCM_STATUS_BIN@|$BIN_PATH|" "$SCRIPT_DIR/lcm-status.service" > "$UNIT_PATH"
+sed "s|@LCM_STATUS_BIN@|$(sed_escape "$BIN_PATH")|" "$SCRIPT_DIR/lcm-status.service" > "$UNIT_PATH"
 systemctl daemon-reload
 systemctl enable lcm-status.service
 systemctl restart lcm-status.service
@@ -182,8 +229,9 @@ systemctl restart lcm-status.service
 # that may not have any of the above. Idempotent: replaces any existing
 # task pointing at this same script path rather than piling up duplicates.
 log "Registering as a TrueNAS POSTINIT script (survives upgrades)..."
+JSON_SCRIPT="$(json_escape "$SCRIPT_DIR/deploy.sh")"
 EXISTING_ID=$(midclt call initshutdownscript.query \
-    "[[\"script\", \"=\", \"$SCRIPT_DIR/deploy.sh\"]]" 2>/dev/null \
+    "[[\"script\", \"=\", \"$JSON_SCRIPT\"]]" 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["id"]) if d else None' 2>/dev/null || true)
 
 # 600 s: at boot a rebuild (after the checkout changed) waits for Docker
@@ -197,7 +245,7 @@ if [ -n "${EXISTING_ID:-}" ] && [ "$EXISTING_ID" != "None" ]; then
 else
     midclt call initshutdownscript.create "{
         \"type\": \"SCRIPT\",
-        \"script\": \"$SCRIPT_DIR/deploy.sh\",
+        \"script\": \"$JSON_SCRIPT\",
         \"when\": \"POSTINIT\",
         \"enabled\": true,
         \"timeout\": $POSTINIT_TIMEOUT
