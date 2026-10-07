@@ -83,12 +83,14 @@ impl Limits {
     }
 
     /// Whether `read` (what the zone reports) is this setting. The kernel
-    /// rounds the time window to the hardware's steps (stock reads back as
-    /// 27983872us, not 28000000), so that one gets 5% either way.
+    /// rounds the time window to the hardware's coarse steps (stock reads
+    /// back as 27983872us, not 28000000; 120s reads back as 111935488us
+    /// on the N5105), so that one gets 25% either way -- still far
+    /// narrower than the gap between a sensible stock and configured value.
     fn matches(&self, read: &Limits) -> bool {
         self.pl1_uw == read.pl1_uw
             && self.pl2_uw == read.pl2_uw
-            && self.tau_us.abs_diff(read.tau_us) * 20 <= self.tau_us
+            && self.tau_us.abs_diff(read.tau_us) * 4 <= self.tau_us
     }
 
     fn describe(&self) -> String {
@@ -605,6 +607,15 @@ mod tests {
         assert!(stock.matches(&read));
         read.tau_us = 40_000_000;
         assert!(!stock.matches(&read));
+        // Seen on the NAS: 120s is stored as 111935488us.
+        let configured = Limits::configured(&CpuPowerConfig::default());
+        let mut read = configured;
+        read.tau_us = 111_935_488;
+        assert!(configured.matches(&read));
+        assert!(!configured.matches(&Limits {
+            tau_us: 27_983_872,
+            ..read
+        }));
         read.tau_us = stock.tau_us;
         read.pl2_uw += 1;
         assert!(!stock.matches(&read), "power limits must match exactly");
