@@ -1,8 +1,13 @@
 # Changelog
 
-Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
+All notable changes to this project are documented in this file.
 
-## Unreleased
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Versions follow `Cargo.toml` (package `lcm-status`). Entries up to 1.3.0
+were reconstructed from git history.
+
+## [Unreleased]
 
 ### Added
 - AQC113 10GbE temperature (hwmon `enp9s0`, PHY/MAC): warn 80C / critical
@@ -35,12 +40,12 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
   survives reboots (TrueNAS regenerates `/etc/group` at boot, which made the
   daemon's socket `chgrp` fail with "invalid group").
 
-## 2.0.0 -- 2026-10-06
+## [2.0.0] - 2026-10-06
 
 Breaking: needs the asustor-platform-driver fork v0.3 or later; the
 `/dev/port` buzzer and the hwmon `pwm3` brightness are gone.
 
-### Requirements
+Requirements:
 - The asustor-platform-driver fork
   (https://github.com/Brady-Woods/asustor-platform-driver), `main`, v0.3
   or later, which replaces the upstream `nas-deploy` build: LEDs, the
@@ -49,6 +54,24 @@ Breaking: needs the asustor-platform-driver fork v0.3 or later; the
   `asustor_it87`) loaded with `led_pwm=3 led_pwm_invert=1` (plus
   `force_pwm=1` on the AS6704T for fan control), for front LED brightness.
   Fan control is unchanged: `pwm1` on the hwmon device named `it8625`.
+
+Upgrading from 1.4.0:
+- Deploy the platform driver first -- the fork's `main` (v0.3 or later)
+  `asustor` modules and its `it87` with `led_pwm=3 led_pwm_invert=1` --
+  then this version. The driver's `deploy.sh` also removes 1.4.0's stale
+  `it87_gp75` export. This version's `deploy.sh` refuses to build without
+  `/sys/devices/platform/asustor` (which older drivers only created on
+  some boards), and the daemon can't beep or set brightness with an older
+  driver or `it87` (it says why in the journal).
+
+### Added
+- EuP / AC-loss check: reads the driver's
+  `/sys/devices/platform/asustor/eup` and `ac_power_resume` (read-only;
+  never written). Logs a WARNING at startup when EuP is on while
+  Wake-on-LAN or a `power_on` schedule rule needs wake from soft-off, and
+  shows both values (and that warning) in `lcm-status status` under
+  "Platform power (BIOS)". Nothing changes with a driver that doesn't
+  provide them.
 
 ### Changed
 - Buzzer: now driven only through the platform driver's own buzzer input
@@ -93,25 +116,7 @@ Breaking: needs the asustor-platform-driver fork v0.3 or later; the
   never work), and the busy-wait tied up a CPU for each beep. The daemon
   no longer touches `/dev/port` or `/sys/class/gpio` at all.
 
-### Upgrading from 1.4.0
-- Deploy the platform driver first -- the fork's `main` (v0.3 or later)
-  `asustor` modules and its `it87` with `led_pwm=3 led_pwm_invert=1` --
-  then this version. The driver's `deploy.sh` also removes 1.4.0's stale
-  `it87_gp75` export. This version's `deploy.sh` refuses to build without
-  `/sys/devices/platform/asustor` (which older drivers only created on
-  some boards), and the daemon can't beep or set brightness with an older
-  driver or `it87` (it says why in the journal).
-
-### Added
-- EuP / AC-loss check: reads the driver's
-  `/sys/devices/platform/asustor/eup` and `ac_power_resume` (read-only;
-  never written). Logs a WARNING at startup when EuP is on while
-  Wake-on-LAN or a `power_on` schedule rule needs wake from soft-off, and
-  shows both values (and that warning) in `lcm-status status` under
-  "Platform power (BIOS)". Nothing changes with a driver that doesn't
-  provide them.
-
-## 1.4.0 -- 2026-10-02
+## [1.4.0] - 2026-10-02
 
 ### Added
 - Chassis buzzer, ADM-style, behind a new `[buzzer]` section (off by
@@ -131,23 +136,34 @@ Breaking: needs the asustor-platform-driver fork v0.3 or later; the
   them. Does not fully remove the green-first look at the start of a
   chassis locate on the AS6704T; still open.
 
-## 1.3.0 -- 2026-10-02
+## [1.3.0] - 2026-10-02
+
+### Added
 - `LOCATE`: blink a bay's (or the chassis') LEDs to find it.
 - ADM-style weekly power schedule (RTC wake, shutdown, restart).
 - Wake-on-LAN: keep `[wol] mode` applied on configured NICs.
 - Fans: fixed mode with a critical-temperature override.
+- LCD display-off at night, front LED brightness, bay LED mode.
+- Optional LCD wire trace (`LCM_STATUS_TRACE=path`).
+
+### Changed
 - NIC LEDs: load `ledtrig-netdev`, verify by read-back, log failures once.
-- LCD display-off at night, front LED brightness, bay LED mode; daytime
-  LEDs restored at startup.
-- Fixed status LED lag and an overnight monitoring gap; LCD redraw; bays
+
+### Fixed
+- Daytime LEDs restored at startup.
+- Status LED lag and an overnight monitoring gap; LCD redraw; bays
   sorted.
 - LCD protocol robustness: write pacing after the MCU speaks, resync on
   partial frames, reject too-early ACKs, redraw both lines after a lost
-  frame; optional wire trace (`LCM_STATUS_TRACE=path`).
+  frame.
 - Guard `SHOW` ttl overflow; build clean on musl and newer clippy.
 
-## 1.2.0 -- 2026-10-02
+## [1.2.0] - 2026-10-02
+
+### Added
 - Configurable screen templates and rotation order.
+
+### Changed
 - Fan control fails safe (full speed without sensors, handed back on
   exit); curve-commanded PWM 0 treated as a stop; manual mode asserted
   before kicks.
@@ -156,17 +172,31 @@ Breaking: needs the asustor-platform-driver fork v0.3 or later; the
   subcommands rejected; a second daemon refuses to start.
 - Config validated beyond templates; unknown keys reported.
 - Edition 2024 and clippy pedantic; assorted cleanups.
+
+### Fixed
 - Front-panel button frames no longer dropped mid-write; sleep-window
   timezone bug fixed; night mode blanks text instead of cutting
   `power:lcd`.
 
-## 1.1.0 -- 2026-09-23
+## [1.1.0] - 2026-09-23
+
+### Added
 - `lcm-status status`: live terminal report from the running daemon.
 - Syslog health monitoring (temps, fan speed, pool health, SMART); status
   LED reflects all monitored health.
 - Multi-fan/multi-sensor fan config and the `fan-profile` calibration
   tool; per-sensor curve endpoints.
 
-## 1.0.0 -- 2026-09-23
+## [1.0.0] - 2026-09-23
+
+### Added
 - Initial release: portable ASUSTOR LCM/LED driver for TrueNAS SCALE, fan
   control, deploy script.
+
+[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.4.0...v2.0.0
+[1.4.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/releases/tag/v1.0.0
