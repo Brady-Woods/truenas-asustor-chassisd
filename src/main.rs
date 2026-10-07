@@ -498,21 +498,6 @@ fn event_loop(
         // status and power schedule too, which live out here alongside
         // `state`, not inside it.
         for cmd in socket::drain(rx) {
-            if (!state.is_asleep()
-                || matches!(
-                    &cmd,
-                    socket::SocketCommand::Show {
-                        level: socket::Level::Critical,
-                        ..
-                    }
-                ))
-                && let socket::SocketCommand::Show { level, .. } = &cmd
-                && *level >= socket::Level::Warn
-                && last_alert_beep.is_none_or(|t| t.elapsed() >= ALERT_BEEP_INTERVAL)
-            {
-                buzzer::alert();
-                last_alert_beep = Some(Instant::now());
-            }
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
                 let _ = resp_tx.send(report::build(
                     state,
@@ -576,6 +561,22 @@ fn event_loop(
         // a truly stuck pass, not a slow one, starves the watchdog.
         progress.bump();
         let effect = state.tick();
+        // Alert beeps: a message that just arrived (at most one a minute, so
+        // a script re-sending `SHOW` doesn't nag) or a `beep=repeat` one
+        // coming round again (already a minute apart, so never held back).
+        match state.take_beep() {
+            Some(state::AlertBeep::Repeat) => {
+                buzzer::alert();
+                last_alert_beep = Some(Instant::now());
+            }
+            Some(state::AlertBeep::Arrival)
+                if last_alert_beep.is_none_or(|t| t.elapsed() >= ALERT_BEEP_INTERVAL) =>
+            {
+                buzzer::alert();
+                last_alert_beep = Some(Instant::now());
+            }
+            _ => {}
+        }
         progress.bump();
         apply_effect(effect, state.display_wanted(), lcm, power);
         drain_pending_keys(state, lcm, power);

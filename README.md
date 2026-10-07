@@ -276,6 +276,8 @@ devices at all:
 | `Degraded` | solid | 500ms/500ms blink | a ZFS pool is `DEGRADED` (factory pattern) |
 | `Failed` | off | solid | a pool is `FAULTED`/`UNAVAIL`/`OFFLINE`, or `error`-level socket alert |
 | `CriticalFlashing` | off | 1000ms/1000ms blink | `critical`-level socket alert |
+| `GreenFlashing` | 1000ms/1000ms blink | off | a `SHOW` with `color=green flash=flash` |
+| `WarningFlashing` | 1000ms/1000ms blink | 1000ms/1000ms blink (together = amber flash) | a `SHOW` with `color=yellow flash=flash` |
 | `Locate` | 250ms/250ms blink | 250ms/250ms blink (together = amber flash) | a chassis `LOCATE` (not a health state; wins over all of the above while it lasts) |
 
 `red:status` is **not** one of the IT8625E's hardware-blinkable LEDs (see
@@ -555,13 +557,13 @@ non-interactive use); otherwise it asks before touching any hardware.
 enabled = false   # master switch; off by default
 boot = true       # long beep when the daemon starts during boot
 power = true      # short beep before a shutdown/restart (also when the OS reboots)
-alerts = true     # short beep on warn/error/critical alerts (max 1/min; only critical while asleep)
+alerts = true     # beeps for socket messages: error once, critical every minute until cleared (SHOW beep= overrides)
 find_me = true    # short beep when a chassis LOCATE starts (at most one per 30 s)
 ```
 
 Same sounds as ADM, a ~2 kHz tone: one long beep (800 ms) when the daemon
 starts during boot, one short beep (200 ms) before a shutdown/restart,
-when a chassis LOCATE starts, and on alerts.
+when a chassis LOCATE starts, and on alerts (an `error` message once, a `critical` one every minute until cleared).
 
 **Requirements:** the asustor-platform-driver fork (`main`, v0.3 or later).
 The speaker sits behind Super I/O pin GP75; the driver claims that pin
@@ -868,7 +870,7 @@ falls back to anything wider. A socket path
 too long to stage this way is bound in place and fixed up right afterwards.
 
 ```
-SHOW <level> <ttl_secs> [bay=N]
+SHOW <level> <ttl_secs> [bay=N] [color=C] [flash=F] [beep=B]
 <line0>
 <line1>
 
@@ -889,6 +891,8 @@ LOCATE off [bay=N]
 - `bay=N` (optional): also flashes that bay's red LED (`Alert` state,
   distinct from a confirmed SMART `Failed`) for as long as the message is
   showing. Only meaningful with `error`/`critical`.
+- `color=`, `flash=`, `beep=` (optional): override the level's LED colour,
+  flashing and beeping -- see "What a level does" below.
 - `line0`/`line1`: each truncated to `[display].scroll_max_chars`
   (default 64) and auto-scrolled if over 16 characters, at
   `[display].scroll_step_ms` per character-step.
@@ -937,6 +941,62 @@ any) as `line1` (so bare text can't itself start with one of those words):
 ```sh
 printf "Backup done\n42 files\n" | nc -U /run/lcm-status.sock -q1
 ```
+
+**What a level does to the LEDs and buzzer.** Each `level` has a default
+look; the `color=`, `flash=` and `beep=` options below override any part
+of it.
+
+| `level` | Status LED | Beep (needs `[buzzer] enabled = true`, `alerts = true`) |
+|---|---|---|
+| `info` | green (solid; a plain `info` leaves the LED to the daemon's own health state) | none |
+| `warn` | yellow (solid amber) | none |
+| `error` | solid red | one short beep |
+| `critical` | red flashing 1000ms/1000ms | one short beep, then another **every 60 seconds until cleared** |
+
+**Custom looks: `color=`, `flash=`, `beep=`.** Add any of these to the
+`SHOW` header (in any order, alongside `bay=N`) to pick the status LED and
+the buzzer yourself, whatever the level:
+
+| Option | Values | Default |
+|---|---|---|
+| `color=` | `green`, `yellow` (or `amber`), `red` | from the level (table above) |
+| `flash=` | `solid`, `flash` (also `on`/`off`, `yes`/`no`) | `flash` for `critical`, else `solid` |
+| `beep=` | `none`, `once`, `repeat` | `none` for info/warn, `once` for error, `repeat` for critical |
+
+`beep=once` is one short beep when the message arrives; `beep=repeat` adds
+another every 60 seconds until the message is cleared, replaced or expires.
+Unknown options or values are an `ERR`, never ignored. Examples:
+
+```sh
+# Flashing yellow with a single beep, until cleared:
+printf "SHOW warn 0 color=yellow flash=flash beep=once\nBACKUP LATE\nNo run in 3d\n" \
+  | nc -U /run/lcm-status.sock -q1
+
+# A critical message that stays silent:
+printf "SHOW critical 0 beep=none\nPOOL RESILVER\n" | nc -U /run/lcm-status.sock -q1
+
+# Solid red with a beep every minute (an error that nags):
+printf "SHOW error 0 beep=repeat\nUPS ON BATTERY\n" | nc -U /run/lcm-status.sock -q1
+```
+
+Notes:
+
+- The level still decides persistence and precedence: `error`/`critical`
+  ignore `ttl_secs` and wake the panel, and a lower level never replaces
+  a more severe active message. `color=`/`flash=` only change what the
+  status LED shows. If the daemon has a *more severe* health alarm of its
+  own (a faulted pool, say) the LED shows that instead, as always.
+- Beeps are rate-limited: a message arriving with a beep right after another
+  one (within 60 seconds) is silent, so a script re-sending `SHOW` every few
+  seconds beeps about once a minute rather than every time. The repeat beeps
+  of a `beep=repeat` message aren't affected.
+- While the panel is asleep (night schedule) only `critical` beeps.
+- The beep itself is always the same short 2 kHz tone, and also requires
+  the `[buzzer]` config (`lcm-status status` shows under "Buzzer" whether it
+  can sound).
+- A flashing `yellow` is 1000ms/1000ms, deliberately slower than a chassis
+  `LOCATE`'s 250ms/250ms amber so the two can't be mistaken. Blink rates
+  aren't otherwise selectable.
 
 **A critical drive alert, with the bay LED flashing too:**
 

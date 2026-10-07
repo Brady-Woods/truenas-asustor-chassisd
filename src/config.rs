@@ -115,8 +115,9 @@ pub struct BuzzerConfig {
     pub boot: bool,
     /// Beep (short) just before a shutdown or restart.
     pub power: bool,
-    /// Beep (short) when a warning, error or critical alert is shown, at
-    /// most once a minute; during the sleep window only critical ones.
+    /// Beep (short) for a socket `SHOW` that beeps (by default error once,
+    /// critical again every minute until cleared; `beep=` overrides). Arrival
+    /// beeps are at most once a minute; during the sleep window only critical.
     pub alerts: bool,
     /// Beep (short) when a chassis `LOCATE` starts.
     pub find_me: bool,

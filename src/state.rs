@@ -10,7 +10,7 @@ use crate::driver_watch::{self, Change, DriverWatch};
 use crate::hal::{self, Screen};
 use crate::led;
 use crate::protocol::Key;
-use crate::socket::{Level, SocketCommand};
+use crate::socket::{BeepMode, Level, Look, REPEAT_BEEP_SECS, SocketCommand};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -33,10 +33,31 @@ impl Action {
 #[derive(Debug, Clone)]
 struct Override {
     level: Level,
+    /// The `color=` / `flash=` / `beep=` the message asked for, over its
+    /// level's defaults.
+    look: Look,
     expires_at: Option<Instant>,
     bay: Option<u32>,
     line0: String,
     line1: String,
+}
+
+impl Override {
+    fn beep(&self) -> BeepMode {
+        self.look
+            .beep
+            .unwrap_or_else(|| BeepMode::default_for(self.level))
+    }
+}
+
+/// Why `AppState::take_beep` wants the buzzer to sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertBeep {
+    /// A message that beeps just arrived (the caller rate-limits these, so
+    /// a script re-sending one doesn't nag).
+    Arrival,
+    /// A `beep=repeat` message is still showing and its minute is up.
+    Repeat,
 }
 
 /// A chassis-wide `LOCATE` (one with no bay): power and status LEDs
@@ -147,6 +168,10 @@ pub struct AppState {
     mode: Mode,
     over: Option<Override>,
     pending_over: Option<Override>,
+    /// A beep `show_override` / `tick` wants played; taken by `take_beep`.
+    beep_pending: Option<AlertBeep>,
+    /// When the active override's next repeat beep is due (`beep=repeat`).
+    next_repeat_beep: Option<Instant>,
     /// The bay currently flashing due to an active override, if any --
     /// tracked separately from `over.bay` so we know which bay's LED to
     /// restore to Normal when the override changes or clears.
@@ -262,6 +287,8 @@ impl AppState {
             status_shown: Cell::new(None),
             led_inputs: None,
             alarm: None,
+            beep_pending: None,
+            next_repeat_beep: None,
             sleeping: false,
             schedule_wants_sleep: false,
             awake_override_until: None,
@@ -426,11 +453,6 @@ impl AppState {
 
     /// Whether the LCD's display should be on: always, except asleep with
     /// `[sleep] lcd_off` -- and even then a chassis locate lights it.
-    /// Inside the sleep window (the panel is dark or blanked).
-    pub fn is_asleep(&self) -> bool {
-        self.sleeping
-    }
-
     pub fn display_wanted(&self) -> bool {
         !(self.sleeping && self.cfg.sleep.lcd_off && self.locate_chassis.is_none())
     }
@@ -561,7 +583,7 @@ impl AppState {
     fn recompute_status_led(&mut self) {
         // The socket message first, so it wins a tie with a health alarm.
         let pushed = self.over.as_ref().and_then(|ov| {
-            led::pattern_for_level(ov.level)
+            led::pattern_for_show(ov.level, ov.look)
                 .map(|p| Alarm::with_pattern(ov.level, p, &ov.line0, &ov.line1))
         });
         self.alarm = alarm::most_critical(pushed.into_iter().chain(self.health_summary().alarms));
@@ -1092,6 +1114,7 @@ impl AppState {
                 self.apply_pending_override();
                 self.show_override(Override {
                     level: Level::Info,
+                    look: Look::default(),
                     expires_at: Some(deadline_after(5)),
                     bay: None,
                     line0,
@@ -1185,6 +1208,7 @@ impl AppState {
                 bay,
                 line0,
                 line1,
+                look,
             } => {
                 // error/critical are meant to always be seen: force them to
                 // persist regardless of whatever ttl the caller passed. A
@@ -1197,6 +1221,7 @@ impl AppState {
                 };
                 let ov = Override {
                     level,
+                    look,
                     expires_at,
                     bay,
                     line0,
@@ -1225,6 +1250,11 @@ impl AppState {
         }
     }
 
+    /// The beep the buzzer should sound now, if any -- at most one per call.
+    pub fn take_beep(&mut self) -> Option<AlertBeep> {
+        self.beep_pending.take()
+    }
+
     fn apply_pending_override(&mut self) {
         if let Some(ov) = self.pending_over.take() {
             self.show_override(ov);
@@ -1240,12 +1270,20 @@ impl AppState {
         if self.over.as_ref().is_some_and(|o| ov.level < o.level) {
             return;
         }
+        // While the panel sleeps only a critical message is worth a beep.
+        let may_beep = !self.sleeping || ov.level == Level::Critical;
         if self.sleeping {
             if !ov.level.always_visible() {
                 return;
             }
             self.wake();
         }
+        let beep = ov.beep();
+        if beep != BeepMode::None && may_beep {
+            self.beep_pending = Some(AlertBeep::Arrival);
+        }
+        self.next_repeat_beep =
+            (beep == BeepMode::Repeat).then(|| deadline_after(REPEAT_BEEP_SECS));
         self.over = Some(ov);
         self.reset_scroll();
         self.sync_leds_to_override();
@@ -1357,6 +1395,19 @@ impl AppState {
             self.over = None;
             self.reset_scroll();
             self.sync_leds_to_override();
+        }
+
+        // A `beep=repeat` message (every critical one, by default) beeps
+        // again each minute until it is cleared or replaced.
+        if let Some(due) = self.next_repeat_beep
+            && self
+                .over
+                .as_ref()
+                .is_some_and(|o| o.beep() == BeepMode::Repeat)
+            && Instant::now() >= due
+        {
+            self.beep_pending.get_or_insert(AlertBeep::Repeat);
+            self.next_repeat_beep = Some(deadline_after(REPEAT_BEEP_SECS));
         }
 
         // Resume auto-rotation after manual paging goes idle.
@@ -1558,6 +1609,7 @@ mod tests {
             level,
             ttl_secs: 0,
             bay: None,
+            look: crate::socket::Look::default(),
             line0: text.to_string(),
             line1: String::new(),
         });
@@ -1565,6 +1617,96 @@ mod tests {
 
     fn active(state: &AppState) -> Option<(Level, &str)> {
         state.over.as_ref().map(|o| (o.level, o.line0.as_str()))
+    }
+
+    fn show_look(state: &mut AppState, level: Level, look: Look) {
+        state.apply_socket_command(SocketCommand::Show {
+            level,
+            ttl_secs: 0,
+            bay: None,
+            look,
+            line0: "X".to_string(),
+            line1: String::new(),
+        });
+    }
+
+    #[test]
+    fn levels_beep_as_documented() {
+        for (level, beeps) in [
+            (Level::Info, false),
+            (Level::Warn, false),
+            (Level::Error, true),
+            (Level::Critical, true),
+        ] {
+            let mut s = AppState::new(Config::default());
+            show(&mut s, level, "X");
+            assert_eq!(s.take_beep().is_some(), beeps, "{level:?}");
+            assert_eq!(s.take_beep(), None);
+        }
+    }
+
+    #[test]
+    fn beep_option_overrides_the_level() {
+        let mut s = AppState::new(Config::default());
+        let beep = |b| Look {
+            beep: Some(b),
+            ..Look::default()
+        };
+        show_look(&mut s, Level::Critical, beep(BeepMode::None));
+        assert_eq!(s.take_beep(), None);
+        let mut s = AppState::new(Config::default());
+        show_look(&mut s, Level::Warn, beep(BeepMode::Once));
+        assert_eq!(s.take_beep(), Some(AlertBeep::Arrival));
+    }
+
+    #[test]
+    fn critical_beeps_again_every_minute_until_cleared() {
+        let mut s = AppState::new(Config::default());
+        show(&mut s, Level::Critical, "X");
+        assert_eq!(s.take_beep(), Some(AlertBeep::Arrival));
+        s.tick();
+        assert_eq!(s.take_beep(), None);
+        s.next_repeat_beep = Some(Instant::now());
+        s.tick();
+        assert_eq!(s.take_beep(), Some(AlertBeep::Repeat));
+        s.tick();
+        assert_eq!(s.take_beep(), None);
+        s.next_repeat_beep = Some(Instant::now());
+        s.apply_socket_command(SocketCommand::Clear { bay: None });
+        s.tick();
+        assert_eq!(s.take_beep(), None);
+    }
+
+    #[test]
+    fn error_does_not_repeat() {
+        let mut s = AppState::new(Config::default());
+        show(&mut s, Level::Error, "X");
+        assert_eq!(s.take_beep(), Some(AlertBeep::Arrival));
+        assert_eq!(s.next_repeat_beep, None);
+    }
+
+    #[test]
+    fn custom_look_picks_the_status_led() {
+        use crate::socket::Color;
+        let mut s = AppState::new(Config::default());
+        show_look(
+            &mut s,
+            Level::Warn,
+            Look {
+                color: Some(Color::Red),
+                flash: Some(true),
+                beep: None,
+            },
+        );
+        assert_eq!(
+            s.alarm.as_ref().map(|a| a.pattern),
+            Some(led::StatusPattern::CriticalFlashing)
+        );
+        show_look(&mut s, Level::Warn, Look::default());
+        assert_eq!(
+            s.alarm.as_ref().map(|a| a.pattern),
+            Some(led::StatusPattern::Warning)
+        );
     }
 
     #[test]
@@ -1616,6 +1758,7 @@ mod tests {
             level: Level::Info,
             ttl_secs: 0,
             bay: None,
+            look: crate::socket::Look::default(),
             line0: "a line that is long enough to scroll across the panel".to_string(),
             line1: String::new(),
         });
@@ -1630,6 +1773,7 @@ mod tests {
             level: Level::Info,
             ttl_secs: u64::MAX,
             bay: None,
+            look: crate::socket::Look::default(),
             line0: "FOREVER".to_string(),
             line1: String::new(),
         });
@@ -1815,6 +1959,7 @@ mod tests {
             level: Level::Critical,
             ttl_secs: 0,
             bay: Some(1),
+            look: crate::socket::Look::default(),
             line0: "DISK".into(),
             line1: String::new(),
         });

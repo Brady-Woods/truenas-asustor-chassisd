@@ -69,11 +69,77 @@ impl Level {
     }
 }
 
+/// The status LED colour a `SHOW` can ask for with `color=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Green,
+    /// Green and red together, the panel's amber.
+    Yellow,
+    Red,
+}
+
+impl Color {
+    fn parse(s: &str) -> Option<Color> {
+        match s.to_ascii_lowercase().as_str() {
+            "green" => Some(Color::Green),
+            "yellow" | "amber" => Some(Color::Yellow),
+            "red" => Some(Color::Red),
+            _ => None,
+        }
+    }
+}
+
+/// How often a `SHOW` beeps, from `beep=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeepMode {
+    None,
+    /// One short beep when the message arrives.
+    Once,
+    /// One when it arrives, then another every `REPEAT_BEEP_SECS` until it
+    /// is cleared (or expires).
+    Repeat,
+}
+
+impl BeepMode {
+    fn parse(s: &str) -> Option<BeepMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" | "no" => Some(BeepMode::None),
+            "once" | "on" | "yes" => Some(BeepMode::Once),
+            "repeat" => Some(BeepMode::Repeat),
+            _ => None,
+        }
+    }
+
+    /// What a level does when the request doesn't say: error beeps once,
+    /// critical keeps beeping until cleared, info and warn are silent.
+    pub fn default_for(level: Level) -> BeepMode {
+        match level {
+            Level::Info | Level::Warn => BeepMode::None,
+            Level::Error => BeepMode::Once,
+            Level::Critical => BeepMode::Repeat,
+        }
+    }
+}
+
+/// Seconds between the beeps of a `beep=repeat` message.
+pub const REPEAT_BEEP_SECS: u64 = 60;
+
+/// The optional `color=`, `flash=` and `beep=` of a `SHOW`. Each left unset
+/// takes the level's default: info green, warn yellow, error solid red,
+/// critical flashing red; beeping as `BeepMode::default_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Look {
+    pub color: Option<Color>,
+    pub flash: Option<bool>,
+    pub beep: Option<BeepMode>,
+}
+
 #[derive(Clone)]
 pub enum SocketCommand {
     Show {
         level: Level,
         ttl_secs: u64,
+        look: Look,
         /// Optional bay this alert is about (e.g. from `SHOW error 0
         /// bay=2`). error/critical with a bay set also flashes that bay's
         /// red LED (a distinct "alert" pattern from a confirmed SMART
@@ -157,7 +223,8 @@ fn parse_message(lines: &[String]) -> Result<SocketCommand, String> {
         "CLEAR" => parse_bay(parts).map(|bay| SocketCommand::Clear { bay }),
         "LOCATE" => parse_locate(parts),
         "SHOW" => {
-            const USAGE: &str = "SHOW needs <level> <ttl_secs> [bay=N]";
+            const USAGE: &str =
+                "SHOW needs <level> <ttl_secs> [bay=N] [color=C] [flash=F] [beep=B]";
             let level = parts.next().ok_or(USAGE)?;
             let level = Level::parse(level).ok_or_else(|| {
                 format!(
@@ -169,10 +236,11 @@ fn parse_message(lines: &[String]) -> Result<SocketCommand, String> {
             let ttl_secs = ttl
                 .parse()
                 .map_err(|_| format!("bad ttl_secs {}; expected whole seconds", quote(ttl)))?;
-            let bay = parse_bay(parts)?;
+            let (bay, look) = parse_show_options(parts)?;
             Ok(SocketCommand::Show {
                 level,
                 ttl_secs,
+                look,
                 bay,
                 line0: lines.get(1).cloned().unwrap_or_default(),
                 line1: lines.get(2).cloned().unwrap_or_default(),
@@ -183,6 +251,7 @@ fn parse_message(lines: &[String]) -> Result<SocketCommand, String> {
             Ok(SocketCommand::Show {
                 level: Level::Info,
                 ttl_secs: 5,
+                look: Look::default(),
                 bay: None,
                 line0: lines.first().cloned().unwrap_or_default(),
                 line1: lines.get(1).cloned().unwrap_or_default(),
@@ -219,6 +288,60 @@ fn parse_bay<'a>(parts: impl Iterator<Item = &'a str>) -> Result<Option<u32>, St
         }
     }
     Ok(bay)
+}
+
+/// The arguments after `SHOW <level> <ttl>`, in any order: `bay=N`,
+/// `color=green|yellow|red`, `flash=solid|flash` and `beep=none|once|repeat`.
+/// Strict, like `parse_bay`: an unknown or repeated option rejects the
+/// request rather than being ignored.
+fn parse_show_options<'a>(
+    parts: impl Iterator<Item = &'a str>,
+) -> Result<(Option<u32>, Look), String> {
+    let (mut bay, mut look) = (None, Look::default());
+    for part in parts {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let twice = || format!("{key} given twice");
+        match key.to_ascii_lowercase().as_str() {
+            "bay" => {
+                if bay.replace(bay_number(value)?).is_some() {
+                    return Err(twice());
+                }
+            }
+            "color" | "colour" => {
+                let c = Color::parse(value).ok_or_else(|| {
+                    format!("bad color {}; expected green, yellow or red", quote(value))
+                })?;
+                if look.color.replace(c).is_some() {
+                    return Err(twice());
+                }
+            }
+            "flash" => {
+                let f = match value.to_ascii_lowercase().as_str() {
+                    "flash" | "flashing" | "on" | "yes" | "true" => true,
+                    "solid" | "steady" | "off" | "no" | "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "bad flash {}; expected solid or flash",
+                            quote(value)
+                        ));
+                    }
+                };
+                if look.flash.replace(f).is_some() {
+                    return Err(twice());
+                }
+            }
+            "beep" => {
+                let b = BeepMode::parse(value).ok_or_else(|| {
+                    format!("bad beep {}; expected none, once or repeat", quote(value))
+                })?;
+                if look.beep.replace(b).is_some() {
+                    return Err(twice());
+                }
+            }
+            _ => return Err(format!("unexpected argument {}", quote(part))),
+        }
+    }
+    Ok((bay, look))
 }
 
 /// The arguments after `LOCATE`, in any order: `off`, `bay=N`, and a TTL
@@ -763,6 +886,7 @@ mod tests {
                 bay,
                 line0,
                 line1,
+                ..
             } => {
                 assert_eq!(level, Level::Critical);
                 assert_eq!(ttl_secs, 0);
@@ -783,6 +907,44 @@ mod tests {
                 assert_eq!(bay, Some(2));
             }
             _ => panic!("expected Show"),
+        }
+    }
+
+    #[test]
+    fn parses_show_look_options() {
+        let cmd = parse_message(&lines(
+            "SHOW warn 0 flash=flash color=red beep=repeat bay=2\nHI",
+        ))
+        .unwrap();
+        match cmd {
+            SocketCommand::Show { bay, look, .. } => {
+                assert_eq!(bay, Some(2));
+                assert_eq!(
+                    look,
+                    Look {
+                        color: Some(Color::Red),
+                        flash: Some(true),
+                        beep: Some(BeepMode::Repeat),
+                    }
+                );
+            }
+            _ => panic!("expected Show"),
+        }
+        let plain = parse_message(&lines("SHOW info 5\nHI")).unwrap();
+        assert!(matches!(plain, SocketCommand::Show { look, .. } if look == Look::default()));
+    }
+
+    #[test]
+    fn rejects_bad_show_options() {
+        for bad in [
+            "SHOW info 0 color=blue",
+            "SHOW info 0 flash=maybe",
+            "SHOW info 0 beep=loud",
+            "SHOW info 0 color=red color=green",
+            "SHOW info 0 colour",
+            "SHOW info 0 volume=3",
+        ] {
+            assert!(parse_message(&lines(bad)).is_err(), "{bad}");
         }
     }
 
@@ -885,6 +1047,7 @@ mod tests {
                 bay,
                 line0,
                 line1,
+                ..
             } => {
                 assert_eq!(level, Level::Info);
                 assert_eq!(ttl_secs, 5);

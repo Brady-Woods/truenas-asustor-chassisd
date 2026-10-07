@@ -8,7 +8,7 @@
 //! bay LEDs' idle style (the platform driver's `disk_led_ready` parameter,
 //! see `set_bay_mode`).
 
-use crate::socket::Level;
+use crate::socket::{Color, Level, Look};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -192,6 +192,13 @@ pub enum StatusPattern {
     /// coarse: which specific thing tripped it is on the LCD/syslog, not
     /// encoded in the LED color.
     Warning,
+    /// Green flashing 1000/1000, red off -- a `SHOW ... color=green
+    /// flash=flash`.
+    GreenFlashing,
+    /// Amber (green+red) flashing 1000/1000 -- a `SHOW ... color=yellow
+    /// flash=flash`. Slower than `Locate`'s 250/250, so the two can't be
+    /// mistaken for each other.
+    WarningFlashing,
     /// Green solid, red flashing 500/500 -- factory RAID-degraded pattern.
     Degraded,
     /// Solid red -- factory "malfunction".
@@ -212,8 +219,11 @@ impl StatusPattern {
     /// 0 for the patterns that aren't alarms at all.
     pub fn severity(self) -> u8 {
         match self {
-            StatusPattern::Ok | StatusPattern::Locate | StatusPattern::Off => 0,
-            StatusPattern::Warning => 1,
+            StatusPattern::Ok
+            | StatusPattern::GreenFlashing
+            | StatusPattern::Locate
+            | StatusPattern::Off => 0,
+            StatusPattern::Warning | StatusPattern::WarningFlashing => 1,
             StatusPattern::Degraded => 2,
             StatusPattern::Failed => 3,
             StatusPattern::CriticalFlashing => 4,
@@ -231,6 +241,19 @@ pub fn set_status(pattern: StatusPattern) {
         StatusPattern::Warning => {
             set_solid("green:status", true);
             set_solid("red:status", true);
+        }
+        StatusPattern::GreenFlashing => {
+            write_attr("red:status", "trigger", "none");
+            set_solid("red:status", false);
+            set_blink("green:status", 1000, 1000);
+        }
+        StatusPattern::WarningFlashing => {
+            // Primed solid first so both start lit, as `prime_locate_status`
+            // does: a timer trigger keeps the LED's state until its first toggle.
+            set_solid("green:status", true);
+            set_solid("red:status", true);
+            set_blink("green:status", 1000, 1000);
+            set_blink("red:status", 1000, 1000);
         }
         StatusPattern::Degraded => {
             set_solid("green:status", true);
@@ -281,15 +304,29 @@ pub fn set_power(pattern: PowerPattern) {
     set_solid("red:power", false);
 }
 
-/// Maps a socket-pushed severity level directly to a status pattern, for
-/// when an active override should also drive the LED (info/warn don't
-/// override the health-derived pattern; error/critical do).
-pub fn pattern_for_level(level: Level) -> Option<StatusPattern> {
-    match level {
-        Level::Error => Some(StatusPattern::Failed),
-        Level::Critical => Some(StatusPattern::CriticalFlashing),
-        Level::Info | Level::Warn => None,
+/// The status pattern a `SHOW` asks for: the level's own (info green,
+/// warn yellow, error solid red, critical flashing red) with any `color=`
+/// / `flash=` of the request laid over it. `None` for a plain `info`,
+/// which doesn't take over the LED at all -- it just isn't an alarm.
+pub fn pattern_for_show(level: Level, look: Look) -> Option<StatusPattern> {
+    if level == Level::Info && look.color.is_none() && look.flash.is_none() {
+        return None;
     }
+    let (color, flash) = match level {
+        Level::Info => (Color::Green, false),
+        Level::Warn => (Color::Yellow, false),
+        Level::Error => (Color::Red, false),
+        Level::Critical => (Color::Red, true),
+    };
+    let (color, flash) = (look.color.unwrap_or(color), look.flash.unwrap_or(flash));
+    Some(match (color, flash) {
+        (Color::Green, false) => StatusPattern::Ok,
+        (Color::Green, true) => StatusPattern::GreenFlashing,
+        (Color::Yellow, false) => StatusPattern::Warning,
+        (Color::Yellow, true) => StatusPattern::WarningFlashing,
+        (Color::Red, false) => StatusPattern::Failed,
+        (Color::Red, true) => StatusPattern::CriticalFlashing,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,6 +792,60 @@ pub fn driver_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_levels_pick_the_documented_status_patterns() {
+        let p = |level, look| pattern_for_show(level, look);
+        let none = Look::default();
+        assert_eq!(p(Level::Info, none), None);
+        assert_eq!(p(Level::Warn, none), Some(StatusPattern::Warning));
+        assert_eq!(p(Level::Error, none), Some(StatusPattern::Failed));
+        assert_eq!(
+            p(Level::Critical, none),
+            Some(StatusPattern::CriticalFlashing)
+        );
+    }
+
+    #[test]
+    fn show_color_and_flash_override_the_level() {
+        let look = |color, flash| Look {
+            color,
+            flash,
+            beep: None,
+        };
+        assert_eq!(
+            pattern_for_show(Level::Info, look(Some(Color::Green), Some(true))),
+            Some(StatusPattern::GreenFlashing)
+        );
+        assert_eq!(
+            pattern_for_show(Level::Warn, look(None, Some(true))),
+            Some(StatusPattern::WarningFlashing)
+        );
+        assert_eq!(
+            pattern_for_show(Level::Critical, look(None, Some(false))),
+            Some(StatusPattern::Failed)
+        );
+        assert_eq!(
+            pattern_for_show(Level::Error, look(Some(Color::Yellow), None)),
+            Some(StatusPattern::Warning)
+        );
+    }
+
+    #[test]
+    fn flashing_status_patterns_blink_the_right_leds() {
+        test_writes::take();
+        set_status(StatusPattern::GreenFlashing);
+        assert!(test_writes::wrote("green:status", "trigger", "timer"));
+        assert!(test_writes::wrote("green:status", "delay_on", "1000"));
+        assert!(test_writes::wrote("red:status", "brightness", "0"));
+        assert!(!test_writes::wrote("red:status", "trigger", "timer"));
+
+        test_writes::take();
+        set_status(StatusPattern::WarningFlashing);
+        assert!(test_writes::wrote("green:status", "trigger", "timer"));
+        assert!(test_writes::wrote("red:status", "trigger", "timer"));
+        assert!(test_writes::wrote("red:status", "delay_off", "1000"));
+    }
 
     #[test]
     fn brightness_percent_maps_to_the_led_range() {

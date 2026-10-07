@@ -219,8 +219,10 @@ enabled = false
 boot = true               # one long beep (800 ms) when the daemon starts during boot
 power = true              # one short beep (200 ms) before a shutdown/restart,
                           # including one the OS starts (the daemon is stopped)
-alerts = true             # short beep on a warning/error/critical SHOW; at most
-                          # once a minute; during the [sleep] window only critical
+alerts = true             # short beep on a SHOW that beeps (default: error once, critical
+                          # again every minute until cleared; see beep= in the README);
+                          # arrival beeps at most once a minute; during the [sleep]
+                          # window only critical
 find_me = true            # short beep when a chassis LOCATE starts
 
 [wol]

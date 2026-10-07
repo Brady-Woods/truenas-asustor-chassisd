@@ -9,6 +9,24 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+### Added
+
+- **Socket `SHOW` look options.** `SHOW <level> <ttl> ... [color=green|yellow|red]
+  [flash=solid|flash] [beep=none|once|repeat]` picks the status LED colour,
+  flashing and buzzer per message, over the level's defaults. Two new status
+  patterns back it: green flashing and yellow (amber) flashing, both
+  1000ms/1000ms. Unknown options or values are an `ERR`.
+- `critical` messages (and `beep=repeat`) beep again every 60 seconds until
+  cleared, replaced or expired.
+
+### Changed
+
+- Socket levels now map to the status LED as: info green, warn yellow (solid
+  amber, previously no LED change), error solid red, critical flashing red.
+- Alert beeps: `error` and `critical` beep by default; `warn` no longer does
+  (use `beep=once` to get it back). Arrival beeps are still limited to one a
+  minute, and only `critical` beeps while the panel sleeps.
+
 ## [3.0.0] - 2026-10-06
 
 Major because the socket protocol changed (see **BREAKING** below), the
