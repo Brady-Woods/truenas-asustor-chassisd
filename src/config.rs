@@ -1112,6 +1112,10 @@ impl Config {
     }
 }
 
+/// Range accepted for `[[fans]] update_secs`.
+const MIN_FAN_UPDATE_SECS: u64 = 1;
+const MAX_FAN_UPDATE_SECS: u64 = 60;
+
 /// Clamps `value` to `max`, noting it in `errors` if that changed it.
 fn clamp_to<T: PartialOrd + Copy + std::fmt::Display>(
     errors: &mut Vec<String>,
@@ -1180,6 +1184,18 @@ impl Config {
     fn sanitize_fan_temps(&mut self, errors: &mut Vec<String>) {
         let defaults = FanProfile::default();
         for fan in &mut self.fans {
+            // 0 would spin the control loop and a huge value would freeze
+            // the fan after its first update, so keep it in a sane range.
+            let clamped = fan
+                .update_secs
+                .clamp(MIN_FAN_UPDATE_SECS, MAX_FAN_UPDATE_SECS);
+            if clamped != fan.update_secs {
+                errors.push(format!(
+                    "[[fans]] '{}': update_secs = {} is outside {MIN_FAN_UPDATE_SECS}..={MAX_FAN_UPDATE_SECS}; using {clamped}",
+                    fan.name, fan.update_secs
+                ));
+                fan.update_secs = clamped;
+            }
             for (key, value, default) in [
                 ("min_temp_c", &mut fan.min_temp_c, defaults.min_temp_c),
                 ("max_temp_c", &mut fan.max_temp_c, defaults.max_temp_c),
@@ -1352,6 +1368,25 @@ mod tests {
         assert_eq!(cfg.refresh.docker_min_secs, MAX_SECS);
         assert_eq!(cfg.display.scroll_max_chars, MAX_SCROLL_CHARS);
         assert_eq!(cfg.display.scroll_gap, MAX_SCROLL_GAP);
+    }
+
+    #[test]
+    fn fan_update_secs_is_clamped_to_one_to_sixty() {
+        for (given, want) in [
+            (0u64, 1u64),
+            (1, 1),
+            (60, 60),
+            (61, 60),
+            (9_223_372_036_854_775_807, 60),
+        ] {
+            let (cfg, errors) = parse(&format!(
+                "[[fans]]\nname = \"f\"\npwm_chip = \"it8625\"\nupdate_secs = {given}\n"
+            ));
+            let fan = cfg.fans.iter().find(|f| f.name == "f").unwrap();
+            assert_eq!(fan.update_secs, want, "{given}");
+            let flagged = errors.iter().any(|e| e.contains("update_secs"));
+            assert_eq!(flagged, given != want, "{given}: {errors:?}");
+        }
     }
 
     #[test]
