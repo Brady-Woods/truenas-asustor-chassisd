@@ -89,7 +89,7 @@ fn wire_time(bytes: usize) -> Duration {
 /// Waits up to `timeout` for `fd` to report any of `events` (or an error
 /// or hangup, which the next read/write then surfaces). False on timeout
 /// or if `poll` itself failed.
-fn poll_fd(fd: RawFd, events: libc::c_short, timeout: Duration) -> bool {
+pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, timeout: Duration) -> bool {
     let mut pfd = libc::pollfd {
         fd,
         events,

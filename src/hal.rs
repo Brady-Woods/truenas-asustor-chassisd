@@ -4,10 +4,13 @@
 
 use crate::config::{Config, NetworkConfig, ScreenTemplate, TempUnits};
 use crate::led::BayState;
+use crate::protocol::poll_fd;
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,12 +41,44 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
     run_with_timeout(cmd, args, COMMAND_TIMEOUT)
 }
 
+/// Most output kept from one command. Everything wanted here (zpool,
+/// smartctl, docker, ip) is a few KiB; more than this means something is
+/// wrong, and the command is abandoned rather than truncated mid-line.
+const OUTPUT_MAX: usize = 1 << 20;
+/// Children that were killed on timeout but haven't exited yet (a process
+/// in uninterruptible I/O ignores SIGKILL until the I/O completes).
+/// Kept so `run_with_timeout` can reap them later without a thread per
+/// wedged child; past `UNREAPED_MAX` no new commands are started.
+static UNREAPED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+const UNREAPED_MAX: usize = 16;
+
+/// Drops every child in `children` that has exited (reaping it).
+fn reap(children: &mut Vec<Child>) {
+    children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+}
+
 /// Runs `cmd`, returning its trimmed stdout if it exits successfully
-/// within `timeout`. On timeout the child is killed and reaped on a
-/// background thread rather than waited on here: a process stuck in
+/// within `timeout`. On timeout the child is killed and reaped later
+/// (see `UNREAPED`) rather than waited on here: a process stuck in
 /// uninterruptible I/O ignores SIGKILL until the I/O completes, so
 /// waiting for it would just move the hang.
+///
+/// Runs without helper threads: stdout is drained from this thread by
+/// polling the pipe, so a wedged child (or a grandchild holding the pipe
+/// open) can never strand a blocked reader.
 fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    {
+        let mut unreaped = UNREAPED.lock().unwrap_or_else(PoisonError::into_inner);
+        reap(&mut unreaped);
+        if unreaped.len() >= UNREAPED_MAX {
+            crate::syslog::warning(&format!(
+                "not running `{cmd}`: {} earlier commands are stuck and unkillable",
+                unreaped.len()
+            ));
+            return None;
+        }
+    }
+
     let mut child = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
@@ -51,39 +86,61 @@ fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Strin
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-
-    // Drain stdout concurrently so a chatty child can't fill the pipe and
-    // block before exiting.
     let mut stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
+    let fd = stdout.as_raw_fd();
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                crate::syslog::warning(&format!(
-                    "`{cmd} {}` timed out after {}s, killed",
-                    args.join(" "),
-                    timeout.as_secs()
-                ));
-                let _ = child.kill();
-                thread::spawn(move || child.wait());
-                return None;
-            }
-            Err(_) => return None,
-        }
-    };
+    let describe = || format!("`{cmd} {}`", args.join(" "));
 
-    let stdout = reader.join().ok()?;
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&stdout).trim().to_string())
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut eof = false;
+    let mut failure = None;
+    while failure.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            failure = Some(format!("timed out after {}s", timeout.as_secs()));
+        } else if eof {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return status
+                        .success()
+                        .then(|| String::from_utf8_lossy(&out).trim().to_string());
+                }
+                Ok(None) => thread::sleep(left.min(Duration::from_millis(10))),
+                Err(_) => return None,
+            }
+        } else if poll_fd(fd, libc::POLLIN, left.min(Duration::from_millis(100))) {
+            match stdout.read(&mut chunk) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    out.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                    if out.len() > OUTPUT_MAX {
+                        failure = Some(format!("printed more than {OUTPUT_MAX} bytes"));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => eof = true,
+            }
+        }
+    }
+
+    crate::syslog::warning(&format!(
+        "{} {}, killed",
+        describe(),
+        failure.unwrap_or_default()
+    ));
+    // A failed kill means the child already exited; either way keep it
+    // until `try_wait` confirms it is reaped.
+    if let Err(e) = child.kill() {
+        crate::syslog::notice(&format!("{}: kill: {e}", describe()));
+    }
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        UNREAPED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(child);
+    }
+    None
 }
 
 /// Every *physical* interface with a global-scope IPv4 -- i.e. actually
@@ -882,6 +939,67 @@ mod tests {
             run_with_timeout("/nonexistent/cmd", &[], Duration::from_secs(5)),
             None
         );
+    }
+
+    #[test]
+    fn run_abandons_a_command_with_runaway_output() {
+        // 3 MiB of zeros: far over `OUTPUT_MAX`, and exits successfully.
+        assert_eq!(
+            run_with_timeout(
+                "head",
+                &["-c", "3000000", "/dev/zero"],
+                Duration::from_secs(10)
+            ),
+            None
+        );
+        // Just under the cap is returned whole.
+        let ok = run_with_timeout(
+            "head",
+            &["-c", "100000", "/dev/zero"],
+            Duration::from_secs(10),
+        );
+        assert_eq!(ok.map(|s| s.len()), Some(100_000));
+    }
+
+    #[test]
+    fn run_gives_up_on_a_wedged_command_holding_the_pipe_open() {
+        // The shell is killed at the deadline but its background child
+        // keeps the pipe's write end: a reader thread would stay blocked
+        // for 30s; here nothing is waiting on it.
+        let start = Instant::now();
+        assert_eq!(
+            run_with_timeout("sh", &["-c", "sleep 30 & wait"], Duration::from_millis(200)),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn run_gives_up_on_a_command_that_closes_stdout_but_keeps_running() {
+        let start = Instant::now();
+        assert_eq!(
+            run_with_timeout(
+                "sh",
+                &["-c", "exec >&-; sleep 30"],
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn reap_drops_exited_children_and_keeps_running_ones() {
+        let mut quick = Command::new("true").spawn().unwrap();
+        quick.wait().unwrap();
+        let slow = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut list = vec![quick, slow];
+        reap(&mut list);
+        assert_eq!(list.len(), 1);
+        for mut c in list {
+            c.kill().unwrap();
+            c.wait().unwrap();
+        }
     }
 
     #[test]
