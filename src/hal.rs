@@ -623,12 +623,9 @@ pub fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
 /// with no matching (or currently unreadable/disconnected) input simply
 /// contribute nothing, same as an empty drive bay having no hwmon instance
 /// at all.
-pub fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> {
-    resolve_selector_in(Path::new(HWMON_ROOT), sel)
-}
-
-/// `resolve_selector` against a hwmon tree rooted at `root` (a fixture, in
-/// tests).
+///
+/// `root` is the hwmon class directory (`/sys/class/hwmon` in production, a
+/// fixture in tests).
 pub fn resolve_selector_in(root: &Path, sel: &crate::config::SensorSelector) -> Vec<f32> {
     let mut out = Vec::new();
     let Some(hwmons) = glob_hwmon_in(root, &sel.chip) else {
