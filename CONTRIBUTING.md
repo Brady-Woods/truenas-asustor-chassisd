@@ -69,7 +69,9 @@ would notice.
   exports (see 2.0.0 in the changelog for why).
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test` and `sh -n deploy.sh` on every push and pull request.
+`cargo test`, `sh -n deploy.sh` and `cargo deny check advisories` (RustSec
+advisories, see `deny.toml`) on every push and pull request. GitHub Actions
+are pinned by commit SHA with a `# vX` comment; Dependabot proposes updates.
 Changes that touch hardware should also be tried on a NAS; say which model
 and TrueNAS version in the pull request.
 
