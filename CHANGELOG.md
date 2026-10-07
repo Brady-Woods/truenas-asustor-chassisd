@@ -20,6 +20,13 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
 - A temperature sensor that disappears is dropped from monitoring instead
   of keeping its last level forever.
 
+### Fixed
+- LED settings (bay LED mode, front LED brightness, the status and night
+  LED state) are applied when the platform driver shows up after the
+  daemon started -- the normal order at boot, where the driver is loaded
+  by its own Post Init script -- and again after the driver is reloaded.
+  Previously they stayed at the firmware defaults until a restart.
+
 ## 2.0.0 -- 2026-10-06
 
 Breaking: needs the asustor-platform-driver fork v0.3 or later; the

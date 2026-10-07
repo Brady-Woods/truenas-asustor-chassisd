@@ -737,13 +737,11 @@ fn trigger_registered(name: &str) -> bool {
 }
 
 /// Checks for the same asustor-platform-driver (fork, `main`, v0.3 or
-/// later) effects `deploy.sh` gates on before building at all: the
-/// `asustor` platform device's directory (always there while the module
-/// is loaded on a supported board) and the LEDs this daemon drives. This
-/// is defense-in-depth for the case where the binary gets started some
-/// other way than `deploy.sh` (e.g. by hand, or a differently-set-up
-/// systemd unit) -- everything here should already be guaranteed by the
-/// time deploy.sh's own check has passed.
+/// later) effects `deploy.sh` checks for: the `asustor` platform device's
+/// directory (always there while the module is loaded on a supported
+/// board) and the LEDs this daemon drives. For the startup warning only:
+/// at boot the driver normally arrives a little after the daemon starts,
+/// which `crate::driver_watch` (watching the same paths) picks up.
 ///
 /// (`/sys/class/leds/power:lcd` used to be the marker. The driver no
 /// longer has it: the LCD's power is a rail now, `lcd_power`, switched on

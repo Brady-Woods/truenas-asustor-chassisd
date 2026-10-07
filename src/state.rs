@@ -6,6 +6,7 @@
 
 use crate::alarm::{self, Alarm};
 use crate::config::{Category, Config};
+use crate::driver_watch::{self, Change, DriverWatch};
 use crate::hal::{self, Screen};
 use crate::led;
 use crate::protocol::Key;
@@ -174,6 +175,12 @@ pub struct AppState {
     /// Why the last brightness write failed, if it did, so a missing LED
     /// device is logged once rather than at every night-mode change.
     brightness_problem: RefCell<Option<String>>,
+    /// Why `[led] bay_mode` couldn't be applied last time, if it couldn't,
+    /// so it's logged once rather than on every driver (re)load.
+    bay_mode_problem: Option<String>,
+    /// Watches for the platform driver appearing or being reloaded after
+    /// the startup LED pass -- see `check_driver`. Set up by `init_leds`.
+    driver: Option<DriverWatch>,
     /// Status LED pattern last written by `recompute_status_led`, so an
     /// unchanged verdict isn't rewritten -- rewriting a blinking pattern
     /// restarts its blink. `None` after anything else wrote the status
@@ -237,6 +244,8 @@ impl AppState {
             day_brightness: None,
             applied_brightness: Cell::new(None),
             brightness_problem: RefCell::new(None),
+            bay_mode_problem: None,
+            driver: None,
             status_shown: Cell::new(None),
             led_inputs: None,
             alarm: None,
@@ -259,32 +268,112 @@ impl AppState {
         self.fan_health = level;
     }
 
-    /// Applies the front LEDs' initial state at daemon startup: NIC mode
-    /// from config, and a first pass of the health-driven status/bay LEDs
-    /// so they're not left in whatever the driver's own boot defaults were.
+    /// Applies the LEDs' initial state at daemon startup -- see
+    /// `apply_all_leds` -- and starts watching for the platform driver to
+    /// appear (or be reloaded) later, which `check_driver` answers by
+    /// applying it all again.
     pub fn init_leds(&mut self) {
-        // The full daytime state, not just the NIC mode: a previous run
-        // stopped mid-night-mode leaves the power LED, LAN rail and USB
-        // LED dark, and nothing else here turns them back on -- only
-        // waking does, and a fresh start was never asleep. (Found live: a
-        // restart at night with `night_brightness` set left power and LAN
-        // dark until morning.) If the schedule wants night mode, the first
-        // tick enters it from here as usual.
-        let result = led::exit_night_mode(self.cfg.led.nic_mode, true);
-        self.status_shown.set(None);
-        self.note_nic_leds(result);
-        if let Some(mode) = self.cfg.led.bay_mode
-            && let Err(e) = led::set_bay_mode(mode)
-        {
-            crate::syslog::warning(&format!("[led] bay_mode not applied: {e}"));
+        self.driver = Some(DriverWatch::new(
+            driver_watch::Paths::system(),
+            Instant::now(),
+        ));
+        self.apply_all_leds();
+    }
+
+    /// Call on every event-loop wakeup: every `driver_watch::CHECK_INTERVAL`
+    /// it looks for the platform driver having appeared, been reloaded
+    /// (which puts every LED back to its driver default) or gone away,
+    /// logs that, and re-applies every LED setting when there's something
+    /// to apply them to. Returns the change, for the caller's own
+    /// follow-ups.
+    ///
+    /// Needed because at boot the daemon normally starts *before* the
+    /// driver is loaded (by its own Post Init script, which systemd can't
+    /// order against), so the startup pass in `init_leds` finds nothing to
+    /// apply most settings to -- see `driver_watch`.
+    pub fn check_driver(&mut self, now: Instant) -> Option<Change> {
+        let change = self.driver.as_mut()?.poll(now)?;
+        match change {
+            Change::Appeared => crate::syslog::notice(change.describe()),
+            Change::Disappeared => crate::syslog::warning(change.describe()),
+            Change::Reloaded | Change::BrightnessLed => crate::syslog::info(change.describe()),
         }
-        self.day_brightness = match (self.cfg.led.brightness, self.cfg.led.night_brightness) {
-            (Some(pct), _) => Some(pct.min(100)),
-            (None, Some(_)) => led::read_front_brightness(),
-            (None, None) => None,
+        if change.reapply() {
+            self.apply_all_leds();
+        }
+        Some(change)
+    }
+
+    /// Applies every LED setting from scratch, for the current state: the
+    /// day or night look, NIC mode, `[led] bay_mode`, front brightness,
+    /// and the health-driven status/bay LEDs, alerts and locates on top.
+    /// At startup, and again whenever the platform driver shows up or is
+    /// reloaded, since its LEDs then start out in the driver's defaults.
+    fn apply_all_leds(&mut self) {
+        let result = if self.sleeping && self.night_darkens_front() {
+            // Night mode darkens everything it touches anyway.
+            let result = led::enter_night_mode(true);
+            self.status_shown.set(Some(led::StatusPattern::Off));
+            result
+        } else {
+            // The full daytime state, not just the NIC mode: a previous
+            // run stopped mid-night-mode leaves the power LED, LAN rail
+            // and USB LED dark, and nothing else here turns them back on
+            // -- only waking does, and a fresh start was never asleep.
+            // (Found live: a restart at night with `night_brightness` set
+            // left power and LAN dark until morning.) If the schedule
+            // wants night mode, the first tick enters it from here as
+            // usual.
+            let result = led::exit_night_mode(self.cfg.led.nic_mode, true);
+            self.status_shown.set(None);
+            if self.sleeping {
+                // Dimmed rather than dark at night: the bay greens still
+                // go dark (never fails with `front` false).
+                let _ = led::enter_night_mode(false);
+            }
+            result
         };
+        self.note_nic_leds(result);
+        self.apply_bay_mode();
+        if self.day_brightness.is_none() {
+            // Read only once there is something to read: with only
+            // `night_brightness` set, the level the BIOS left (it87 keeps
+            // it across a reload, so this can't pick up a night level).
+            self.day_brightness = match (self.cfg.led.brightness, self.cfg.led.night_brightness) {
+                (Some(pct), _) => Some(pct.min(100)),
+                (None, Some(_)) => led::read_front_brightness(),
+                (None, None) => None,
+            };
+        }
+        // The LED may be a new device since the last write.
+        self.applied_brightness.set(None);
         self.apply_front_brightness();
         self.update_health_leds();
+        if let Some(bay) = self.alert_bay {
+            self.apply_bay_led(bay);
+        }
+        self.reassert_locate_leds();
+    }
+
+    /// `[led] bay_mode`, if configured; a failure is logged once per
+    /// distinct problem, and once more when it applies again.
+    fn apply_bay_mode(&mut self) {
+        let Some(mode) = self.cfg.led.bay_mode else {
+            return;
+        };
+        match led::set_bay_mode(mode) {
+            Ok(()) => {
+                if self.bay_mode_problem.take().is_some() {
+                    crate::syslog::notice("[led] bay_mode applied");
+                }
+            }
+            Err(e) => {
+                if self.bay_mode_problem.as_ref() != Some(&e) {
+                    crate::syslog::warning(&format!("[led] bay_mode not applied: {e}"));
+                    self.bay_mode_problem = Some(e);
+                }
+            }
+        }
     }
 
     /// Whether night mode switches the front (status/power/LAN/USB) LEDs

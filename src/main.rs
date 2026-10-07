@@ -1,6 +1,7 @@
 mod alarm;
 mod buzzer;
 mod config;
+mod driver_watch;
 mod fan;
 mod fan_calibrate;
 mod hal;
@@ -307,19 +308,19 @@ fn run_daemon(cfg_path: &Path) {
         buzzer::boot_finished();
     }
 
-    // deploy.sh already gates on this before it will even build; this is
-    // defense-in-depth for the binary being started some other way. LED
-    // writes against a missing driver are harmless no-ops (plain sysfs
-    // writes to paths that don't exist), so this doesn't refuse to start
-    // -- it just makes sure that degraded state is loud in the logs
-    // instead of silently invisible.
+    // Normal at boot: the driver is loaded by its own Post Init script,
+    // after this unit has started (see driver_watch.rs). LED writes
+    // against a missing driver are harmless no-ops (plain sysfs writes to
+    // paths that don't exist), so this doesn't refuse to start; the event
+    // loop applies the LED settings once the driver shows up. Logged so a
+    // driver that never comes is loud in the logs, not silently invisible.
     if !led::driver_present() {
         eprintln!(
             "WARNING: asustor-platform-driver (fork: \
              https://github.com/Brady-Woods/asustor-platform-driver, main, v0.3 or later) \
-             not detected -- \
-             LED control (bay/status LEDs) will silently no-op. \
-             LCD text/menu still works. Run deploy.sh, which checks this before building."
+             not detected (yet) -- \
+             LED control (bay/status LEDs, brightness) waits for it and is applied \
+             as soon as it's loaded. LCD text/menu works without it."
         );
     }
 
@@ -353,15 +354,7 @@ fn run_daemon(cfg_path: &Path) {
         ));
     }
 
-    // Read-only: the daemon never changes these BIOS settings.
-    let platform = platform::PowerSettings::read();
-    let platform_lines = platform.describe();
-    if !platform_lines.is_empty() {
-        syslog::info(&format!("platform: {}", platform_lines.join("; ")));
-    }
-    if let Some(warning) = platform::eup_warning(&platform, &platform::wake_sources(&cfg)) {
-        syslog::warning(&warning);
-    }
+    log_platform_settings(&cfg);
 
     // A panic in the event loop is caught only long enough to hand the
     // fans back before it propagates; the process still exits non-zero
@@ -474,6 +467,14 @@ fn event_loop(
             lcm.forget_text();
             last_redraw = Instant::now();
         }
+        if let Some(change) = state.check_driver(Instant::now())
+            && change.platform_is_new()
+        {
+            // Normally a no-op by now; covers a start with no LED class
+            // devices at all to look triggers up in.
+            led::ensure_trigger_modules();
+            log_platform_settings(cfg);
+        }
         let effect = state.tick();
         apply_effect(effect, state.display_wanted(), lcm, power);
         drain_pending_keys(state, lcm, power);
@@ -507,6 +508,21 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Logs the board's power settings as the platform driver reports them,
+/// and warns when EuP would defeat a configured wake source. At startup,
+/// and again when the driver appears later (nothing to read before).
+/// Read-only: the daemon never changes these BIOS settings.
+fn log_platform_settings(cfg: &Config) {
+    let platform = platform::PowerSettings::read();
+    let platform_lines = platform.describe();
+    if !platform_lines.is_empty() {
+        syslog::info(&format!("platform: {}", platform_lines.join("; ")));
+    }
+    if let Some(warning) = platform::eup_warning(&platform, &platform::wake_sources(cfg)) {
+        syslog::warning(&warning);
+    }
 }
 
 /// The MCU reports its firmware version unprompted when it boots -- after a
