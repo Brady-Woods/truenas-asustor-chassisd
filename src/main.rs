@@ -284,16 +284,20 @@ fn run_daemon(cfg_path: &Path) {
 
     // First, before touching the serial port or fans: if another daemon
     // is already running, this is a second instance and must not start.
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = socket::command_channel();
     let socket_path = &cfg.socket.path;
-    match socket::spawn(socket_path, &cfg.socket.group, tx) {
-        Ok(()) => {}
+    // Removes the socket file when dropped, on the way out below.
+    let socket_guard = match socket::spawn(socket_path, &cfg.socket.group, tx) {
+        Ok(guard) => Some(guard),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!("{socket_path}: {e}; exiting");
             std::process::exit(1);
         }
-        Err(e) => eprintln!("socket listener failed to start on {socket_path}: {e}"),
-    }
+        Err(e) => {
+            eprintln!("socket listener failed to start on {socket_path}: {e}");
+            None
+        }
+    };
 
     let mut lcm = Lcm::open(&cfg.display.serial_device).unwrap_or_else(|e| {
         eprintln!("failed to open {}: {e}", cfg.display.serial_device);
@@ -362,6 +366,8 @@ fn run_daemon(cfg_path: &Path) {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         event_loop(&mut state, &mut lcm, &cfg, &fans, &mut wol, &mut power, &rx)
     }));
+    // No new clients from here on; the file goes even if the loop failed.
+    drop(socket_guard);
     fans.shutdown();
     // The OS stopping this service as part of a shutdown/reboot is the
     // one power action the daemon doesn't start itself.
@@ -402,12 +408,14 @@ fn event_loop(
     let mut last_alert_beep: Option<Instant> = None;
 
     while !shutdown::requested() {
-        // Drain any socket commands that arrived since the last wakeup.
+        // Drain the socket commands that arrived since the last wakeup, at
+        // most `socket::MAX_COMMANDS_PER_PASS` of them: a flood waits in
+        // the (bounded) queue, never ahead of the fan and LCD work below.
         // STATUS is handled here rather than forwarded into
         // `apply_socket_command`: building the report needs the fan
         // status and power schedule too, which live out here alongside
         // `state`, not inside it.
-        while let Ok(cmd) = rx.try_recv() {
+        for cmd in socket::drain(rx) {
             if (!state.is_asleep()
                 || matches!(
                     &cmd,

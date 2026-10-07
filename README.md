@@ -792,6 +792,13 @@ of needing to run as root. Newline-delimited; each connection sends one
 message, optionally a header line plus up to two content lines, then
 closes.
 
+The socket is created with its final mode and group already in place (it is
+bound in a private `0700` directory next to it and renamed into position),
+and removed again when the daemon stops cleanly. The group is looked up in
+`/etc/group`; if it isn't there (or the `chown` fails) the daemon logs a
+warning and the socket stays `root:root`, usable by root only. A socket path
+too long to stage this way is bound in place and fixed up right afterwards.
+
 ```
 SHOW <level> <ttl_secs> [bay=N]
 <line0>
@@ -824,9 +831,40 @@ LOCATE off [bay=N]
   confirms, subject to the same rule that a lower level never replaces a
   more severe active alert.
 
-**Bare text shorthand** -- a message with no `SHOW`/`CLEAR` header is
-`SHOW info 5` with the first line as `line0` and the second (if any) as
-`line1`:
+**Replies and errors.** A valid fire-and-forget request (`SHOW`, `CLEAR`,
+`LOCATE`, bare text) gets no reply: clients just send and close, as before.
+A request the daemon refuses gets one line, `ERR <reason>`, written
+best-effort before it closes the connection (a client that doesn't read it
+is unaffected), and nothing is shown or changed:
+
+```
+ERR unknown level "crtical"; expected info, warn, error or critical
+ERR bad ttl_secs "soon"; expected whole seconds
+ERR bad bay "0"; bays are numbered from 1
+ERR STATUS takes no arguments
+ERR request is not valid UTF-8
+ERR busy: too many commands queued
+ERR busy: too many connections
+```
+
+Parsing is strict rather than forgiving: an unknown `level`, a missing or
+non-numeric `ttl_secs`, a `bay=` that isn't a number from 1 up, an unknown
+extra argument on `SHOW`/`CLEAR`/`LOCATE`, `STATUS` with anything after it,
+and text that isn't UTF-8 are all errors. (`CLEAR bay=` with a typo used to
+clear *every* alert, and a misspelled level used to become `info`.) Level
+names are case-insensitive; `warning` is accepted for `warn`.
+
+**Limits.** At most 16 connections are served at once (further ones get
+`ERR busy: too many connections` and are closed), and a client has 5 seconds
+in total to send its request however slowly it does so (and 2 seconds of
+silence at most). The daemon queues up to 64 commands for its main loop and
+takes at most 16 per 100 ms pass; when the queue is full a request is
+dropped with `ERR busy: too many commands queued` rather than queued
+without bound.
+
+**Bare text shorthand** -- a message with no `SHOW`/`CLEAR`/`LOCATE`/`STATUS`
+header is `SHOW info 5` with the first line as `line0` and the second (if
+any) as `line1` (so bare text can't itself start with one of those words):
 
 ```sh
 printf "Backup done\n42 files\n" | nc -U /run/lcm-status.sock -q1
@@ -985,11 +1023,10 @@ the active socket override if any:
   severity: Info  (fan=Info temp=Info network=Info pool_degraded=false pool_faulted=false bay_failed=false)
 ```
 
-Implementation note, if you're extending the protocol further: `handle_connection`
-keeps a second cloned handle to the stream for writing the response after
-the `BufReader` has consumed the original for reading -- a Unix stream
-socket's two directions are independent, so this works even though a
-plain read loop would otherwise "consume" the connection. The client
+Implementation note, if you're extending the protocol further: the daemon
+reads the request through a size- and deadline-limited reader, then writes
+the reply on the same stream -- a Unix stream socket's two directions are
+independent, so reading to EOF doesn't stop it answering. The client
 (`socket_request` in `main.rs`) sends its request, then shuts down just
 its *write* half (`Shutdown::Write`) so the daemon's `.lines()` sees EOF
 and stops waiting for more input, while the read half stays open to
