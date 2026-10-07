@@ -11,6 +11,13 @@ Type=simple
 ExecStart=@LCM_STATUS_BIN@ daemon /etc/lcm-status.toml
 Restart=on-failure
 RestartSec=2
+# Liveness: the daemon pings the service watchdog (sd_notify, over
+# $NOTIFY_SOCKET) from its main loop only while fan control is making
+# progress, so a wedged fan thread gets the process restarted instead of
+# leaving a fan unsupervised. NotifyAccess=main: only the daemon's own
+# process may send those pings.
+WatchdogSec=30
+NotifyAccess=main
 # Needs root: /dev/ttyS1, the LCD power GPIO/LED, smartctl, and
 # systemctl poweroff/reboot for the panel's shutdown/restart action and
 # the power schedule, and /sys/class/rtc/rtc0/wakealarm for its power on.

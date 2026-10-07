@@ -39,6 +39,19 @@
 //!   one `FanController` per entry, independently, on a dedicated thread
 //!   (`FanService`) so the main loop can never stall fan control.
 //!
+//! Sensors are read off the control path: each selector has its own
+//! reader thread (`SensorFeed`) that samples sysfs on its own schedule and
+//! publishes the latest value. A `drivetemp` read can block indefinitely
+//! on a wedged drive; with reads inline that would freeze the fan thread --
+//! and every other fan's curve with it. Now a wedged read only makes that
+//! one selector's sample go stale, which counts as "lost" (below).
+//!
+//! A selector that *used to* read and now doesn't is never ignored: after
+//! a short grace the fan is held at `max_pwm` (a hot drive must not be
+//! forgotten just because its sensor vanished), and released only after
+//! the selector has read steadily for a while, so a flapping sensor can't
+//! make the fan oscillate.
+//!
 //! A fan can instead run at a constant PWM (`mode = "fixed"`, like ADM's
 //! fixed fan mode -- `config::FanMode`). Only the *target* changes: it
 //! goes through the same kick/stall/RPM-health handling, still holds
@@ -57,17 +70,165 @@
 //! actually exist and what a fan's real min-start/min-stop PWM is, rather
 //! than this module guessing.
 
-use crate::config::{FanMode, FanProfile, TemperatureConfig, resolve_temp_threshold};
-use crate::hal::{glob_hwmon, read_sysfs_raw_f32, resolve_selector};
+use crate::config::{
+    FanMode, FanProfile, SensorSelector, TemperatureConfig, resolve_temp_threshold,
+};
+use crate::hal::{glob_hwmon_in, is_over_range, read_sysfs_raw_f32, resolve_selector_in};
 use crate::socket::Level;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// How often the fan thread wakes to give each controller a chance to
 /// tick. Each controller still only acts every `update_secs`.
 const FAN_THREAD_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Shortest and longest a selector's reader thread waits between samples.
+/// The ceiling bounds how stale a temperature can be even if a config
+/// asks for hours between reads.
+const MIN_SENSOR_INTERVAL_SECS: u64 = 1;
+const MAX_SENSOR_INTERVAL_SECS: u64 = 300;
+/// A sample older than three sampling intervals (but at least this long)
+/// is stale: the reader is wedged or gone, and the selector counts as
+/// having no reading.
+const MIN_SENSOR_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// How long the fan controller tolerates each failure before reacting.
+/// A field of `FanController` so tests can shrink them.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// A selector that used to read has been silent this long: hold
+    /// `max_pwm` for the fan.
+    sensor_loss_grace: Duration,
+    /// ...and it must then read continuously this long before the hold is
+    /// released (anti-flap).
+    sensor_recovery_hold: Duration,
+    /// A fan this daemon can't write (chip not resolved, writes failing)
+    /// is a WARNING after this long, so a normal boot -- the platform
+    /// driver loads after this unit starts -- doesn't raise one...
+    control_warn_after: Duration,
+    /// ...and CRITICAL after this long.
+    control_critical_after: Duration,
+    /// With the chip resolved but no sensor having *ever* read, the fan is
+    /// taken over at `max_pwm` after this long (rather than left in
+    /// BIOS/driver automatic mode, which can stop it).
+    sensor_takeover_after: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            sensor_loss_grace: Duration::from_secs(10),
+            sensor_recovery_hold: Duration::from_secs(30),
+            control_warn_after: Duration::from_secs(30),
+            control_critical_after: Duration::from_secs(180),
+            sensor_takeover_after: Duration::from_secs(30),
+        }
+    }
+}
+
+/// A configured, enabled fan this daemon is not currently able to drive.
+#[derive(Debug)]
+struct ControlLoss {
+    since: Instant,
+    /// Latest reason, for the log line.
+    why: String,
+    warned: bool,
+    critical: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One published sensor sample: when it was taken and the hottest value
+/// the selector produced (`None`: it matched no readable sensor).
+#[derive(Debug, Default, Clone, Copy)]
+struct Sample {
+    at: Option<Instant>,
+    value: Option<f32>,
+}
+
+/// The fan controller's view of one `SensorSelector`: the latest sample
+/// (written by the selector's reader thread, if one is running) plus the
+/// loss/recovery tracking the control thread keeps about it.
+#[derive(Debug)]
+struct SensorFeed {
+    shared: Arc<Mutex<Sample>>,
+    /// Older than this, the sample is stale and the selector has no reading.
+    max_age: Duration,
+    /// Has this selector ever produced a reading? Only a selector that has
+    /// can be "lost"; one that never matched anything (no NVMe installed)
+    /// is just absent.
+    ever_read: bool,
+    /// Not reading since (while `ever_read`), and not yet `held`.
+    lost_since: Option<Instant>,
+    /// Past the grace: the fan is held at `max_pwm` for this selector.
+    held: bool,
+    /// While `held`: reading steadily since this moment.
+    back_since: Option<Instant>,
+}
+
+impl SensorFeed {
+    fn new(sel: &SensorSelector, update_secs: u64) -> Self {
+        let secs = sampling_secs(sel, update_secs);
+        SensorFeed {
+            shared: Arc::new(Mutex::new(Sample::default())),
+            max_age: Duration::from_secs(secs.saturating_mul(3)).max(MIN_SENSOR_MAX_AGE),
+            ever_read: false,
+            lost_since: None,
+            held: false,
+            back_since: None,
+        }
+    }
+
+    /// The selector's reading now: its latest sample's value, unless that
+    /// sample is missing or stale.
+    fn current(&self) -> Option<f32> {
+        let sample = *lock(&self.shared);
+        sample
+            .at
+            .filter(|at| at.elapsed() <= self.max_age)
+            .and(sample.value)
+    }
+}
+
+/// Seconds between samples of `sel`: its own `min_resample_secs`, else the
+/// fan's `update_secs`, clamped to the supported range.
+fn sampling_secs(sel: &SensorSelector, update_secs: u64) -> u64 {
+    sel.min_resample_secs
+        .unwrap_or(update_secs)
+        .clamp(MIN_SENSOR_INTERVAL_SECS, MAX_SENSOR_INTERVAL_SECS)
+}
+
+/// Runs `read` on a new thread every `interval` until `stop`, publishing
+/// each result into `shared`. If `read` blocks forever the thread simply
+/// stays blocked (it is never joined) and the sample goes stale -- that is
+/// the point: nothing on the control path ever waits for it.
+fn spawn_reader(
+    name: String,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Mutex<Sample>>,
+    mut read: impl FnMut() -> Option<f32> + Send + 'static,
+) -> std::io::Result<()> {
+    thread::Builder::new().name(name).spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let value = read();
+            *lock(&shared) = Sample {
+                at: Some(Instant::now()),
+                value,
+            };
+            let slept = Instant::now();
+            while slept.elapsed() < interval && !stop.load(Ordering::Relaxed) {
+                thread::sleep(FAN_THREAD_INTERVAL);
+            }
+        }
+    })?;
+    Ok(())
+}
 
 /// What the main loop needs from the fan thread: the worst current health
 /// (for the status LED) and one status line per fan (for `STATUS`).
@@ -77,14 +238,39 @@ pub struct FanStatus {
     pub lines: Vec<String>,
 }
 
+/// The fan thread publishes a heartbeat every loop (well under a second);
+/// one older than this means it is wedged (a hung sysfs write, say), and
+/// the main loop treats that like the thread dying.
+pub const FAN_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `shutdown` waits for the fan thread to exit before giving up
+/// on it and forcing the fans to full speed itself.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// ...and how long that forced write may take before shutdown moves on.
+const FAILSAFE_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_HWMON_ROOT: &str = "/sys/class/hwmon";
+
 /// Fan control, running on its own thread so nothing the main loop does
 /// (a slow `smartctl`, a hung `zpool`, a stuck socket client) can stall
 /// it. The controllers are owned by that thread; the main loop only sees
-/// the published `FanStatus`.
+/// the published `FanStatus` and the thread's heartbeat.
 pub struct FanService {
     status: Arc<Mutex<FanStatus>>,
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    /// Milliseconds since `epoch` of the fan thread's last loop. An atomic
+    /// rather than a field of `FanStatus` so reading it can never wait on
+    /// a lock the (possibly wedged) thread holds.
+    heartbeat_ms: Arc<AtomicU64>,
+    epoch: Instant,
+    /// Kept so `shutdown` can force full speed if the thread is wedged and
+    /// so can't run its controllers' own restore-on-drop.
+    profiles: Vec<FanProfile>,
+    hwmon_root: PathBuf,
+    join_timeout: Duration,
+}
+
+fn millis_since(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl FanService {
@@ -96,20 +282,39 @@ impl FanService {
         profiles: Vec<FanProfile>,
         temperature: &TemperatureConfig,
     ) -> std::io::Result<Self> {
+        Self::spawn_in(PathBuf::from(DEFAULT_HWMON_ROOT), profiles, temperature)
+    }
+
+    fn spawn_in(
+        hwmon_root: PathBuf,
+        profiles: Vec<FanProfile>,
+        temperature: &TemperatureConfig,
+    ) -> std::io::Result<Self> {
         let status = Arc::new(Mutex::new(FanStatus {
             health: Level::Info,
             lines: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Instant::now();
+        let heartbeat_ms = Arc::new(AtomicU64::new(0));
         let temperature = temperature.clone();
         let handle = thread::Builder::new().name("fans".into()).spawn({
             let status = Arc::clone(&status);
             let stop = Arc::clone(&stop);
+            let heartbeat_ms = Arc::clone(&heartbeat_ms);
+            let (profiles, hwmon_root) = (profiles.clone(), hwmon_root.clone());
             move || {
                 let mut fans: Vec<FanController> = profiles
                     .into_iter()
-                    .map(|p| FanController::new(p, &temperature))
+                    .map(|p| {
+                        let mut c = FanController::new(p, &temperature);
+                        c.hwmon_root.clone_from(&hwmon_root);
+                        c
+                    })
                     .collect();
+                for f in &fans {
+                    f.start_readers(&stop);
+                }
                 while !stop.load(Ordering::Relaxed) {
                     for f in &mut fans {
                         f.tick();
@@ -118,9 +323,8 @@ impl FanService {
                         health: worst_health(&fans),
                         lines: fans.iter().map(FanController::status_line).collect(),
                     };
-                    *status
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+                    *lock(&status) = snapshot;
+                    heartbeat_ms.store(millis_since(epoch), Ordering::Relaxed);
                     thread::sleep(FAN_THREAD_INTERVAL);
                 }
             }
@@ -129,14 +333,16 @@ impl FanService {
             status,
             stop,
             handle,
+            heartbeat_ms,
+            epoch,
+            profiles,
+            hwmon_root,
+            join_timeout: SHUTDOWN_JOIN_TIMEOUT,
         })
     }
 
     pub fn status(&self) -> FanStatus {
-        self.status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        lock(&self.status).clone()
     }
 
     /// True if the fan thread has exited on its own, i.e. it panicked.
@@ -144,11 +350,88 @@ impl FanService {
         self.handle.is_finished()
     }
 
-    /// Stops the fan thread and waits for it to exit.
+    /// How long since the fan thread last completed a loop.
+    pub fn heartbeat_age(&self) -> Duration {
+        self.epoch.elapsed().saturating_sub(Duration::from_millis(
+            self.heartbeat_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// True if the fan thread is alive but has stopped making progress
+    /// (`FAN_HEARTBEAT_TIMEOUT`): wedged, so nothing is watching
+    /// temperatures. The caller should treat this like `has_died`.
+    pub fn is_stalled(&self) -> bool {
+        self.heartbeat_age() > FAN_HEARTBEAT_TIMEOUT
+    }
+
+    /// Stops the fan thread and waits for it to exit -- but not forever. A
+    /// thread that is wedged inside a sysfs call never reaches its
+    /// controllers' restore-on-drop, so after `SHUTDOWN_JOIN_TIMEOUT` this
+    /// forces every enabled fan to full speed itself (on a helper thread,
+    /// itself time-limited) and abandons the stuck thread; the process is
+    /// about to exit anyway.
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.handle.join();
+        let deadline = Instant::now() + self.join_timeout;
+        while !self.handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if self.handle.is_finished() {
+            if self.handle.join().is_err() {
+                crate::syslog::critical("fan control thread had panicked");
+            }
+            return;
+        }
+        crate::syslog::critical(&format!(
+            "fan control thread did not stop within {}s; forcing fans to full speed",
+            self.join_timeout.as_secs()
+        ));
+        force_full_speed(self.hwmon_root, self.profiles);
     }
+}
+
+/// Last-resort fail-safe for a wedged fan thread: manual mode at full
+/// speed on every enabled fan, written from a helper thread so a sysfs
+/// write that hangs too can't hang the caller beyond `FAILSAFE_TIMEOUT`.
+fn force_full_speed(root: PathBuf, profiles: Vec<FanProfile>) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("fan-failsafe".into())
+        .spawn(move || {
+            for p in profiles.iter().filter(|p| p.enabled) {
+                if let Err(e) = write_full_speed(&root, p) {
+                    crate::syslog::critical(&format!(
+                        "fan '{}' (pwm{}): could not force full speed: {e}",
+                        p.name, p.pwm_index
+                    ));
+                }
+            }
+            // The receiver may have given up already; nothing to do then.
+            done_tx.send(()).ok();
+        });
+    match spawned {
+        Ok(_) => {
+            if done_rx.recv_timeout(FAILSAFE_TIMEOUT).is_err() {
+                crate::syslog::critical("forcing fans to full speed timed out");
+            }
+        }
+        Err(e) => crate::syslog::critical(&format!("could not start the fan fail-safe: {e}")),
+    }
+}
+
+/// Manual mode, full speed, for one profile's pwm output under `root`.
+fn write_full_speed(root: &Path, profile: &FanProfile) -> std::io::Result<()> {
+    let hwmon = glob_hwmon_in(root, &profile.pwm_chip)
+        .and_then(|v| v.into_iter().next())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("pwm chip '{}' not found", profile.pwm_chip),
+            )
+        })?;
+    let n = profile.pwm_index;
+    std::fs::write(format!("{hwmon}/pwm{n}_enable"), "1")?;
+    std::fs::write(format!("{hwmon}/pwm{n}"), u8::MAX.to_string())
 }
 
 fn worst_health(fans: &[FanController]) -> Level {
@@ -189,9 +472,12 @@ pub struct FanController {
     /// for a single-purpose daemon but would freeze LCD/button handling
     /// here for a full second. Spread across normal tick cadence instead.
     kick_until: Option<Instant>,
-    /// Parallel to `profile.sensors`: (last refresh time, last resolved
-    /// max value) per selector, each on its own `min_resample_secs`.
-    sensor_cache: Vec<(Option<Instant>, Option<f32>)>,
+    /// Parallel to `profile.sensors`: each selector's latest sample and
+    /// loss tracking (see `SensorFeed`).
+    feeds: Vec<SensorFeed>,
+    /// The hwmon class directory; `/sys/class/hwmon` outside tests.
+    hwmon_root: PathBuf,
+    timing: Timing,
     /// Parallel to `profile.sensors`: (warning, critical) for each
     /// selector's chip, resolved once from `[temperature]` -- what a
     /// fixed-mode fan's critical override goes by.
@@ -217,6 +503,16 @@ pub struct FanController {
     /// True while every sensor feeding this fan has stopped reading (and
     /// so the fan is being held at full speed instead).
     sensors_lost: bool,
+    /// Has any of this fan's selectors ever produced a reading?
+    any_sensor_read: bool,
+    /// When this controller was created -- the clock for "never took over"
+    /// and "never had a sensor" escalation.
+    started: Instant,
+    /// Set from construction (nothing has been written yet) until a write
+    /// succeeds, and again whenever one fails.
+    control_loss: Option<ControlLoss>,
+    /// The "no sensor ever read" CRITICAL has been logged.
+    no_sensor_critical_logged: bool,
 }
 
 impl FanController {
@@ -225,6 +521,19 @@ impl FanController {
     /// for RPM if this profile has no `fan_index` configured (no tach to
     /// read) or the chip isn't resolved (not loaded yet).
     pub fn status_line(&self) -> String {
+        if !self.profile.enabled {
+            let why = if self.profile.disabled_by_config {
+                "disabled by config (left in BIOS/driver mode, which may stop the fan)"
+            } else {
+                "disabled"
+            };
+            return format!(
+                "{} (pwm{}): {why} [{:?}]",
+                self.profile.name,
+                self.profile.pwm_index,
+                self.health_level()
+            );
+        }
         let pwm = self.last_pwm.unwrap_or(0);
         let pct = u32::from(pwm) * 100 / 255;
         let rpm = match (&self.hwmon, self.profile.fan_index) {
@@ -250,17 +559,48 @@ impl FanController {
     /// -- current state, not transition-gated the way this fan's own
     /// syslog lines are (the LED always reflects "right now").
     pub fn health_level(&self) -> Level {
-        if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS {
+        if self.profile.disabled_by_config {
+            return Level::Warn;
+        }
+        let uncontrolled_for = self.control_loss.as_ref().map(|l| l.since.elapsed());
+        let never_had_a_sensor = self.sensors_lost && !self.any_sensor_read;
+        if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS
+            || uncontrolled_for.is_some_and(|t| t >= self.timing.control_critical_after)
+            || (never_had_a_sensor && self.started.elapsed() >= self.timing.control_critical_after)
+        {
             Level::Critical
-        } else if self.consecutive_stalls > 0 || self.low_rpm_warned || self.sensors_lost {
+        } else if uncontrolled_for.is_some_and(|t| t >= self.timing.control_warn_after)
+            || self.consecutive_stalls > 0
+            || self.low_rpm_warned
+            || self.sensors_lost
+            || self.floor_active()
+        {
             Level::Warn
         } else {
             Level::Info
         }
     }
 
+    /// An enabled fan starts out "not under control" until its first
+    /// successful write; a disabled one never is.
+    fn starting_unmanaged(mut self) -> Self {
+        if self.profile.enabled {
+            self.control_loss = Some(ControlLoss {
+                since: self.started,
+                why: "not taken over yet".to_string(),
+                warned: false,
+                critical: false,
+            });
+        }
+        self
+    }
+
     pub fn new(profile: FanProfile, temperature: &TemperatureConfig) -> Self {
-        let sensor_cache = vec![(None, None); profile.sensors.len()];
+        let feeds = profile
+            .sensors
+            .iter()
+            .map(|sel| SensorFeed::new(sel, profile.update_secs))
+            .collect();
         let thresholds = profile
             .sensors
             .iter()
@@ -271,7 +611,9 @@ impl FanController {
             hwmon: None,
             last_pwm: None,
             kick_until: None,
-            sensor_cache,
+            feeds,
+            hwmon_root: PathBuf::from("/sys/class/hwmon"),
+            timing: Timing::default(),
             thresholds,
             critical_override: false,
             last_tick: None,
@@ -279,7 +621,12 @@ impl FanController {
             consecutive_stalls: 0,
             low_rpm_warned: false,
             sensors_lost: false,
+            any_sensor_read: false,
+            started: Instant::now(),
+            control_loss: None,
+            no_sensor_critical_logged: false,
         }
+        .starting_unmanaged()
     }
 
     /// Call every time main.rs's event loop wakes up (it polls at a fixed
@@ -310,7 +657,10 @@ impl FanController {
             self.hwmon = self.resolve_hwmon();
         }
         let Some(hwmon) = self.hwmon.clone() else {
-            return; // chip not loaded (yet) -- try again next tick
+            // Chip not loaded (yet) -- try again next tick, but never
+            // silently: see `note_control_lost`.
+            self.note_control_lost(&format!("pwm chip '{}' not found", self.profile.pwm_chip));
+            return;
         };
 
         let Some(sensor_target) = self.target_pwm_from_sensors() else {
@@ -354,8 +704,10 @@ impl FanController {
         let (PwmCommand::Set(pwm) | PwmCommand::Kick(pwm)) = cmd;
         if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, pwm).is_err() {
             self.hwmon = None; // path went stale -- re-resolve next tick
+            self.note_control_lost(&format!("writing pwm{} failed", self.profile.pwm_index));
             return;
         }
+        self.mark_control_ok();
         self.last_pwm = Some(pwm);
         if matches!(cmd, PwmCommand::Kick(_)) {
             self.kick_until = Some(Instant::now() + Duration::from_secs(1));
@@ -438,12 +790,99 @@ impl FanController {
     }
 
     /// The PWM this fan should run at right now, per its `mode`; `None` if
-    /// no sensor feeding it has a reading.
+    /// no sensor feeding it has a reading. While any selector is lost
+    /// (`floor_active`) a fan that has readings still runs at `max_pwm`.
     fn target_pwm_from_sensors(&mut self) -> Option<u8> {
-        self.refresh_sensor_cache();
-        match self.profile.mode {
+        self.track_sensors();
+        let target = match self.profile.mode {
             FanMode::Curve => self.curve_target(),
             FanMode::Fixed => self.fixed_target(),
+        };
+        if self.floor_active() {
+            target.map(|_| self.profile.max_pwm)
+        } else {
+            target
+        }
+    }
+
+    /// True while some selector that used to read has been silent past the
+    /// grace (and hasn't yet read steadily again): the fan can't know what
+    /// that sensor would say, so it is held at `max_pwm`.
+    fn floor_active(&self) -> bool {
+        self.feeds.iter().any(|f| f.held)
+    }
+
+    /// Updates each selector's loss/recovery state from its latest sample,
+    /// logging once per transition. Called each time the fan is updated.
+    fn track_sensors(&mut self) {
+        let fan = format!(
+            "fan '{}' (pwm{})",
+            self.profile.name, self.profile.pwm_index
+        );
+        let now = Instant::now();
+        let mut any_read = false;
+        for (sel, feed) in self.profile.sensors.iter().zip(&mut self.feeds) {
+            if feed.current().is_some() {
+                any_read = true;
+                feed.ever_read = true;
+                feed.lost_since = None;
+                if feed.held {
+                    let since = *feed.back_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= self.timing.sensor_recovery_hold {
+                        feed.held = false;
+                        feed.back_since = None;
+                        crate::syslog::notice(&format!(
+                            "{fan}: sensor '{}' reading steadily again, resuming normal control",
+                            sel.chip
+                        ));
+                    }
+                }
+            } else if feed.ever_read {
+                feed.back_since = None;
+                let since = *feed.lost_since.get_or_insert(now);
+                if !feed.held
+                    && now.saturating_duration_since(since) >= self.timing.sensor_loss_grace
+                {
+                    feed.held = true;
+                    crate::syslog::warning(&format!(
+                        "{fan}: sensor '{}' stopped reading, holding max_pwm until it reads \
+                         steadily again",
+                        sel.chip
+                    ));
+                }
+            }
+        }
+        self.any_sensor_read |= any_read;
+    }
+
+    /// Starts one reader thread per sensor selector (see `SensorFeed`).
+    /// They run until `stop` is set. A thread that can't be started is
+    /// logged; its selector then never reads, which the loss handling
+    /// treats like any other missing sensor.
+    fn start_readers(&self, stop: &Arc<AtomicBool>) {
+        if !self.profile.enabled {
+            return;
+        }
+        for (sel, feed) in self.profile.sensors.iter().zip(&self.feeds) {
+            let interval = Duration::from_secs(sampling_secs(sel, self.profile.update_secs));
+            let (root, selector) = (self.hwmon_root.clone(), sel.clone());
+            let result = spawn_reader(
+                format!("sensor-{}", sel.chip),
+                interval,
+                Arc::clone(stop),
+                Arc::clone(&feed.shared),
+                move || {
+                    resolve_selector_in(&root, &selector)
+                        .into_iter()
+                        .reduce(f32::max)
+                },
+            );
+            if let Err(e) = result {
+                crate::syslog::critical(&format!(
+                    "fan '{}' (pwm{}): could not start the reader for sensor '{}': {e}",
+                    self.profile.name, self.profile.pwm_index, sel.chip
+                ));
+            }
         }
     }
 
@@ -455,10 +894,12 @@ impl FanController {
     /// that hot, it should be properly cooled, not just nudged back under
     /// the line. Logged on both transitions. Returns whether it's active.
     fn update_critical_override(&mut self, readings: &[(usize, f32)]) -> bool {
+        // An over-range reading (see `hal::is_over_range`) is hot whatever
+        // the configured thresholds say.
         let hot = readings
             .iter()
             .copied()
-            .find(|&(i, t)| t >= self.thresholds[i].1);
+            .find(|&(i, t)| t >= self.thresholds[i].1 || is_over_range(t));
         if let Some((i, temp_c)) = hot {
             if !self.critical_override {
                 self.critical_override = true;
@@ -467,15 +908,23 @@ impl FanController {
                     FanMode::Fixed => "fixed pwm",
                 };
                 crate::syslog::warning(&format!(
-                    "fan '{}' (pwm{}): {} at {temp_c:.1}C, at/above its critical {:.1}C -- \
+                    "fan '{}' (pwm{}): {} at {temp_c:.1}C{}, at/above its critical {:.1}C -- \
                      overriding {what} to max_pwm until everything is below warning",
                     self.profile.name,
                     self.profile.pwm_index,
                     self.profile.sensors[i].chip,
+                    if is_over_range(temp_c) {
+                        " (over-range: failed sensor or real emergency)"
+                    } else {
+                        ""
+                    },
                     self.thresholds[i].1
                 ));
             }
-        } else if self.critical_override && readings.iter().all(|&(i, t)| t < self.thresholds[i].0)
+        } else if self.critical_override
+            && readings
+                .iter()
+                .all(|&(i, t)| t < self.thresholds[i].0 && !is_over_range(t))
         {
             self.critical_override = false;
             crate::syslog::notice(&format!(
@@ -486,34 +935,12 @@ impl FanController {
         self.critical_override
     }
 
-    /// Rereads each sensor selector whose own resample interval is up --
-    /// fast for CPU, which can spike quickly; slower for drive/NVMe temps,
-    /// which change slowly and don't need hammering.
-    fn refresh_sensor_cache(&mut self) {
-        for (sel, cache) in self.profile.sensors.iter().zip(&mut self.sensor_cache) {
-            let min_resample = sel
-                .min_resample_secs
-                .unwrap_or(self.profile.update_secs)
-                .max(1);
-            let need_refresh = match cache.0 {
-                None => true,
-                Some(t) => t.elapsed() >= Duration::from_secs(min_resample),
-            };
-            if need_refresh {
-                let v = resolve_selector(sel)
-                    .into_iter()
-                    .fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.max(x))));
-                *cache = (Some(Instant::now()), v);
-            }
-        }
-    }
-
     /// (sensor index, latest temperature) for every sensor with a reading.
     fn readings(&self) -> Vec<(usize, f32)> {
-        self.sensor_cache
+        self.feeds
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, t))| t.map(|t| (i, t)))
+            .filter_map(|(i, f)| f.current().map(|t| (i, t)))
             .collect()
     }
 
@@ -565,30 +992,113 @@ impl FanController {
         })
     }
 
-    /// No sensor feeding this fan has a reading. Before this controller
-    /// has ever written the fan (e.g. sensors not loaded yet at startup)
-    /// it's left alone, in whatever mode the BIOS/driver set. Once it has
-    /// taken the fan over, losing every sensor (a module unloaded, a chip
-    /// renumbered) would otherwise freeze the fan at its last speed with
-    /// nothing watching temperatures -- so fail safe to `max_pwm` instead.
+    /// No sensor feeding this fan has a reading. Right after start (sensor
+    /// modules not loaded yet) the fan is left alone, in whatever mode the
+    /// BIOS/driver set, for `sensor_takeover_after`: that is normal at
+    /// boot. Past that -- or once this controller has taken the fan over
+    /// and then lost every sensor (a module unloaded, a chip renumbered) --
+    /// fail safe to `max_pwm`. Leaving BIOS automatic mode in charge is not
+    /// safe here: on this board's it8625 it stops the fan outright.
     fn hold_full_speed_without_sensors(&mut self, hwmon: &str) {
-        if self.last_pwm.is_none() {
+        let first_takeover = self.last_pwm.is_none();
+        if first_takeover && self.started.elapsed() < self.timing.sensor_takeover_after {
             return;
         }
         if !self.sensors_lost {
             self.sensors_lost = true;
-            crate::syslog::warning(&format!(
-                "fan '{}' (pwm{}): no sensor readings, holding at max_pwm",
+            let fan = format!(
+                "fan '{}' (pwm{})",
                 self.profile.name, self.profile.pwm_index
+            );
+            if first_takeover {
+                crate::syslog::warning(&format!(
+                    "{fan}: no sensor has produced a reading {}s after start; taking the fan \
+                     over at max_pwm rather than leaving BIOS automatic mode in charge \
+                     (which can stop it)",
+                    self.started.elapsed().as_secs()
+                ));
+            } else {
+                crate::syslog::warning(&format!("{fan}: no sensor readings, holding at max_pwm"));
+            }
+        }
+        if !self.any_sensor_read
+            && !self.no_sensor_critical_logged
+            && self.started.elapsed() >= self.timing.control_critical_after
+        {
+            self.no_sensor_critical_logged = true;
+            crate::syslog::critical(&format!(
+                "fan '{}' (pwm{}): still no sensor has ever produced a reading \
+                 ({}s); check its [[fans.sensors]] selectors; fan held at max_pwm",
+                self.profile.name,
+                self.profile.pwm_index,
+                self.started.elapsed().as_secs()
             ));
         }
         self.kick_until = None;
         let max = self.profile.max_pwm;
         if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, max).is_err() {
             self.hwmon = None;
+            self.note_control_lost(&format!("writing pwm{} failed", self.profile.pwm_index));
             return;
         }
+        self.mark_control_ok();
         self.last_pwm = Some(max);
+    }
+
+    /// This enabled fan can't be driven right now (its pwm chip isn't
+    /// there, or a write failed). Normal for a while at boot, so silent
+    /// until `control_warn_after`; then one WARNING, and one CRITICAL after
+    /// `control_critical_after` -- the fan is in whatever mode the BIOS
+    /// left it in, which may be stopped. Health follows the same clock.
+    fn note_control_lost(&mut self, why: &str) {
+        let fan = format!(
+            "fan '{}' (pwm{})",
+            self.profile.name, self.profile.pwm_index
+        );
+        let (warn_after, critical_after) = (
+            self.timing.control_warn_after,
+            self.timing.control_critical_after,
+        );
+        let loss = self.control_loss.get_or_insert_with(|| ControlLoss {
+            since: Instant::now(),
+            why: String::new(),
+            warned: false,
+            critical: false,
+        });
+        loss.why = why.to_string();
+        let age = loss.since.elapsed();
+        if age >= critical_after && !loss.critical {
+            loss.critical = true;
+            loss.warned = true;
+            crate::syslog::critical(&format!(
+                "{fan}: still not under control after {}s: {why}; BIOS/driver automatic \
+                 mode may have the fan stopped",
+                age.as_secs()
+            ));
+        } else if age >= warn_after && !loss.warned {
+            loss.warned = true;
+            crate::syslog::warning(&format!(
+                "{fan}: not under control after {}s: {why}; BIOS/driver automatic mode may \
+                 leave the fan stopped",
+                age.as_secs()
+            ));
+        }
+    }
+
+    /// A write just succeeded: the fan is under control. Logs the
+    /// recovery if the loss had been reported.
+    fn mark_control_ok(&mut self) {
+        if let Some(loss) = self.control_loss.take()
+            && loss.warned
+        {
+            crate::syslog::notice(&format!(
+                "fan '{}' (pwm{}): under control again after {}s ({})",
+                self.profile.name,
+                self.profile.pwm_index,
+                loss.since.elapsed().as_secs(),
+                loss.why
+            ));
+        }
     }
 
     /// Leaves the fan safe on exit (clean shutdown, or unwinding from a
@@ -614,7 +1124,7 @@ impl FanController {
     }
 
     fn resolve_hwmon(&self) -> Option<String> {
-        glob_hwmon(&self.profile.pwm_chip).and_then(|v| v.into_iter().next())
+        glob_hwmon_in(&self.hwmon_root, &self.profile.pwm_chip).and_then(|v| v.into_iter().next())
     }
 
     fn enable_path(&self, hwmon: &str) -> String {
@@ -674,7 +1184,6 @@ fn compute_pwm(temp_c: f32, min_temp_c: f32, max_temp_c: f32, cfg: &FanProfile) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SensorSelector;
 
     /// The default curve (45-90C, pwm 50/55/60..255) on it8625 pwm1/fan1.
     fn cfg() -> FanProfile {
@@ -751,6 +1260,19 @@ mod tests {
         let drive_max_t = 60.0; // drivetemp critical threshold
         assert_eq!(compute_pwm(60.0, drive_min_t, drive_max_t, &c), 255);
         assert_eq!(compute_pwm(70.0, drive_min_t, drive_max_t, &c), 255); // past its own max too
+    }
+
+    impl FanController {
+        /// Publishes `values` as each selector's fresh sample, as its
+        /// reader thread would.
+        fn set_samples(&mut self, values: &[Option<f32>]) {
+            for (feed, value) in self.feeds.iter_mut().zip(values) {
+                *lock(&feed.shared) = Sample {
+                    at: Some(Instant::now()),
+                    value: *value,
+                };
+            }
+        }
     }
 
     /// A scratch directory standing in for a hwmon device, seeded with
@@ -936,7 +1458,7 @@ mod tests {
 
     /// Feeds `fixed_target` these readings, as if just sampled.
     fn fixed_with(c: &mut FanController, drive: Option<f32>, cpu: Option<f32>) -> Option<u8> {
-        c.sensor_cache = vec![(Some(Instant::now()), drive), (Some(Instant::now()), cpu)];
+        c.set_samples(&[drive, cpu]);
         c.fixed_target()
     }
 
@@ -981,7 +1503,7 @@ mod tests {
     }
 
     fn curve_with(c: &mut FanController, drive: Option<f32>, cpu: Option<f32>) -> Option<u8> {
-        c.sensor_cache = vec![(Some(Instant::now()), drive), (Some(Instant::now()), cpu)];
+        c.set_samples(&[drive, cpu]);
         c.curve_target()
     }
 
@@ -1001,6 +1523,33 @@ mod tests {
     }
 
     #[test]
+    fn an_over_range_reading_pegs_the_fan_even_above_misconfigured_thresholds() {
+        // Thresholds nobody could reach (warn/critical above the plausible
+        // range) must not hide a 130C reading.
+        let temperature = TemperatureConfig {
+            warn_threshold: 500.0,
+            critical_threshold: 600.0,
+            ..TemperatureConfig::default()
+        };
+        let mut c = FanController::new(
+            FanProfile {
+                sensors: vec![SensorSelector {
+                    chip: "coretemp".into(),
+                    ..SensorSelector::default()
+                }],
+                ..cfg()
+            },
+            &temperature,
+        );
+        c.set_samples(&[Some(130.0)]);
+        assert_eq!(c.curve_target(), Some(255));
+        assert!(c.status_line().contains("critical-temp override"));
+        // Back in range: released (the huge warning threshold is cleared).
+        c.set_samples(&[Some(60.0)]);
+        assert!(c.curve_target().unwrap() < 255);
+    }
+
+    #[test]
     fn a_hot_nic_pegs_the_default_fan() {
         // The AQC113's PHY/MAC sensor: critical at 100C, ADM's LAN curve.
         let cfg = crate::config::Config::default();
@@ -1012,9 +1561,9 @@ mod tests {
             .position(|s| s.chip == "enp9s0")
             .expect("default fan has an AQC113 sensor");
         let mut feed = |temp: Option<f32>| {
-            let mut cache = vec![(Some(Instant::now()), None); c.sensor_cache.len()];
-            cache[nic] = (Some(Instant::now()), temp);
-            c.sensor_cache = cache;
+            let mut samples = vec![None; c.feeds.len()];
+            samples[nic] = temp;
+            c.set_samples(&samples);
             c.curve_target()
         };
         let warm = feed(Some(72.0)).unwrap();
@@ -1037,5 +1586,434 @@ mod tests {
         c.last_pwm = Some(100);
         assert_eq!(c.plan(100, Some(0.0)), PwmCommand::Kick(60));
         assert_eq!(c.health_level(), Level::Warn);
+    }
+
+    /// A controller on `hw` fed by two selectors ("cpu", "drive"), with
+    /// the loss grace shrunk to nothing and a short recovery hold.
+    fn two_sensor_controller(hw: &FakeHwmon) -> FanController {
+        let sel = |chip: &str| SensorSelector {
+            chip: chip.into(),
+            ..SensorSelector::default()
+        };
+        let mut c = new_controller(FanProfile {
+            fan_index: None,
+            sensors: vec![sel("cpu"), sel("drive")],
+            ..cfg()
+        });
+        c.hwmon = Some(hw.path());
+        c.timing = Timing {
+            sensor_loss_grace: Duration::ZERO,
+            sensor_recovery_hold: Duration::from_millis(80),
+            ..Timing::default()
+        };
+        c
+    }
+
+    fn pwm_written(hw: &FakeHwmon) -> u8 {
+        hw.read("pwm1").trim().parse().unwrap()
+    }
+
+    #[test]
+    fn a_wedged_sensor_read_cannot_freeze_the_control_path() {
+        let hw = FakeHwmon::new("wedged");
+        let mut c = two_sensor_controller(&hw);
+        // The drive selector's reader blocks forever (a hung drivetemp
+        // read); only the sender's drop at the end of the test frees it.
+        let (_release, wedge) = std::sync::mpsc::channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_reader(
+            "wedged".into(),
+            Duration::from_secs(1),
+            Arc::clone(&stop),
+            Arc::clone(&c.feeds[1].shared),
+            move || {
+                let _ = wedge.recv();
+                None
+            },
+        )
+        .unwrap();
+        // CPU keeps producing: the curve still ticks and writes.
+        c.last_pwm = Some(100);
+        c.set_samples(&[Some(80.0), None]);
+        let started = Instant::now();
+        c.update();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(pwm_written(&hw) > 150, "got {}", pwm_written(&hw));
+        // The never-read drive is merely absent, not a fault.
+        assert!(!c.floor_active());
+        assert_eq!(c.health_level(), Level::Info);
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_stale_sample_counts_as_a_lost_sensor() {
+        let hw = FakeHwmon::new("stale");
+        let mut c = two_sensor_controller(&hw);
+        c.last_pwm = Some(100);
+        c.set_samples(&[Some(40.0), Some(40.0)]);
+        c.update();
+        assert!(pwm_written(&hw) < 100);
+        // The drive's reader wedged: its last sample ages out.
+        c.feeds[1].max_age = Duration::from_millis(30);
+        c.set_samples(&[Some(40.0), None]);
+        *lock(&c.feeds[1].shared) = Sample {
+            at: Instant::now().checked_sub(Duration::from_millis(60)),
+            value: Some(40.0),
+        };
+        c.update();
+        assert_eq!(pwm_written(&hw), 255);
+        assert_eq!(c.health_level(), Level::Warn);
+    }
+
+    #[test]
+    fn losing_one_of_several_sensors_holds_max_pwm_until_it_reads_steadily_again() {
+        let hw = FakeHwmon::new("partial");
+        let mut c = two_sensor_controller(&hw);
+        c.last_pwm = Some(100);
+        c.set_samples(&[Some(40.0), Some(40.0)]);
+        c.update();
+        let quiet = pwm_written(&hw);
+        assert!(quiet < 100, "got {quiet}");
+        assert_eq!(c.health_level(), Level::Info);
+
+        // The drive sensor (which had been reading) goes silent while the
+        // CPU still reads: the fan must not just follow the CPU.
+        c.set_samples(&[Some(40.0), None]);
+        c.update();
+        assert_eq!(pwm_written(&hw), 255);
+        assert!(c.floor_active());
+        assert_eq!(c.health_level(), Level::Warn);
+
+        // A reading comes back, but one reading isn't "recovered".
+        c.set_samples(&[Some(40.0), Some(40.0)]);
+        c.update();
+        assert_eq!(pwm_written(&hw), 255);
+        // Lost again inside the hold: stays held, no flapping to the curve.
+        c.set_samples(&[Some(40.0), None]);
+        c.update();
+        c.set_samples(&[Some(40.0), Some(40.0)]);
+        c.update();
+        assert_eq!(pwm_written(&hw), 255);
+        // Steady for the whole hold: back to the curve.
+        std::thread::sleep(Duration::from_millis(100));
+        c.update();
+        assert_eq!(pwm_written(&hw), quiet);
+        assert!(!c.floor_active());
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn a_selector_that_never_read_does_not_hold_the_fan() {
+        let hw = FakeHwmon::new("absent");
+        let mut c = two_sensor_controller(&hw);
+        c.last_pwm = Some(100);
+        for _ in 0..3 {
+            c.set_samples(&[Some(40.0), None]); // no NVMe/drive installed
+            c.update();
+        }
+        assert!(pwm_written(&hw) < 100);
+        assert!(!c.floor_active());
+    }
+
+    #[test]
+    fn reader_threads_publish_what_the_fixture_hwmon_reads() {
+        let tree = crate::hal::HwmonTree::new("fan-reader");
+        tree.chip("hwmon0", "coretemp", &[("temp1_input", "61000")]);
+        let mut c = new_controller(FanProfile {
+            sensors: vec![SensorSelector {
+                chip: "coretemp".into(),
+                ..SensorSelector::default()
+            }],
+            ..cfg()
+        });
+        c.hwmon_root = tree.0.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        c.start_readers(&stop);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.feeds[0].current().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(c.feeds[0].current(), Some(61.0));
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn sampling_interval_is_clamped_to_a_safe_range() {
+        let sel = |secs| SensorSelector {
+            min_resample_secs: secs,
+            ..SensorSelector::default()
+        };
+        assert_eq!(sampling_secs(&sel(None), 1), 1);
+        assert_eq!(sampling_secs(&sel(Some(0)), 1), 1);
+        assert_eq!(sampling_secs(&sel(Some(30)), 1), 30);
+        assert_eq!(
+            sampling_secs(&sel(Some(u64::MAX)), 1),
+            MAX_SENSOR_INTERVAL_SECS
+        );
+        // Even an absurd update_secs can't overflow the staleness limit.
+        let feed = SensorFeed::new(&sel(Some(u64::MAX)), u64::MAX);
+        assert_eq!(
+            feed.max_age,
+            Duration::from_secs(MAX_SENSOR_INTERVAL_SECS * 3)
+        );
+    }
+
+    /// Timing that makes "never took over" and "no sensor ever" react at
+    /// once, with CRITICAL a moment later.
+    fn impatient() -> Timing {
+        Timing {
+            control_warn_after: Duration::ZERO,
+            control_critical_after: Duration::from_millis(80),
+            sensor_takeover_after: Duration::ZERO,
+            ..Timing::default()
+        }
+    }
+
+    fn it8625_tree(tag: &str) -> crate::hal::HwmonTree {
+        let tree = crate::hal::HwmonTree::new(tag);
+        tree.chip("hwmon0", "it8625", &[("pwm1", "120"), ("pwm1_enable", "2")]);
+        tree
+    }
+
+    fn coretemp_fan() -> FanProfile {
+        FanProfile {
+            fan_index: None,
+            sensors: vec![SensorSelector {
+                chip: "coretemp".into(),
+                ..SensorSelector::default()
+            }],
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn a_pwm_chip_that_never_resolves_raises_warn_then_critical() {
+        let empty = crate::hal::HwmonTree::new("no-chip");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = empty.0.clone();
+        c.timing = Timing {
+            control_warn_after: Duration::from_millis(40),
+            ..impatient()
+        };
+        // Within the boot grace: quiet.
+        c.update();
+        assert_eq!(c.health_level(), Level::Info);
+        std::thread::sleep(Duration::from_millis(50));
+        c.update();
+        assert_eq!(c.health_level(), Level::Warn);
+        assert!(c.control_loss.as_ref().is_some_and(|l| l.warned));
+        std::thread::sleep(Duration::from_millis(50));
+        c.update();
+        assert_eq!(c.health_level(), Level::Critical);
+        assert!(c.control_loss.as_ref().is_some_and(|l| l.critical));
+    }
+
+    #[test]
+    fn health_recovers_once_a_late_chip_is_taken_over() {
+        let tree = crate::hal::HwmonTree::new("late-chip");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        c.timing = impatient();
+        c.update();
+        assert_eq!(c.health_level(), Level::Warn);
+        // The platform driver loads: chip appears, a sensor reads.
+        let hw = tree.chip("hwmon0", "it8625", &[("pwm1", "120"), ("pwm1_enable", "2")]);
+        c.set_samples(&[Some(60.0)]);
+        c.last_tick = None;
+        c.update();
+        assert!(c.control_loss.is_none());
+        assert_eq!(c.health_level(), Level::Info);
+        assert_eq!(
+            std::fs::read_to_string(format!("{hw}/pwm1_enable")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn failing_pwm_writes_count_as_not_under_control() {
+        let tree = it8625_tree("write-fail");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        c.timing = impatient();
+        c.set_samples(&[Some(60.0)]);
+        // pwm1_enable is a directory: every write to it fails.
+        let enable = tree.0.join("hwmon0/pwm1_enable");
+        std::fs::remove_file(&enable).unwrap();
+        std::fs::create_dir(&enable).unwrap();
+        c.update();
+        assert!(c.hwmon.is_none());
+        assert_eq!(c.health_level(), Level::Warn);
+    }
+
+    #[test]
+    fn no_sensor_ever_reading_takes_the_fan_over_at_max_pwm_after_the_grace() {
+        let tree = it8625_tree("never-sensor");
+        let hw = tree.0.join("hwmon0");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        // Inside the grace: BIOS mode is left alone (normal at boot).
+        c.timing = Timing {
+            sensor_takeover_after: Duration::from_secs(60),
+            control_warn_after: Duration::from_secs(60),
+            ..impatient()
+        };
+        c.update();
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "120");
+        assert_eq!(c.health_level(), Level::Info);
+        // Past it: manual mode at full speed, health Warn...
+        c.timing.sensor_takeover_after = Duration::ZERO;
+        c.timing.control_warn_after = Duration::ZERO;
+        c.update();
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+        assert_eq!(
+            std::fs::read_to_string(hw.join("pwm1_enable")).unwrap(),
+            "1"
+        );
+        assert!(c.sensors_lost);
+        assert_eq!(c.health_level(), Level::Warn);
+        // ...and Critical when it persists.
+        std::thread::sleep(Duration::from_millis(100));
+        c.update();
+        assert_eq!(c.health_level(), Level::Critical);
+        assert!(c.no_sensor_critical_logged);
+        // A sensor finally reads: the curve takes over and health clears.
+        c.set_samples(&[Some(40.0)]);
+        c.update();
+        assert!(!c.sensors_lost);
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn a_fan_disabled_by_config_is_flagged_not_silent() {
+        let (cfg, diagnostics) = crate::config::Config::parse(
+            "[[fans]]\nname = \"bad\"\npwm_chip = \"it8625\"\nmin_temp_c = 90.0\nmax_temp_c = 45.0\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains("may stop it")),
+            "{diagnostics:?}"
+        );
+        let c = FanController::new(cfg.fans[0].clone(), &cfg.temperature);
+        assert_eq!(c.health_level(), Level::Warn);
+        let line = c.status_line();
+        assert!(line.contains("disabled by config"), "{line}");
+        assert!(line.contains("[Warn]"), "{line}");
+    }
+
+    #[test]
+    fn a_fan_disabled_on_purpose_is_just_disabled() {
+        let c = new_controller(FanProfile {
+            enabled: false,
+            ..cfg()
+        });
+        assert_eq!(c.health_level(), Level::Info);
+        assert!(
+            c.status_line().contains("disabled [Info]"),
+            "{}",
+            c.status_line()
+        );
+    }
+
+    /// A `FanService` around a thread that never returns, as a fan thread
+    /// wedged in a sysfs call would be, with a heartbeat last seen `age` ago.
+    fn wedged_service(
+        root: PathBuf,
+        profiles: Vec<FanProfile>,
+        age: Duration,
+    ) -> (FanService, std::sync::mpsc::Sender<()>) {
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = wedge.recv();
+        });
+        let epoch = Instant::now().checked_sub(age).unwrap();
+        (
+            FanService {
+                status: Arc::new(Mutex::new(FanStatus {
+                    health: Level::Info,
+                    lines: Vec::new(),
+                })),
+                stop: Arc::new(AtomicBool::new(false)),
+                handle,
+                heartbeat_ms: Arc::new(AtomicU64::new(0)),
+                epoch,
+                profiles,
+                hwmon_root: root,
+                join_timeout: Duration::from_millis(100),
+            },
+            release,
+        )
+    }
+
+    #[test]
+    fn a_stale_heartbeat_is_a_stalled_fan_thread() {
+        let (svc, _release) = wedged_service(
+            PathBuf::from("/nonexistent"),
+            Vec::new(),
+            Duration::from_secs(20),
+        );
+        assert!(!svc.has_died(), "the thread is alive, just stuck");
+        assert!(svc.is_stalled());
+        assert!(svc.heartbeat_age() >= Duration::from_secs(20));
+        let (fresh, _release) = wedged_service(
+            PathBuf::from("/nonexistent"),
+            Vec::new(),
+            Duration::from_secs(1),
+        );
+        assert!(!fresh.is_stalled());
+    }
+
+    #[test]
+    fn a_running_fan_service_keeps_its_heartbeat_fresh() {
+        let tree = it8625_tree("heartbeat");
+        let svc = FanService::spawn_in(tree.0.clone(), Vec::new(), &TemperatureConfig::default())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            svc.heartbeat_age() < Duration::from_secs(1),
+            "{:?}",
+            svc.heartbeat_age()
+        );
+        assert!(!svc.is_stalled());
+        let started = Instant::now();
+        svc.shutdown();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_wedged_thread_and_forces_full_speed() {
+        let tree = it8625_tree("failsafe");
+        let hw = tree.0.join("hwmon0");
+        let profiles = vec![
+            coretemp_fan(),
+            // Disabled fans are left alone.
+            FanProfile {
+                pwm_index: 2,
+                enabled: false,
+                ..coretemp_fan()
+            },
+        ];
+        std::fs::write(hw.join("pwm2"), "77").unwrap();
+        std::fs::write(hw.join("pwm2_enable"), "2").unwrap();
+        let (svc, release) = wedged_service(tree.0.clone(), profiles, Duration::from_secs(20));
+        let started = Instant::now();
+        svc.shutdown(); // must return despite the stuck thread
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+        assert_eq!(
+            std::fs::read_to_string(hw.join("pwm1_enable")).unwrap(),
+            "1"
+        );
+        assert_eq!(std::fs::read_to_string(hw.join("pwm2")).unwrap(), "77");
+        drop(release);
+    }
+
+    #[test]
+    fn forcing_full_speed_reports_a_missing_chip() {
+        let empty = crate::hal::HwmonTree::new("failsafe-none");
+        let err = write_full_speed(&empty.0, &coretemp_fan()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

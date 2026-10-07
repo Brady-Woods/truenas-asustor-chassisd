@@ -393,12 +393,21 @@ Three ways this goes further than upstream fancontrol:
   chip can expose more temp inputs than a given board wires up -- this
   board's `it8625` has `temp1`-`temp3` with no diode connected to any of
   them, reading a constant, wildly-out-of-range value forever.
-  `hal::read_temp_input` treats a set `tempN_fault` flag, or a reading
-  outside a generous plausible range, as "not connected" and excludes it,
-  rather than letting a phantom sensor drag every fan to full speed
-  forever. A `chip = "..."` selector with no `input` set matches *every*
-  temp input that chip has, relying on this filtering rather than needing
-  you to already know which specific inputs are real.
+  `hal::read_temp_input` excludes a set `tempN_fault` flag, anything that
+  isn't a finite number, and anything below -20C (that board's constant is
+  -128C) as "not connected", rather than letting a phantom sensor stand in
+  for a real one. A reading *above* 125C is the opposite case: it is kept
+  and treated as hot (the fan goes to `max_pwm` as for a critical
+  temperature, and the health monitor alarms), because a sensor that failed
+  high must never remove cooling. A `chip = "..."` selector with no `input`
+  set matches *every* temp input that chip has, relying on this filtering
+  rather than needing you to already know which specific inputs are real;
+  if an unwired input on another board reads a constant high value, narrow
+  the selector with `input`/`label`.
+- **Chip names match exactly.** `pwm_chip` and sensor `chip` match the
+  hwmon `name` exactly; a name prefix is only a fallback when no chip has
+  that exact name (so `"nvme"` and `"it8625"` keep working). Name a
+  `pwm_chip` exactly.
 
 **Fixed mode** (`mode = "fixed"` + `fixed_pwm`, the equivalent of ADM's
 fixed fan mode) skips the curve and runs the fan at a constant PWM --
@@ -433,9 +442,35 @@ frozen with nothing watching temperatures:
 
 - Fan control runs on its own thread, so a slow or hung `zpool`/`smartctl`
   on the main loop can't stall it (and every external command is killed
-  after 10s anyway).
+  after 10s anyway). Sensors are read on their own reader threads, one per
+  `[[fans.sensors]]` selector, so a wedged `drivetemp` read can't freeze
+  the CPU curve either: a sample older than three read intervals (at
+  least 10s) simply counts as no reading. Read intervals are limited to
+  1-300s.
 - If every sensor feeding a fan stops reading after the daemon has taken
-  it over, the fan is held at `max_pwm` until a reading comes back.
+  it over, the fan is held at `max_pwm` until a reading comes back. The
+  same goes for one selector that *used to* read (a drive, the NIC) and
+  goes silent for 10s while others still do: the fan is held at `max_pwm`,
+  with a WARNING, until that selector has read steadily for 30s (so a
+  flapping sensor can't make the fan oscillate). A selector that never
+  read (no NVMe installed) is just absent. Restarting the daemon clears
+  the hold.
+- A fan that is enabled but never taken over doesn't fail silently. If its
+  pwm chip isn't found (or writes keep failing) the fan shows a WARNING
+  after 30s -- long enough for the platform driver to load at boot -- and
+  CRITICAL after 180s, in the log, `STATUS` and the status LED. If the chip
+  is there but no sensor has ever read, after 30s the fan is taken over at
+  `max_pwm` (BIOS automatic mode stops this board's fan), CRITICAL after
+  180s. A fan disabled at load for an inconsistent profile is left alone
+  but shows as "disabled by config" with a WARNING, and the diagnostic
+  says BIOS mode may stop it.
+- The fan thread publishes a heartbeat; if it stops making progress for
+  15s (a hung sysfs write) the daemon exits, hands the fans back at full
+  speed and systemd restarts it. `lcm-status.service` also sets
+  `WatchdogSec=30`: the daemon pings systemd's watchdog (a minimal
+  `sd_notify`, no dependency) from its main loop only while the fan thread
+  is alive, so a stuck daemon is restarted too. Without `NOTIFY_SOCKET`
+  (run by hand) this does nothing.
 - `pwmN_enable` is set to manual before *every* write. In automatic mode
   the it87 driver rejects pwm writes, and on this board automatic mode
   stops the fan entirely (0 RPM).
