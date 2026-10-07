@@ -479,7 +479,20 @@ frozen with nothing watching temperatures:
   under 15s old and the main loop has made progress within the last 300s,
   so a wedged fan thread or main loop is restarted, while a slow
   `zpool`/`smartctl`/`docker` refresh is not mistaken for one. Without
-  `NOTIFY_SOCKET` (run by hand) this does nothing.
+  `NOTIFY_SOCKET` (run by hand) this does nothing. The default
+  `WatchdogSignal=SIGABRT` is kept on purpose: a wedged process may never
+  act on a graceful SIGTERM, so it is ended at once (with a core for
+  diagnosis) and the unit's `ExecStopPost` provides the fan safety.
+- That matters because a process killed by systemd (watchdog abort,
+  SIGKILL, the OOM killer, a crash) never runs its restore-on-exit, which
+  would leave a fan at its last manual PWM -- possibly low -- until the
+  restarted daemon retakes it. `lcm-status.service` therefore has
+  `ExecStopPost=... fan-failsafe /etc/lcm-status.toml`, which runs after
+  *every* stop and forces each enabled fan to manual mode at full speed
+  (time-bounded to 3s, logged to syslog, no serial port or socket needed;
+  `TimeoutStopSec=20`). It exits 0 when no fan chip exists at all, and
+  non-zero if a fan that is present could not be set. Run it by hand with
+  `lcm-status fan-failsafe [CONFIG]`.
 - `pwmN_enable` is set to manual before *every* write. In automatic mode
   the it87 driver rejects pwm writes, and on this board automatic mode
   stops the fan entirely (0 RPM).

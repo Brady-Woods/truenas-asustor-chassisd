@@ -11,6 +11,24 @@ Type=simple
 ExecStart=@LCM_STATUS_BIN@ daemon /etc/lcm-status.toml
 Restart=on-failure
 RestartSec=2
+# Fan fail-safe. When systemd kills the daemon (watchdog SIGABRT, SIGKILL
+# after a stuck stop, the OOM killer, a crash) its restore-on-exit never
+# runs and the fan would stay at its last manual PWM -- possibly low -- until
+# the restarted daemon retakes it; handing back to BIOS automatic mode is no
+# answer, it stops this board's fan. ExecStopPost runs after *every* stop,
+# clean or not, and forces each enabled fan to manual, full speed (bounded
+# to 3s inside the binary; it takes no serial lock and touches no LCD or
+# socket). No leading '-': a non-zero exit means a present fan could not be
+# set (no chip at all exits 0), and that should show as a failed unit
+# rather than be ignored; Restart=on-failure restarts either way.
+# `lcm-status fan-profile` stops this unit and then drives pwm itself, so
+# full speed right after the stop is harmless there.
+ExecStopPost=@LCM_STATUS_BIN@ fan-failsafe /etc/lcm-status.toml
+# Graceful stop is ~5s fan-thread join + 3s fail-safe + other cleanup; the
+# default 90s would leave a daemon that ignores SIGTERM (e.g. a wedged main
+# loop) running that long before SIGKILL. 20s covers the graceful path with
+# slack and keeps ExecStopPost (also bounded by this) plus restart prompt.
+TimeoutStopSec=20
 # Liveness: a dedicated daemon thread pings the service watchdog
 # (sd_notify, over $NOTIFY_SOCKET) only while the fan thread's heartbeat is
 # fresh (<15s) and the main loop has made progress within 300s, so a wedged
@@ -19,6 +37,12 @@ RestartSec=2
 # not. WatchdogSec=60 leaves the 15s fan bound ample slack.
 # NotifyAccess=main: only the daemon's own process may send those pings.
 WatchdogSec=60
+# Keep the default WatchdogSignal=SIGABRT rather than SIGTERM. A watchdog
+# trip means the process is wedged, which is exactly when a SIGTERM that
+# only sets a flag would go unheard: the daemon would keep running (fans
+# unsupervised) until TimeoutStopSec, then be SIGKILLed anyway. SIGABRT ends
+# it at once and leaves a core for diagnosis; ExecStopPost above provides
+# the fan restore the graceful path would have, so nothing is lost.
 NotifyAccess=main
 # Needs root: /dev/ttyS1, the LCD power GPIO/LED, smartctl, and
 # systemctl poweroff/reboot for the panel's shutdown/restart action and
