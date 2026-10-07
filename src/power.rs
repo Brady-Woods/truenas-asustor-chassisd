@@ -44,7 +44,9 @@
 
 use crate::config::PowerRule;
 use crate::state::Action;
+use crate::syslog;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The RTC wake alarm sysfs file. Write `0` to disarm, or a future UTC
@@ -300,7 +302,10 @@ pub struct LocalTime {
 impl LocalTime {
     /// `t` (UTC epoch seconds) in the system's local timezone, via libc's
     /// `localtime_r` -- the same source `[sleep]` uses (see
-    /// `main::now_hhmm` for why not `SystemTime` arithmetic).
+    /// `main::now_hhmm` for why not `SystemTime` arithmetic). If libc
+    /// cannot convert `t` (it returns NULL, e.g. a year that doesn't fit
+    /// its `int`), this is `from_utc(t)` and a warning is logged once;
+    /// never a zeroed `tm` passed off as 1900-01-00 00:00.
     pub fn from_epoch(t: i64) -> LocalTime {
         // `t` is passed as-is: `time_t` is `i64` on every 64-bit target
         // this builds for, and naming `libc::time_t` is deprecated on musl
@@ -308,20 +313,59 @@ impl LocalTime {
         // SAFETY: `tm` is plain data for which all-zeroes is valid, and
         // both pointers passed to the reentrant `localtime_r` are to
         // locals that outlive the call.
-        let tm = unsafe {
+        let converted = unsafe {
             let mut tm: libc::tm = std::mem::zeroed();
-            libc::localtime_r(&raw const t, &raw mut tm);
-            tm
+            let ok = !libc::localtime_r(&raw const t, &raw mut tm).is_null();
+            ok.then_some(tm)
+        };
+        let Some(tm) = converted else {
+            static WARNED: Once = Once::new();
+            WARNED.call_once(|| {
+                syslog::warning(&format!(
+                    "localtime_r failed for epoch {t}; using UTC for local time"
+                ));
+            });
+            return LocalTime::from_utc(t);
         };
         let field = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
         LocalTime {
-            year: tm.tm_year + 1900,
+            year: tm.tm_year.saturating_add(1900),
             month: field(tm.tm_mon) + 1,
             day: field(tm.tm_mday),
             weekday: field(tm.tm_wday),
             hour: field(tm.tm_hour),
             minute: field(tm.tm_min),
             utc_offset: tm.tm_gmtoff,
+        }
+    }
+
+    /// `t` as UTC, with a zero offset: the fallback when the system's
+    /// timezone conversion fails. Days since 1970-01-01 -> civil date is
+    /// Howard Hinnant's `civil_from_days`; arithmetic saturates so any
+    /// `t` is safe, with a `year` clamped to `i32` (nothing real gets there).
+    pub fn from_utc(t: i64) -> LocalTime {
+        let days = t.div_euclid(86_400);
+        let secs = t.rem_euclid(86_400);
+        let z = days.saturating_add(719_468);
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe
+            .saturating_add(era.saturating_mul(400))
+            .saturating_add(i64::from(month <= 2));
+        let small = |v: i64| u32::try_from(v).unwrap_or(0);
+        LocalTime {
+            year: i32::try_from(year).unwrap_or(if year < 0 { i32::MIN } else { i32::MAX }),
+            month: small(month),
+            day: small(doy - (153 * mp + 2) / 5 + 1),
+            // 1970-01-01 was a Thursday.
+            weekday: small((days.saturating_add(4)).rem_euclid(7)),
+            hour: small(secs / 3600),
+            minute: small(secs / 60 % 60),
+            utc_offset: 0,
         }
     }
 
@@ -696,6 +740,56 @@ mod tests {
 
     fn utc(t: i64) -> LocalTime {
         at_offset(t, 0)
+    }
+
+    #[test]
+    fn the_utc_fallback_matches_independent_civil_arithmetic() {
+        for t in [
+            0,
+            1,
+            86_399,
+            86_400,
+            951_782_400,   // 2000-02-29
+            1_700_000_000, // 2023-11-14 22:13:20 UTC
+            MON,
+            4_102_444_800, // 2100-01-01
+            -1,
+            -86_400,
+            -2_208_988_800, // 1900-01-01
+        ] {
+            assert_eq!(LocalTime::from_utc(t), utc(t), "t = {t}");
+        }
+        let known = LocalTime::from_utc(1_700_000_000);
+        assert_eq!(
+            (known.year, known.month, known.day, known.weekday),
+            (2023, 11, 14, 2)
+        );
+        assert_eq!((known.hour, known.minute, known.utc_offset), (22, 13, 0));
+    }
+
+    #[test]
+    fn the_utc_fallback_cannot_panic_on_absurd_times() {
+        for t in [i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1] {
+            let l = LocalTime::from_utc(t);
+            assert!((1..=12).contains(&l.month), "t = {t}: {l:?}");
+            assert!((1..=31).contains(&l.day), "t = {t}: {l:?}");
+            assert!(
+                l.weekday < 7 && l.hour < 24 && l.minute < 60,
+                "t = {t}: {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_localtime_cannot_convert_falls_back_to_utc() {
+        // Far beyond what `tm_year` (an `int`) can hold: `localtime_r`
+        // fails with EOVERFLOW rather than filling `tm`.
+        let l = LocalTime::from_epoch(i64::MAX);
+        assert_eq!(l, LocalTime::from_utc(i64::MAX));
+        assert_eq!(l.utc_offset, 0);
+        // And an ordinary time still goes through libc, whatever zone.
+        let l = LocalTime::from_epoch(MON);
+        assert!((1..=12).contains(&l.month) && l.hour < 24);
     }
 
     /// US Pacific around its 2026 transitions: spring forward Sun Mar 8
