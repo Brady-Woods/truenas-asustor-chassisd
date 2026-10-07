@@ -1,0 +1,95 @@
+name: Release
+
+# On a pushed vX.Y.Z tag: build a static x86_64 musl binary and attach it
+# (tarball + SHA-256) to the GitHub release for that tag, creating the
+# release (notes from CHANGELOG.md) if it doesn't exist yet. Re-running
+# replaces the assets.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    name: build and upload
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Check the tag matches Cargo.toml
+        id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Check the binary is static
+        run: |
+          bin="target/$TARGET/release/lcm-status"
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie)? linked|statically linked'
+
+      - name: Package
+        id: package
+        run: |
+          name="lcm-status-$GITHUB_REF_NAME-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/lcm-status" README.md CHANGELOG.md \
+            lcm-status.example.toml lcm-status.service "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::no '## [$VERSION]' section in CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
