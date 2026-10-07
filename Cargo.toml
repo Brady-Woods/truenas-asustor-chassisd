@@ -1,6 +1,6 @@
 [package]
 name = "lcm-status"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Front-panel LCD, LED and fan control daemon for ASUSTOR NAS hardware running TrueNAS SCALE"

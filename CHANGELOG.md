@@ -9,6 +9,8 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-06
+
 ### Added
 
 - **Socket `SHOW` look options.** `SHOW <level> <ttl> ... [color=green|yellow|red]
@@ -393,7 +395,8 @@ Upgrading from 1.4.0:
 - Initial release: portable ASUSTOR LCM/LED driver for TrueNAS SCALE, fan
   control, deploy script.
 
-[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.4.0...v2.0.0
