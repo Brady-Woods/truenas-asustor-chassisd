@@ -1021,7 +1021,11 @@ sudo ./deploy.sh
 
 is the whole build+install pipeline: checks the driver dependency first
 and refuses to continue without it, builds in a throwaway container
-(nothing installed on the host toolchain-wise), installs the config only
+(nothing installed on the host toolchain-wise) -- only when the source
+changed since the last build, so the boot-time run doesn't need Docker,
+which isn't up yet when Post Init scripts run -- creates the `lcm-status`
+socket group through the TrueNAS middleware (so it's in the config
+database and survives reboots), installs the config only
 if one doesn't already exist (never clobbers edits), installs and enables
 the systemd unit, and registers itself as a TrueNAS **POSTINIT
 Init/Shutdown Script** (`midclt call initshutdownscript.query`) so the
@@ -1037,9 +1041,14 @@ straight out of this checkout (the systemd unit's `ExecStart` points at
 carried forward from update to update -- which is fine, since `deploy.sh`
 reinstalls both every run rather than treating first-install as special.
 What's actually durable is TrueNAS's own config database, which is where
-Init/Shutdown Scripts live. So even a fresh boot environment missing the
-group, the systemd unit, and everything under `/etc` will self-heal on its
-very first boot, with no manual re-deploy step. The source tree itself
+Init/Shutdown Scripts live (and the `lcm-status` group). So even a fresh
+boot environment missing the systemd unit and everything else under `/etc`
+will self-heal on its very first boot, with no manual re-deploy step.
+
+At boot the daemon usually starts a second or so *before* the platform
+driver's own Post Init script has loaded the modules (the two can't be
+ordered). It notices the driver appearing (and any later reload) and
+applies the LED settings then, so nothing waits for a restart. The source tree itself
 lives under the data pool (`/mnt/.../home/...`, not the boot pool), for
 the same reason -- it's storage TrueNAS updates never touch.
 
