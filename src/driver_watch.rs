@@ -5,12 +5,12 @@
 //!
 //! At boot this is the normal order, not an edge case: lcm-status.service
 //! is started by systemd, while the driver is loaded by its own TrueNAS
-//! Post Init script (`truenas-asustor-deploy/components/platform-driver/
-//! deploy.sh`), which runs once boot has finished and can't be ordered
-//! against a systemd unit. Found live (2026-10-06): the daemon started
-//! about a second before the modules were loaded, so the startup LED pass
-//! (`AppState::init_leds`) found no `disk_led_ready` and no
-//! `front_panel::brightness`, and nothing applied them until a manual
+//! Post Init script (its modules aren't installed into the boot pool,
+//! which TrueNAS updates replace). That runs once boot has finished and
+//! can't be ordered against a systemd unit. Found live (2026-10-06): the
+//! daemon started about a second before the modules were loaded, so the
+//! startup LED pass (`AppState::init_leds`) found no `disk_led_ready` and
+//! no `front_panel::brightness`, and nothing applied them until a manual
 //! restart. The driver's deploy script also reloads the modules whenever
 //! its checkout changes, which re-creates every LED in its default state.
 //!

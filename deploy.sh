@@ -45,8 +45,8 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
 # project uses actually exists.
 check_driver() {
     log "Checking for asustor-platform-driver (fork main, v0.3 or later)..."
-    # This and the platform driver's own Post Init script (see
-    # truenas-asustor-deploy/components/platform-driver/) both run as
+    # This and the platform driver's own Post Init script (which builds
+    # and loads its modules from a checkout on the data pool) both run as
     # POSTINIT Init/Shutdown Scripts, and TrueNAS doesn't guarantee which
     # runs first. On a fresh boot environment the driver may still be
     # mid-rebuild when this starts, so poll instead of failing immediately.

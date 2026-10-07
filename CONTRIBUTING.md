@@ -15,8 +15,6 @@ Not here, so please report them in the component's own repo:
 - kernel driver behaviour (LED class devices, GPIO, `it87`, the buzzer
   device, `lcd_power`, EuP):
   [Brady-Woods/asustor-platform-driver](https://github.com/Brady-Woods/asustor-platform-driver)
-- deploying the whole stack, `verify-all.sh`, the cross-component docs:
-  [Brady-Woods/truenas-asustor-deploy](https://github.com/Brady-Woods/truenas-asustor-deploy)
 
 ## Reporting a problem
 
