@@ -2,13 +2,16 @@
 name = "lcm-status"
 version = "2.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Front-panel LCD, LED and fan control daemon for ASUSTOR NAS hardware running TrueNAS SCALE"
 license = "MIT"
 publish = false
 
 [profile.release]
 opt-level = 2
+# A wrapped counter or time delta would silently misbehave; a panic is
+# restarts the daemon (Restart=on-failure) instead.
+overflow-checks = true
 
 [dependencies]
 libc = "0.2"

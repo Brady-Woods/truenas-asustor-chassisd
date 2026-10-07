@@ -391,13 +391,15 @@ fn is_repeated_wall_time(m: i64, local: &impl Fn(i64) -> LocalTime) -> bool {
     let at = local(m);
     // DST shifts are at most a couple of hours; looking 4h back is sure to
     // see the offset from before any shift that `m` is still inside of.
-    let shift = local(m - 4 * 3600).utc_offset - at.utc_offset;
-    shift > 0 && local(m - shift).wall() == at.wall()
+    let shift = local(m.saturating_sub(4 * 3600))
+        .utc_offset
+        .saturating_sub(at.utc_offset);
+    shift > 0 && local(m.saturating_sub(shift)).wall() == at.wall()
 }
 
 /// Every minute boundary in (`after`, `until`], as epoch seconds.
 fn minute_boundaries(after: i64, until: i64) -> impl Iterator<Item = i64> {
-    let first = after.div_euclid(60) * 60 + 60;
+    let first = after.div_euclid(60).saturating_mul(60).saturating_add(60);
     (first..=until).step_by(60)
 }
 
@@ -429,7 +431,7 @@ pub fn next_occurrence<'a>(
     if !rules.iter().any(filter) {
         return None;
     }
-    minute_boundaries(after, after + LOOKAHEAD_MINUTES * 60)
+    minute_boundaries(after, after.saturating_add(LOOKAHEAD_MINUTES * 60))
         .find_map(|m| best(due_at(rules, m, local, filter)).map(|r| (m, r)))
 }
 
@@ -515,10 +517,10 @@ impl Scheduler {
                 self.checked_until = Some(now);
                 self.next_rtc_check = i64::MIN;
             }
-            Some(prev) if (now - prev).abs() > MAX_GAP_SECS => {
+            Some(prev) if now.abs_diff(prev) > MAX_GAP_SECS.unsigned_abs() => {
                 crate::syslog::notice(&format!(
                     "power schedule: clock jumped by {}s; anything scheduled in between is skipped",
-                    now - prev
+                    now.saturating_sub(prev)
                 ));
                 self.checked_until = Some(now);
                 self.next_rtc_check = i64::MIN;
@@ -559,7 +561,7 @@ impl Scheduler {
         let Some(path) = self.rtc.clone() else {
             return;
         };
-        self.next_rtc_check = now + RTC_RECHECK_SECS;
+        self.next_rtc_check = now.saturating_add(RTC_RECHECK_SECS);
         let want = next_occurrence(&self.rules, now, local, is_power_on);
         let want_at = want.map(|(t, _)| t);
         let result = (|| -> std::io::Result<bool> {
@@ -638,7 +640,7 @@ fn describe_with(
                 format!(
                     "{} ({}, {})",
                     format_local(local(t)),
-                    in_text(t - now),
+                    in_text(t.saturating_sub(now)),
                     r.label
                 )
             },
@@ -691,7 +693,7 @@ fn format_local(t: LocalTime) -> String {
 
 /// "in 2d 3h 4m" for a positive number of seconds.
 fn in_text(secs: i64) -> String {
-    let mins = (secs.max(0) + 59) / 60;
+    let mins = secs.max(0).saturating_add(59) / 60;
     let (d, h, m) = (mins / 1440, mins / 60 % 24, mins % 60);
     match (d, h) {
         (0, 0) => format!("in {m}m"),
@@ -907,6 +909,30 @@ mod tests {
         let (t, _) = next_occurrence(&r, sat_noon, &pacific, is_power_on).unwrap();
         let l = pacific(t);
         assert_eq!((l.month, l.day, l.hour, l.minute), (3, 9, 2, 30));
+    }
+
+    #[test]
+    fn extreme_clock_values_do_not_overflow() {
+        // The fake timezone does plain arithmetic itself, so keep it to
+        // times it can represent; the code under test sees the extremes.
+        let local = |t: i64| utc(t.clamp(-(1 << 50), 1 << 50));
+        let r = rules(&[raw(&["mon"], "23:00", "shutdown")]);
+        let mut s = Scheduler::with_rtc(r, Path::new("/nonexistent"));
+        for t in [
+            0,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX,
+            0,
+            i64::MIN + 1,
+            i64::MAX - 30,
+        ] {
+            let _ = s.poll_with(t, &local);
+        }
+        let _ = next_occurrence(&s.rules, i64::MAX - 5, &local, is_power_off);
+        let _ = describe_with(&s.rules, i64::MAX, false, false, &local);
+        assert!(!is_repeated_wall_time(i64::MIN, &local));
+        assert!(in_text(i64::MAX).starts_with("in "));
     }
 
     #[test]

@@ -7,6 +7,15 @@ use std::path::Path;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/lcm-status.toml";
 
+/// Upper bound for every user-set duration in seconds that ends up in
+/// `Instant + Duration` arithmetic (a day is longer than any sensible
+/// dwell, timeout or refresh floor). Anything larger is clamped with a
+/// diagnostic; `state::deadline_after` is the second line of defence.
+pub const MAX_SECS: u64 = 86_400;
+/// Longest scrolling line (characters) and end-to-start gap accepted.
+const MAX_SCROLL_CHARS: usize = 1024;
+const MAX_SCROLL_GAP: usize = 64;
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
@@ -996,11 +1005,15 @@ impl Config {
     ///   curve that makes no sense;
     /// - an unparseable `[wol] mode` leaves WOL untouched;
     /// - an `[led]` brightness over 100 is clamped to 100;
+    /// - durations over a day and absurd scroll sizes are clamped;
+    /// - a NaN or infinite temperature falls back to its default (fan
+    ///   curve) or is dropped (threshold override);
     /// - inverted temperature thresholds are reported only;
     /// - a malformed `[[power_schedule]]` entry is disabled; rules that
     ///   are fine alone but clash (see `power::lint`) are reported only.
     fn validate(&mut self) -> Vec<String> {
         let mut errors = self.templates.validate();
+        self.clamp_bounds(&mut errors);
 
         if self.sleep.enabled {
             for (key, value) in [("start", &self.sleep.start), ("end", &self.sleep.end)] {
@@ -1014,6 +1027,8 @@ impl Config {
                 self.sleep.enabled = false;
             }
         }
+
+        self.sanitize_fan_temps(&mut errors);
 
         for fan in self.fans.iter_mut().filter(|f| f.enabled) {
             if fan.mode == FanMode::Curve && fan.fixed_pwm.is_some() {
@@ -1073,6 +1088,8 @@ impl Config {
             }
         }
 
+        self.sanitize_thresholds(&mut errors);
+
         let t = &self.temperature;
         if t.warn_threshold >= t.critical_threshold {
             errors.push(format!(
@@ -1092,6 +1109,143 @@ impl Config {
         }
 
         errors
+    }
+}
+
+/// Clamps `value` to `max`, noting it in `errors` if that changed it.
+fn clamp_to<T: PartialOrd + Copy + std::fmt::Display>(
+    errors: &mut Vec<String>,
+    key: &str,
+    value: &mut T,
+    max: T,
+) {
+    if *value > max {
+        errors.push(format!("{key} = {value} is over {max}; using {max}"));
+        *value = max;
+    }
+}
+
+impl Config {
+    /// Clamps the settings that size a timer or a buffer, so a typo (or
+    /// `9223372036854775807`) can't overflow `Instant` arithmetic or ask
+    /// for a gigabyte scroll buffer.
+    fn clamp_bounds(&mut self, errors: &mut Vec<String>) {
+        let secs = [
+            ("[rotation] dwell_secs", &mut self.rotation.dwell_secs),
+            (
+                "[rotation] resume_after_secs",
+                &mut self.rotation.resume_after_secs,
+            ),
+            (
+                "[menu] confirm_timeout_secs",
+                &mut self.menu.confirm_timeout_secs,
+            ),
+            (
+                "[refresh] network_min_secs",
+                &mut self.refresh.network_min_secs,
+            ),
+            ("[refresh] pools_min_secs", &mut self.refresh.pools_min_secs),
+            ("[refresh] hdd_min_secs", &mut self.refresh.hdd_min_secs),
+            (
+                "[refresh] temperature_min_secs",
+                &mut self.refresh.temperature_min_secs,
+            ),
+            (
+                "[refresh] docker_min_secs",
+                &mut self.refresh.docker_min_secs,
+            ),
+        ];
+        for (key, value) in secs {
+            clamp_to(errors, key, value, MAX_SECS);
+        }
+        clamp_to(
+            errors,
+            "[display] scroll_max_chars",
+            &mut self.display.scroll_max_chars,
+            MAX_SCROLL_CHARS,
+        );
+        clamp_to(
+            errors,
+            "[display] scroll_gap",
+            &mut self.display.scroll_gap,
+            MAX_SCROLL_GAP,
+        );
+    }
+
+    /// Replaces NaN/infinite fan-curve temperatures: comparisons with NaN
+    /// are all false, so such a curve would pass `FanProfile::problems`
+    /// and then compute garbage. The fan's own values revert to the
+    /// defaults (checked for consistency afterwards like any other), a
+    /// sensor's own override is dropped so it shares the fan's.
+    fn sanitize_fan_temps(&mut self, errors: &mut Vec<String>) {
+        let defaults = FanProfile::default();
+        for fan in &mut self.fans {
+            for (key, value, default) in [
+                ("min_temp_c", &mut fan.min_temp_c, defaults.min_temp_c),
+                ("max_temp_c", &mut fan.max_temp_c, defaults.max_temp_c),
+            ] {
+                if !value.is_finite() {
+                    errors.push(format!(
+                        "[[fans]] '{}': {key} = {value} is not a finite number; using {default}",
+                        fan.name
+                    ));
+                    *value = default;
+                }
+            }
+            for sel in &mut fan.sensors {
+                for (key, value) in [
+                    ("min_temp_c", &mut sel.min_temp_c),
+                    ("max_temp_c", &mut sel.max_temp_c),
+                ] {
+                    if value.is_some_and(|v| !v.is_finite()) {
+                        errors.push(format!(
+                            "[[fans]] '{}': sensor '{}': {key} is not a finite number; \
+                             using the fan's value",
+                            fan.name, sel.chip
+                        ));
+                        *value = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same for the `[temperature]` thresholds: a NaN would silently never
+    /// alert. The global pair reverts to its defaults, an override entry is
+    /// dropped (its chip then falls back to the global pair).
+    fn sanitize_thresholds(&mut self, errors: &mut Vec<String>) {
+        let defaults = TemperatureConfig::default();
+        let t = &mut self.temperature;
+        for (key, value, default) in [
+            (
+                "warn_threshold",
+                &mut t.warn_threshold,
+                defaults.warn_threshold,
+            ),
+            (
+                "critical_threshold",
+                &mut t.critical_threshold,
+                defaults.critical_threshold,
+            ),
+        ] {
+            if !value.is_finite() {
+                errors.push(format!(
+                    "[temperature] {key} = {value} is not a finite number; using {default}"
+                ));
+                *value = default;
+            }
+        }
+        t.thresholds.retain(|o| {
+            let ok = o.warn_threshold.is_finite() && o.critical_threshold.is_finite();
+            if !ok {
+                errors.push(format!(
+                    "[[temperature.thresholds]] '{}': thresholds must be finite numbers; \
+                     entry ignored",
+                    o.chip
+                ));
+            }
+            ok
+        });
     }
 }
 
@@ -1178,6 +1332,68 @@ mod tests {
 
     fn parse(text: &str) -> (Config, Vec<String>) {
         Config::parse(text)
+    }
+
+    #[test]
+    fn huge_durations_and_sizes_are_clamped() {
+        let (cfg, errors) = parse(
+            "[rotation]\ndwell_secs = 9223372036854775807\nresume_after_secs = 9223372036854775807\n\
+             [menu]\nconfirm_timeout_secs = 9223372036854775807\n\
+             [refresh]\nnetwork_min_secs = 86401\npools_min_secs = 9223372036854775807\n\
+             hdd_min_secs = 9223372036854775807\ntemperature_min_secs = 9223372036854775807\n\
+             docker_min_secs = 9223372036854775807\n\
+             [display]\nscroll_max_chars = 9223372036854775807\nscroll_gap = 100000\n",
+        );
+        assert_eq!(errors.len(), 10, "{errors:?}");
+        assert_eq!(cfg.rotation.dwell_secs, MAX_SECS);
+        assert_eq!(cfg.rotation.resume_after_secs, MAX_SECS);
+        assert_eq!(cfg.menu.confirm_timeout_secs, MAX_SECS);
+        assert_eq!(cfg.refresh.network_min_secs, MAX_SECS);
+        assert_eq!(cfg.refresh.docker_min_secs, MAX_SECS);
+        assert_eq!(cfg.display.scroll_max_chars, MAX_SCROLL_CHARS);
+        assert_eq!(cfg.display.scroll_gap, MAX_SCROLL_GAP);
+    }
+
+    #[test]
+    fn values_at_the_bound_and_defaults_are_left_alone() {
+        let (cfg, errors) = parse("[rotation]\ndwell_secs = 86400\n");
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(cfg.rotation.dwell_secs, 86_400);
+        assert_eq!(cfg.rotation.resume_after_secs, 30);
+    }
+
+    #[test]
+    fn non_finite_thresholds_are_replaced_with_a_diagnostic() {
+        let (cfg, errors) = parse(
+            "[temperature]\nwarn_threshold = nan\ncritical_threshold = inf\n\
+             [[temperature.thresholds]]\nchip = \"a\"\nwarn_threshold = nan\ncritical_threshold = 90.0\n\
+             [[temperature.thresholds]]\nchip = \"b\"\nwarn_threshold = 50.0\ncritical_threshold = -inf\n\
+             [[temperature.thresholds]]\nchip = \"c\"\nwarn_threshold = 50.0\ncritical_threshold = 60.0\n",
+        );
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!((cfg.temperature.warn_threshold - 75.0).abs() < f32::EPSILON);
+        assert!((cfg.temperature.critical_threshold - 85.0).abs() < f32::EPSILON);
+        let chips: Vec<&str> = cfg
+            .temperature
+            .thresholds
+            .iter()
+            .map(|o| o.chip.as_str())
+            .collect();
+        assert_eq!(chips, ["c"]);
+    }
+
+    #[test]
+    fn non_finite_fan_temps_revert_to_usable_values() {
+        let (cfg, errors) = parse(
+            "[[fans]]\nname = \"f\"\npwm_chip = \"it8625\"\nmin_temp_c = nan\nmax_temp_c = inf\n\
+             [[fans.sensors]]\nchip = \"coretemp\"\nmin_temp_c = nan\nmax_temp_c = 80.0\n",
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        let fan = &cfg.fans[0];
+        assert!(fan.enabled, "a repaired curve keeps the fan under control");
+        assert!(fan.min_temp_c.is_finite() && fan.max_temp_c.is_finite());
+        assert_eq!(fan.sensors[0].min_temp_c, None);
+        assert_eq!(fan.sensors[0].max_temp_c, Some(80.0));
     }
 
     #[test]

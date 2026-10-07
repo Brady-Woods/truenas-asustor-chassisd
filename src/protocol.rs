@@ -5,12 +5,15 @@
 //!   checksum = 8-bit sum of bytes[0 .. N+2], stored at byte[N+3]
 //!   wire length = N + 4
 //!
-//! Serial: /dev/ttyS1, 115200 8N1, opened `O_RDWR|O_NOCTTY|O_NONBLOCK`, VMIN=1.
+//! Serial: /dev/ttyS1, 115200 8N1, opened `O_RDWR|O_NOCTTY|O_NONBLOCK`, VMIN=1,
+//! and exclusively (`flock`), so the daemon and the probe subcommands
+//! (`settext`, `init`, `listen`) can't interleave frames on the wire.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const LCM_DEVICE: &str = "/dev/ttyS1";
@@ -58,6 +61,11 @@ const ACK_TIMEOUT: Duration = Duration::from_millis(300);
 /// failures. 20ms keeps 2x margin. Applied in `send`, so it covers every
 /// write, and is also the retry backoff in `set_text`.
 const SETTLE: Duration = Duration::from_millis(20);
+/// How long `send` keeps trying to get one frame into the port when the
+/// kernel's output buffer is full (`WouldBlock`). A frame takes ~2ms on
+/// the wire and the buffer is kilobytes, so this only ever expires if the
+/// UART is wedged.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Wait before retrying a write the MCU didn't ACK, giving it time to
 /// finish with whatever it made of the lost frame first. ADM's `lcmd`
 /// uses the same 100ms.
@@ -76,6 +84,62 @@ fn wire_time(bytes: usize) -> Duration {
     // 10 bits per byte (start + 8 data + stop) at 115200 baud.
     let micros = u64::try_from(bytes).unwrap_or(u64::MAX) * 10 * 1_000_000 / 115_200;
     Duration::from_micros(micros)
+}
+
+/// Waits up to `timeout` for `fd` to report any of `events` (or an error
+/// or hangup, which the next read/write then surfaces). False on timeout
+/// or if `poll` itself failed.
+pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `pfd` is a valid pollfd for the duration of the call, and
+    // the count (1) matches.
+    unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) > 0 }
+}
+
+/// Opens the serial device read/write, non-blocking, and takes an
+/// exclusive advisory lock on it so a second `lcm-status` (the daemon, or
+/// a probe subcommand) can't write frames into the middle of ours. The
+/// lock lives as long as the returned `File`.
+fn open_exclusive(path: &str) -> io::Result<File> {
+    let port = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)?;
+    match port.try_lock() {
+        Ok(()) => Ok(port),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!(
+                "{path} is in use by another lcm-status process \
+                 (stop the daemon first: systemctl stop lcm-status)"
+            ),
+        )),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Opens the `LCM_STATUS_TRACE` file for appending. Refuses a symlink
+/// (`O_NOFOLLOW`) and anything that isn't a regular file: the daemon runs
+/// as root and the variable comes from the environment, so it mustn't be
+/// steerable at `/dev/...` or a planted link. `O_NONBLOCK` keeps a FIFO
+/// from hanging the open before it is rejected.
+fn open_trace(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::other("not a regular file"))
+    }
 }
 
 pub struct Lcm {
@@ -189,11 +253,7 @@ impl AsRawFd for Lcm {
 
 impl Lcm {
     pub fn open(path: &str) -> io::Result<Self> {
-        let port = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(path)?;
+        let port = open_exclusive(path)?;
 
         let fd = port.as_raw_fd();
         // SAFETY: `termios` is plain data for which all-zeroes is valid,
@@ -225,12 +285,16 @@ impl Lcm {
             stats: LinkStats::default(),
             tx_started: Instant::now(),
             trace: std::env::var_os("LCM_STATUS_TRACE").and_then(|path| {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-                    .map(|f| (f, Instant::now()))
+                match open_trace(Path::new(&path)) {
+                    Ok(f) => Some((f, Instant::now())),
+                    Err(e) => {
+                        crate::syslog::warning(&format!(
+                            "LCM_STATUS_TRACE {}: not tracing: {e}",
+                            Path::new(&path).display()
+                        ));
+                        None
+                    }
+                }
             }),
         }
     }
@@ -245,8 +309,20 @@ impl Lcm {
     }
 
     /// Writes one frame, first waiting out `SETTLE` since the MCU last
-    /// sent anything.
+    /// sent anything. The port is non-blocking, so a full output buffer or
+    /// a partial write is waited out (up to `WRITE_TIMEOUT`) rather than
+    /// failing with half a frame on the wire.
     pub fn send(&mut self, opcode: u8, subcmd: u8, payload: &[u8]) -> io::Result<()> {
+        self.send_within(opcode, subcmd, payload, WRITE_TIMEOUT)
+    }
+
+    fn send_within(
+        &mut self,
+        opcode: u8,
+        subcmd: u8,
+        payload: &[u8],
+        write_timeout: Duration,
+    ) -> io::Result<()> {
         if let Some(last) = self.last_rx {
             let wait = SETTLE.saturating_sub(last.elapsed());
             if !wait.is_zero() {
@@ -256,7 +332,31 @@ impl Lcm {
         let wire = encode(opcode, subcmd, payload);
         self.trace_bytes("TX", &wire);
         self.tx_started = Instant::now();
-        self.port.write_all(&wire)
+        let deadline = self.tx_started.checked_add(write_timeout);
+        let mut rest = wire.as_slice();
+        while !rest.is_empty() {
+            match self.port.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => rest = rest.get(n..).unwrap_or_default(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let left = deadline.map_or(write_timeout, |d| {
+                        d.saturating_duration_since(Instant::now())
+                    });
+                    if left.is_zero() || !poll_fd(self.port.as_raw_fd(), libc::POLLOUT, left) {
+                        // Whatever was already accepted (the bytes before
+                        // `rest`) is on its way; the MCU resyncs on the
+                        // next frame's opcode and `set_text` retries.
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "serial port not accepting data",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Reads one frame (up to `FRAME_MAX` bytes) with a timeout, byte at a
@@ -270,16 +370,7 @@ impl Lcm {
 
         while got < FRAME_MAX && start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(start.elapsed());
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
-            // SAFETY: `pfd` is a valid pollfd for the duration of the call,
-            // and the count (1) matches.
-            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-            if rc <= 0 {
+            if !poll_fd(fd, libc::POLLIN, remaining) {
                 break;
             }
             let mut byte = [0u8; 1];
@@ -530,6 +621,82 @@ mod tests {
         ours.set_nonblocking(true).unwrap();
         let port = File::from(std::os::fd::OwnedFd::from(ours));
         (Lcm::with_port(port), mcu)
+    }
+
+    /// Fills the port's output buffer until it reports `WouldBlock`.
+    fn fill_port(lcm: &mut Lcm) -> usize {
+        let chunk = [0u8; 4096];
+        let mut total = 0;
+        loop {
+            match lcm.port.write(&chunk) {
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return total,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn send_waits_out_a_full_output_buffer_and_writes_the_whole_frame() {
+        let (mut lcm, mut mcu) = lcm_pair();
+        let filler = fill_port(&mut lcm);
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut all = vec![0u8; filler + 8];
+            mcu.read_exact(&mut all).unwrap();
+            all
+        });
+        lcm.send(OP_COMMAND, SUB_SET_TEXT, &[0, 0, b'H', b'I'])
+            .unwrap();
+        let all = reader.join().unwrap();
+        assert_eq!(
+            &all[filler..],
+            encode(OP_COMMAND, SUB_SET_TEXT, &[0, 0, b'H', b'I'])
+        );
+    }
+
+    #[test]
+    fn send_gives_up_when_the_port_never_drains() {
+        let (mut lcm, _mcu) = lcm_pair();
+        fill_port(&mut lcm);
+        let start = Instant::now();
+        let err = lcm
+            .send_within(OP_COMMAND, SUB_DISPLAY, &[1], Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lcm-status-proto-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn the_port_can_only_be_opened_once_at_a_time() {
+        let path = scratch("port");
+        std::fs::write(&path, b"").unwrap();
+        let first = open_exclusive(path.to_str().unwrap()).unwrap();
+        let err = open_exclusive(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(first);
+        assert!(open_exclusive(path.to_str().unwrap()).is_ok());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn trace_file_must_be_a_regular_non_symlink_file() {
+        let real = scratch("trace");
+        let link = scratch("trace-link");
+        assert!(open_trace(&real).is_ok(), "creates a missing file");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_trace(&link).is_err(), "symlink refused");
+        assert!(
+            open_trace(Path::new("/dev/null")).is_err(),
+            "device refused"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&real).unwrap();
     }
 
     #[test]
