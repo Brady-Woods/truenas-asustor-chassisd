@@ -26,7 +26,8 @@ use std::os::unix::io::AsRawFd;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Upper bound on how long the event loop sleeps waiting for a panel
@@ -340,12 +341,17 @@ fn run_daemon(cfg_path: &Path) {
         std::process::exit(1);
     });
 
-    // The first refresh runs subprocesses (each capped at 10s) and may take
-    // a while on a sick box; tell systemd's watchdog we are alive first so
-    // startup isn't counted against it.
-    sd_notify::Watchdog::from_env().ping();
+    // systemd's watchdog is fed from its own thread, gated on the fan
+    // thread's heartbeat and on `progress` (see `sd_notify`), so the slow
+    // subprocess-heavy refreshes below can't starve it. Started before the
+    // first refresh so startup isn't counted against the watchdog either.
+    let progress = sd_notify::Progress::new();
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    start_watchdog_feeder(&fans, &progress, &watchdog_stop);
     let mut state = AppState::new(cfg.clone());
+    progress.bump();
     state.refresh_all();
+    progress.bump();
     state.init_leds();
     state.set_fan_health(fans.status().health);
 
@@ -369,8 +375,11 @@ fn run_daemon(cfg_path: &Path) {
     // fans back before it propagates; the process still exits non-zero
     // and systemd restarts it.
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        event_loop(&mut state, &mut lcm, &cfg, &fans, &mut wol, &mut power, &rx)
+        event_loop(
+            &mut state, &mut lcm, &cfg, &fans, &mut wol, &mut power, &rx, &progress,
+        )
     }));
+    watchdog_stop.store(true, Ordering::Relaxed);
     // No new clients from here on; the file goes even if the loop failed.
     drop(socket_guard);
     fans.shutdown();
@@ -397,8 +406,33 @@ fn run_daemon(cfg_path: &Path) {
     }
 }
 
+/// Starts the thread that feeds systemd's watchdog (see `sd_notify`).
+fn start_watchdog_feeder(
+    fans: &fan::FanService,
+    progress: &sd_notify::Progress,
+    stop: &Arc<AtomicBool>,
+) {
+    let fan_liveness = fans.liveness();
+    let progress = progress.clone();
+    let started = sd_notify::spawn_feeder(
+        sd_notify::Watchdog::from_env(),
+        Duration::from_secs(1),
+        Arc::clone(stop),
+        move || sd_notify::should_ping(fan_liveness.age(), fan::FAN_HEARTBEAT_TIMEOUT, &progress),
+    );
+    if let Err(e) = started {
+        // Not fatal: without a feeder systemd restarts us after
+        // `WatchdogSec`, which is the safe direction.
+        syslog::critical(&format!("could not start the watchdog thread: {e}"));
+    }
+}
+
 /// Runs until SIGTERM/SIGINT (`Ok`) or until fan control can no longer be
 /// trusted (`Err`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the daemon's long-lived pieces, owned by run_daemon"
+)]
 fn event_loop(
     state: &mut AppState,
     lcm: &mut Lcm,
@@ -407,13 +441,14 @@ fn event_loop(
     wol: &mut wol::WolKeeper,
     power: &mut power::Scheduler,
     rx: &mpsc::Receiver<socket::SocketCommand>,
+    progress: &sd_notify::Progress,
 ) -> Result<(), &'static str> {
     let serial_fd = lcm.as_raw_fd();
     let mut last_redraw = Instant::now();
     let mut last_alert_beep: Option<Instant> = None;
-    let mut watchdog = sd_notify::Watchdog::from_env();
 
     while !shutdown::requested() {
+        progress.bump();
         // Drain the socket commands that arrived since the last wakeup, at
         // most `socket::MAX_COMMANDS_PER_PASS` of them: a flood waits in
         // the (bounded) queue, never ahead of the fan and LCD work below.
@@ -480,10 +515,6 @@ fn event_loop(
         if fans.is_stalled() {
             return Err("fan control thread stopped responding");
         }
-        // Only reached while the fan thread is demonstrably alive: a stuck
-        // fan thread (or a stuck loop) stops the pings and systemd's
-        // `WatchdogSec=` restarts the daemon.
-        watchdog.ping();
         state.set_fan_health(fans.status().health);
         wol.maybe_enforce();
 
@@ -499,7 +530,12 @@ fn event_loop(
             led::ensure_trigger_modules();
             log_platform_settings(cfg);
         }
+        // `tick` runs the stale-data refreshes, which block on subprocesses
+        // for a long while on a sick box: mark progress either side so only
+        // a truly stuck pass, not a slow one, starves the watchdog.
+        progress.bump();
         let effect = state.tick();
+        progress.bump();
         apply_effect(effect, state.display_wanted(), lcm, power);
         drain_pending_keys(state, lcm, power);
 

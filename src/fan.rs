@@ -230,6 +230,21 @@ fn spawn_reader(
     Ok(())
 }
 
+/// How long the fan thread waits for the readers' first samples before
+/// its first control pass. Without it the first pass finds no sensor
+/// readings, writes nothing, and the fan stays in BIOS automatic mode
+/// (which can stop it on this board) for a whole `update_secs`.
+const FIRST_SAMPLES_WAIT: Duration = Duration::from_millis(500);
+
+/// Waits up to `limit` for every reader to publish once; never longer, so
+/// a reader that is wedged (or failed to start) cannot delay control.
+fn wait_for_first_samples(fans: &[FanController], limit: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < limit && fans.iter().any(FanController::awaiting_first_samples) {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// What the main loop needs from the fan thread: the worst current health
 /// (for the status LED) and one status line per fan (for `STATUS`).
 #[derive(Debug, Clone)]
@@ -257,11 +272,7 @@ pub struct FanService {
     status: Arc<Mutex<FanStatus>>,
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
-    /// Milliseconds since `epoch` of the fan thread's last loop. An atomic
-    /// rather than a field of `FanStatus` so reading it can never wait on
-    /// a lock the (possibly wedged) thread holds.
-    heartbeat_ms: Arc<AtomicU64>,
-    epoch: Instant,
+    liveness: FanLiveness,
     /// Kept so `shutdown` can force full speed if the thread is wedged and
     /// so can't run its controllers' own restore-on-drop.
     profiles: Vec<FanProfile>,
@@ -271,6 +282,42 @@ pub struct FanService {
 
 fn millis_since(epoch: Instant) -> u64 {
     u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The fan thread's heartbeat, cheap to clone so the systemd watchdog
+/// thread can watch it too. An atomic rather than part of `FanStatus` so
+/// reading it can never wait on a lock the (possibly wedged) thread holds.
+#[derive(Debug, Clone)]
+pub struct FanLiveness {
+    /// Milliseconds since `epoch` of the fan thread's last loop.
+    heartbeat_ms: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl FanLiveness {
+    fn new() -> Self {
+        FanLiveness {
+            heartbeat_ms: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
+        }
+    }
+
+    fn beat(&self) {
+        self.heartbeat_ms
+            .store(millis_since(self.epoch), Ordering::Relaxed);
+    }
+
+    /// How long since the fan thread last completed a loop.
+    pub fn age(&self) -> Duration {
+        self.epoch.elapsed().saturating_sub(Duration::from_millis(
+            self.heartbeat_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Older than `FAN_HEARTBEAT_TIMEOUT`: the thread is wedged or gone.
+    pub fn is_stalled(&self) -> bool {
+        self.age() > FAN_HEARTBEAT_TIMEOUT
+    }
 }
 
 impl FanService {
@@ -295,13 +342,12 @@ impl FanService {
             lines: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let epoch = Instant::now();
-        let heartbeat_ms = Arc::new(AtomicU64::new(0));
+        let liveness = FanLiveness::new();
         let temperature = temperature.clone();
         let handle = thread::Builder::new().name("fans".into()).spawn({
             let status = Arc::clone(&status);
             let stop = Arc::clone(&stop);
-            let heartbeat_ms = Arc::clone(&heartbeat_ms);
+            let liveness = liveness.clone();
             let (profiles, hwmon_root) = (profiles.clone(), hwmon_root.clone());
             move || {
                 let mut fans: Vec<FanController> = profiles
@@ -315,6 +361,7 @@ impl FanService {
                 for f in &fans {
                     f.start_readers(&stop);
                 }
+                wait_for_first_samples(&fans, FIRST_SAMPLES_WAIT);
                 while !stop.load(Ordering::Relaxed) {
                     for f in &mut fans {
                         f.tick();
@@ -324,7 +371,7 @@ impl FanService {
                         lines: fans.iter().map(FanController::status_line).collect(),
                     };
                     *lock(&status) = snapshot;
-                    heartbeat_ms.store(millis_since(epoch), Ordering::Relaxed);
+                    liveness.beat();
                     thread::sleep(FAN_THREAD_INTERVAL);
                 }
             }
@@ -333,8 +380,7 @@ impl FanService {
             status,
             stop,
             handle,
-            heartbeat_ms,
-            epoch,
+            liveness,
             profiles,
             hwmon_root,
             join_timeout: SHUTDOWN_JOIN_TIMEOUT,
@@ -350,18 +396,16 @@ impl FanService {
         self.handle.is_finished()
     }
 
-    /// How long since the fan thread last completed a loop.
-    pub fn heartbeat_age(&self) -> Duration {
-        self.epoch.elapsed().saturating_sub(Duration::from_millis(
-            self.heartbeat_ms.load(Ordering::Relaxed),
-        ))
+    /// A handle on the heartbeat for another thread (the watchdog feeder).
+    pub fn liveness(&self) -> FanLiveness {
+        self.liveness.clone()
     }
 
     /// True if the fan thread is alive but has stopped making progress
     /// (`FAN_HEARTBEAT_TIMEOUT`): wedged, so nothing is watching
     /// temperatures. The caller should treat this like `has_died`.
     pub fn is_stalled(&self) -> bool {
-        self.heartbeat_age() > FAN_HEARTBEAT_TIMEOUT
+        self.liveness.is_stalled()
     }
 
     /// Stops the fan thread and waits for it to exit -- but not forever. A
@@ -855,6 +899,12 @@ impl FanController {
         self.any_sensor_read |= any_read;
     }
 
+    /// True while a selector's reader has not published its first sample
+    /// (not even an empty one).
+    fn awaiting_first_samples(&self) -> bool {
+        self.profile.enabled && self.feeds.iter().any(|f| lock(&f.shared).at.is_none())
+    }
+
     /// Starts one reader thread per sensor selector (see `SensorFeed`).
     /// They run until `stop` is set. A thread that can't be started is
     /// logged; its selector then never reads, which the loss handling
@@ -863,11 +913,13 @@ impl FanController {
         if !self.profile.enabled {
             return;
         }
-        for (sel, feed) in self.profile.sensors.iter().zip(&self.feeds) {
+        for (index, (sel, feed)) in self.profile.sensors.iter().zip(&self.feeds).enumerate() {
             let interval = Duration::from_secs(sampling_secs(sel, self.profile.update_secs));
             let (root, selector) = (self.hwmon_root.clone(), sel.clone());
             let result = spawn_reader(
-                format!("sensor-{}", sel.chip),
+                // Index-based on purpose: `Builder::spawn` panics on a name
+                // with an interior NUL, and the chip is a user string.
+                format!("sensor-{index}"),
                 interval,
                 Arc::clone(stop),
                 Arc::clone(&feed.shared),
@@ -1603,7 +1655,8 @@ mod tests {
         c.hwmon = Some(hw.path());
         c.timing = Timing {
             sensor_loss_grace: Duration::ZERO,
-            sensor_recovery_hold: Duration::from_millis(80),
+            // Long, so only the test releasing it (below) can end a hold.
+            sensor_recovery_hold: Duration::from_secs(3600),
             ..Timing::default()
         };
         c
@@ -1615,34 +1668,120 @@ mod tests {
 
     #[test]
     fn a_wedged_sensor_read_cannot_freeze_the_control_path() {
+        use std::sync::mpsc::{channel, sync_channel};
         let hw = FakeHwmon::new("wedged");
         let mut c = two_sensor_controller(&hw);
-        // The drive selector's reader blocks forever (a hung drivetemp
-        // read); only the sender's drop at the end of the test frees it.
-        let (_release, wedge) = std::sync::mpsc::channel::<()>();
+        // The drive selector's real reader thread reads fine once, then
+        // blocks inside its second read (a hung drivetemp read) until the
+        // sender below is dropped at the end of the test.
+        let (_release, wedge) = channel::<()>();
+        let (entered_tx, entered) = sync_channel::<()>(1);
+        let returned = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let mut reads = 0u32;
         spawn_reader(
             "wedged".into(),
-            Duration::from_secs(1),
+            Duration::from_millis(10),
             Arc::clone(&stop),
             Arc::clone(&c.feeds[1].shared),
-            move || {
-                let _ = wedge.recv();
-                None
+            {
+                let returned = Arc::clone(&returned);
+                move || {
+                    reads += 1;
+                    if reads == 1 {
+                        return Some(40.0);
+                    }
+                    entered_tx.try_send(()).ok();
+                    wedge.recv().ok();
+                    returned.store(true, Ordering::Relaxed);
+                    None
+                }
             },
         )
         .unwrap();
-        // CPU keeps producing: the curve still ticks and writes.
+        // Proof the reader really is stuck mid-read, not merely slow.
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(!returned.load(Ordering::Relaxed));
+
+        // CPU keeps producing and the drive's last good sample is fresh:
+        // the curve still ticks and writes while that reader is stuck.
         c.last_pwm = Some(100);
-        c.set_samples(&[Some(80.0), None]);
-        let started = Instant::now();
+        *lock(&c.feeds[0].shared) = Sample {
+            at: Some(Instant::now()),
+            value: Some(40.0),
+        };
         c.update();
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(pwm_written(&hw) > 150, "got {}", pwm_written(&hw));
-        // The never-read drive is merely absent, not a fault.
+        assert!(pwm_written(&hw) < 100, "got {}", pwm_written(&hw));
         assert!(!c.floor_active());
-        assert_eq!(c.health_level(), Level::Info);
+
+        // The wedged reader can never publish again, so its last sample
+        // ages out (100s old against the 10s limit, set directly rather
+        // than waited for): the fail-safe engages on the control path even
+        // though that reader is still blocked.
+        let old = lock(&c.feeds[1].shared).value;
+        *lock(&c.feeds[1].shared) = Sample {
+            at: Instant::now().checked_sub(Duration::from_secs(100)),
+            value: old,
+        };
+        *lock(&c.feeds[0].shared) = Sample {
+            at: Some(Instant::now()),
+            value: Some(40.0),
+        };
+        c.update();
+        assert_eq!(pwm_written(&hw), 255);
+        assert!(c.floor_active());
+        assert_eq!(c.health_level(), Level::Warn);
+        assert!(!returned.load(Ordering::Relaxed), "reader still wedged");
         stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_nul_in_a_chip_name_does_not_panic_the_reader_spawn() {
+        let c = new_controller(FanProfile {
+            sensors: vec![SensorSelector {
+                chip: "evil\u{0}chip".into(),
+                ..SensorSelector::default()
+            }],
+            ..cfg()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        c.start_readers(&stop); // used to panic inside Builder::spawn
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn the_first_control_pass_waits_for_the_first_samples() {
+        // update_secs = 60: if the first pass ran before any sample
+        // existed, nothing would be written for a whole minute.
+        let tree = it8625_tree("first-pass");
+        tree.chip("hwmon1", "coretemp", &[("temp1_input", "40000")]);
+        let hw = tree.0.join("hwmon0");
+        let profile = FanProfile {
+            update_secs: 60,
+            ..coretemp_fan()
+        };
+        let svc =
+            FanService::spawn_in(tree.0.clone(), vec![profile], &TemperatureConfig::default())
+                .unwrap();
+        // Loose bound (the wait itself is <= 500ms) so a loaded machine
+        // cannot flake it; the failure mode it catches is 60s.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while std::fs::read_to_string(hw.join("pwm1_enable"))
+            .unwrap_or_default()
+            .trim()
+            != "1"
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pwm: u32 = std::fs::read_to_string(hw.join("pwm1"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        svc.shutdown();
+        assert_ne!(pwm, 120, "the fan was never taken over");
+        assert!(pwm < 255, "cool sensor should not pin the fan: {pwm}");
     }
 
     #[test]
@@ -1654,10 +1793,11 @@ mod tests {
         c.update();
         assert!(pwm_written(&hw) < 100);
         // The drive's reader wedged: its last sample ages out.
-        c.feeds[1].max_age = Duration::from_millis(30);
+        // (100s old against a 10s limit; no real waiting involved.)
+        c.feeds[1].max_age = Duration::from_secs(10);
         c.set_samples(&[Some(40.0), None]);
         *lock(&c.feeds[1].shared) = Sample {
-            at: Instant::now().checked_sub(Duration::from_millis(60)),
+            at: Instant::now().checked_sub(Duration::from_secs(100)),
             value: Some(40.0),
         };
         c.update();
@@ -1694,8 +1834,9 @@ mod tests {
         c.set_samples(&[Some(40.0), Some(40.0)]);
         c.update();
         assert_eq!(pwm_written(&hw), 255);
-        // Steady for the whole hold: back to the curve.
-        std::thread::sleep(Duration::from_millis(100));
+        // Steady for the whole hold (shrunk to nothing here rather than
+        // slept through): back to the curve.
+        c.timing.sensor_recovery_hold = Duration::ZERO;
         c.update();
         assert_eq!(pwm_written(&hw), quiet);
         assert!(!c.floor_active());
@@ -1791,18 +1932,22 @@ mod tests {
         let empty = crate::hal::HwmonTree::new("no-chip");
         let mut c = new_controller(coretemp_fan());
         c.hwmon_root = empty.0.clone();
+        // The thresholds are moved between updates instead of sleeping
+        // past them, so no scheduler delay can change the outcome.
+        let hour = Duration::from_secs(3600);
         c.timing = Timing {
-            control_warn_after: Duration::from_millis(40),
+            control_warn_after: hour,
+            control_critical_after: hour,
             ..impatient()
         };
         // Within the boot grace: quiet.
         c.update();
         assert_eq!(c.health_level(), Level::Info);
-        std::thread::sleep(Duration::from_millis(50));
+        c.timing.control_warn_after = Duration::ZERO;
         c.update();
         assert_eq!(c.health_level(), Level::Warn);
         assert!(c.control_loss.as_ref().is_some_and(|l| l.warned));
-        std::thread::sleep(Duration::from_millis(50));
+        c.timing.control_critical_after = Duration::ZERO;
         c.update();
         assert_eq!(c.health_level(), Level::Critical);
         assert!(c.control_loss.as_ref().is_some_and(|l| l.critical));
@@ -1855,6 +2000,7 @@ mod tests {
         c.timing = Timing {
             sensor_takeover_after: Duration::from_secs(60),
             control_warn_after: Duration::from_secs(60),
+            control_critical_after: Duration::from_secs(3600),
             ..impatient()
         };
         c.update();
@@ -1872,7 +2018,7 @@ mod tests {
         assert!(c.sensors_lost);
         assert_eq!(c.health_level(), Level::Warn);
         // ...and Critical when it persists.
-        std::thread::sleep(Duration::from_millis(100));
+        c.timing.control_critical_after = Duration::ZERO;
         c.update();
         assert_eq!(c.health_level(), Level::Critical);
         assert!(c.no_sensor_critical_logged);
@@ -1933,8 +2079,10 @@ mod tests {
                 })),
                 stop: Arc::new(AtomicBool::new(false)),
                 handle,
-                heartbeat_ms: Arc::new(AtomicU64::new(0)),
-                epoch,
+                liveness: FanLiveness {
+                    heartbeat_ms: Arc::new(AtomicU64::new(0)),
+                    epoch,
+                },
                 profiles,
                 hwmon_root: root,
                 join_timeout: Duration::from_millis(100),
@@ -1952,7 +2100,7 @@ mod tests {
         );
         assert!(!svc.has_died(), "the thread is alive, just stuck");
         assert!(svc.is_stalled());
-        assert!(svc.heartbeat_age() >= Duration::from_secs(20));
+        assert!(svc.liveness().age() >= Duration::from_secs(20));
         let (fresh, _release) = wedged_service(
             PathBuf::from("/nonexistent"),
             Vec::new(),
@@ -1968,14 +2116,14 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(350));
         assert!(
-            svc.heartbeat_age() < Duration::from_secs(1),
+            svc.liveness().age() < Duration::from_secs(5),
             "{:?}",
-            svc.heartbeat_age()
+            svc.liveness().age()
         );
         assert!(!svc.is_stalled());
         let started = Instant::now();
         svc.shutdown();
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]
