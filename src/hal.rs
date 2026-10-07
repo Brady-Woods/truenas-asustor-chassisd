@@ -31,6 +31,19 @@ fn render(tpl: &ScreenTemplate, vars: &[(&str, &str)]) -> Screen {
     }
 }
 
+/// A `Command` for a helper program the daemon runs. Strips the service
+/// manager's notification variables: a child that inherits `NOTIFY_SOCKET`
+/// can talk to systemd as if it were the daemon (and, linked against
+/// libsystemd, some do), which systemd logs as "notification message from
+/// PID ..., but reception only permitted for main PID" on every spawn.
+pub fn command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    for var in ["NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID"] {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// Upper bound on any one external command. These all run on the main
 /// event loop, and some can block indefinitely: `zpool` on a pool with
 /// suspended I/O, `docker` with a wedged daemon, `smartctl` on a dying
@@ -115,7 +128,7 @@ fn run_tracked(
         }
     }
 
-    let mut child = Command::new(cmd)
+    let mut child = command(cmd)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1188,6 +1201,18 @@ mod tests {
             None
         );
         assert!(list.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn helper_commands_do_not_inherit_the_notify_socket() {
+        let removed: Vec<_> = command("true")
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in ["NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID"] {
+            assert!(removed.iter().any(|k| k == var), "{var} is inherited");
+        }
     }
 
     #[test]

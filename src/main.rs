@@ -222,6 +222,8 @@ fn main() -> ExitCode {
         Cli::FanFailsafe(path) => {
             // Deliberately no serial port, socket or LCD: this runs from
             // ExecStopPost, possibly right after the daemon was killed.
+            // Open syslog so its lines carry the program name in the journal.
+            syslog::init();
             let cfg = Config::load(&path);
             if !fan::force_full_speed_all(cfg.fans).all_present_fans_set() {
                 return ExitCode::FAILURE;
@@ -683,7 +685,7 @@ fn run_action(action: Action) {
         Action::Shutdown => "poweroff",
         Action::Restart => "reboot",
     };
-    match std::process::Command::new("systemctl").arg(verb).status() {
+    match hal::command("systemctl").arg(verb).status() {
         Ok(status) if status.success() => {}
         Ok(status) => syslog::critical(&format!("systemctl {verb} failed ({status})")),
         Err(e) => syslog::critical(&format!("systemctl {verb} failed to run: {e}")),
@@ -693,7 +695,7 @@ fn run_action(action: Action) {
 /// True while systemd is carrying out a shutdown/reboot (as opposed to
 /// someone restarting just this service).
 fn system_is_stopping() -> bool {
-    std::process::Command::new("systemctl")
+    hal::command("systemctl")
         .arg("is-system-running")
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "stopping")

@@ -709,7 +709,7 @@ pub fn ensure_trigger_modules() {
         if trigger_registered(trigger) {
             continue;
         }
-        let loaded = std::process::Command::new("modprobe")
+        let loaded = crate::hal::command("modprobe")
             .arg(module)
             .status()
             .is_ok_and(|s| s.success());
