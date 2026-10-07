@@ -105,6 +105,16 @@ struct Timing {
     /// ...and it must then read continuously this long before the hold is
     /// released (anti-flap).
     sensor_recovery_hold: Duration,
+    /// A fan this daemon can't write (chip not resolved, writes failing)
+    /// is a WARNING after this long, so a normal boot -- the platform
+    /// driver loads after this unit starts -- doesn't raise one...
+    control_warn_after: Duration,
+    /// ...and CRITICAL after this long.
+    control_critical_after: Duration,
+    /// With the chip resolved but no sensor having *ever* read, the fan is
+    /// taken over at `max_pwm` after this long (rather than left in
+    /// BIOS/driver automatic mode, which can stop it).
+    sensor_takeover_after: Duration,
 }
 
 impl Default for Timing {
@@ -112,8 +122,21 @@ impl Default for Timing {
         Timing {
             sensor_loss_grace: Duration::from_secs(10),
             sensor_recovery_hold: Duration::from_secs(30),
+            control_warn_after: Duration::from_secs(30),
+            control_critical_after: Duration::from_secs(180),
+            sensor_takeover_after: Duration::from_secs(30),
         }
     }
+}
+
+/// A configured, enabled fan this daemon is not currently able to drive.
+#[derive(Debug)]
+struct ControlLoss {
+    since: Instant,
+    /// Latest reason, for the log line.
+    why: String,
+    warned: bool,
+    critical: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -358,6 +381,14 @@ pub struct FanController {
     sensors_lost: bool,
     /// Has any of this fan's selectors ever produced a reading?
     any_sensor_read: bool,
+    /// When this controller was created -- the clock for "never took over"
+    /// and "never had a sensor" escalation.
+    started: Instant,
+    /// Set from construction (nothing has been written yet) until a write
+    /// succeeds, and again whenever one fails.
+    control_loss: Option<ControlLoss>,
+    /// The "no sensor ever read" CRITICAL has been logged.
+    no_sensor_critical_logged: bool,
 }
 
 impl FanController {
@@ -366,6 +397,19 @@ impl FanController {
     /// for RPM if this profile has no `fan_index` configured (no tach to
     /// read) or the chip isn't resolved (not loaded yet).
     pub fn status_line(&self) -> String {
+        if !self.profile.enabled {
+            let why = if self.profile.disabled_by_config {
+                "disabled by config (left in BIOS/driver mode, which may stop the fan)"
+            } else {
+                "disabled"
+            };
+            return format!(
+                "{} (pwm{}): {why} [{:?}]",
+                self.profile.name,
+                self.profile.pwm_index,
+                self.health_level()
+            );
+        }
         let pwm = self.last_pwm.unwrap_or(0);
         let pct = u32::from(pwm) * 100 / 255;
         let rpm = match (&self.hwmon, self.profile.fan_index) {
@@ -391,9 +435,18 @@ impl FanController {
     /// -- current state, not transition-gated the way this fan's own
     /// syslog lines are (the LED always reflects "right now").
     pub fn health_level(&self) -> Level {
-        if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS {
+        if self.profile.disabled_by_config {
+            return Level::Warn;
+        }
+        let uncontrolled_for = self.control_loss.as_ref().map(|l| l.since.elapsed());
+        let never_had_a_sensor = self.sensors_lost && !self.any_sensor_read;
+        if self.consecutive_stalls >= UNRESPONSIVE_AFTER_STALLS
+            || uncontrolled_for.is_some_and(|t| t >= self.timing.control_critical_after)
+            || (never_had_a_sensor && self.started.elapsed() >= self.timing.control_critical_after)
+        {
             Level::Critical
-        } else if self.consecutive_stalls > 0
+        } else if uncontrolled_for.is_some_and(|t| t >= self.timing.control_warn_after)
+            || self.consecutive_stalls > 0
             || self.low_rpm_warned
             || self.sensors_lost
             || self.floor_active()
@@ -402,6 +455,20 @@ impl FanController {
         } else {
             Level::Info
         }
+    }
+
+    /// An enabled fan starts out "not under control" until its first
+    /// successful write; a disabled one never is.
+    fn starting_unmanaged(mut self) -> Self {
+        if self.profile.enabled {
+            self.control_loss = Some(ControlLoss {
+                since: self.started,
+                why: "not taken over yet".to_string(),
+                warned: false,
+                critical: false,
+            });
+        }
+        self
     }
 
     pub fn new(profile: FanProfile, temperature: &TemperatureConfig) -> Self {
@@ -431,7 +498,11 @@ impl FanController {
             low_rpm_warned: false,
             sensors_lost: false,
             any_sensor_read: false,
+            started: Instant::now(),
+            control_loss: None,
+            no_sensor_critical_logged: false,
         }
+        .starting_unmanaged()
     }
 
     /// Call every time main.rs's event loop wakes up (it polls at a fixed
@@ -462,7 +533,10 @@ impl FanController {
             self.hwmon = self.resolve_hwmon();
         }
         let Some(hwmon) = self.hwmon.clone() else {
-            return; // chip not loaded (yet) -- try again next tick
+            // Chip not loaded (yet) -- try again next tick, but never
+            // silently: see `note_control_lost`.
+            self.note_control_lost(&format!("pwm chip '{}' not found", self.profile.pwm_chip));
+            return;
         };
 
         let Some(sensor_target) = self.target_pwm_from_sensors() else {
@@ -506,8 +580,10 @@ impl FanController {
         let (PwmCommand::Set(pwm) | PwmCommand::Kick(pwm)) = cmd;
         if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, pwm).is_err() {
             self.hwmon = None; // path went stale -- re-resolve next tick
+            self.note_control_lost(&format!("writing pwm{} failed", self.profile.pwm_index));
             return;
         }
+        self.mark_control_ok();
         self.last_pwm = Some(pwm);
         if matches!(cmd, PwmCommand::Kick(_)) {
             self.kick_until = Some(Instant::now() + Duration::from_secs(1));
@@ -660,6 +736,9 @@ impl FanController {
     /// logged; its selector then never reads, which the loss handling
     /// treats like any other missing sensor.
     fn start_readers(&self, stop: &Arc<AtomicBool>) {
+        if !self.profile.enabled {
+            return;
+        }
         for (sel, feed) in self.profile.sensors.iter().zip(&self.feeds) {
             let interval = Duration::from_secs(sampling_secs(sel, self.profile.update_secs));
             let (root, selector) = (self.hwmon_root.clone(), sel.clone());
@@ -789,30 +868,113 @@ impl FanController {
         })
     }
 
-    /// No sensor feeding this fan has a reading. Before this controller
-    /// has ever written the fan (e.g. sensors not loaded yet at startup)
-    /// it's left alone, in whatever mode the BIOS/driver set. Once it has
-    /// taken the fan over, losing every sensor (a module unloaded, a chip
-    /// renumbered) would otherwise freeze the fan at its last speed with
-    /// nothing watching temperatures -- so fail safe to `max_pwm` instead.
+    /// No sensor feeding this fan has a reading. Right after start (sensor
+    /// modules not loaded yet) the fan is left alone, in whatever mode the
+    /// BIOS/driver set, for `sensor_takeover_after`: that is normal at
+    /// boot. Past that -- or once this controller has taken the fan over
+    /// and then lost every sensor (a module unloaded, a chip renumbered) --
+    /// fail safe to `max_pwm`. Leaving BIOS automatic mode in charge is not
+    /// safe here: on this board's it8625 it stops the fan outright.
     fn hold_full_speed_without_sensors(&mut self, hwmon: &str) {
-        if self.last_pwm.is_none() {
+        let first_takeover = self.last_pwm.is_none();
+        if first_takeover && self.started.elapsed() < self.timing.sensor_takeover_after {
             return;
         }
         if !self.sensors_lost {
             self.sensors_lost = true;
-            crate::syslog::warning(&format!(
-                "fan '{}' (pwm{}): no sensor readings, holding at max_pwm",
+            let fan = format!(
+                "fan '{}' (pwm{})",
                 self.profile.name, self.profile.pwm_index
+            );
+            if first_takeover {
+                crate::syslog::warning(&format!(
+                    "{fan}: no sensor has produced a reading {}s after start; taking the fan \
+                     over at max_pwm rather than leaving BIOS automatic mode in charge \
+                     (which can stop it)",
+                    self.started.elapsed().as_secs()
+                ));
+            } else {
+                crate::syslog::warning(&format!("{fan}: no sensor readings, holding at max_pwm"));
+            }
+        }
+        if !self.any_sensor_read
+            && !self.no_sensor_critical_logged
+            && self.started.elapsed() >= self.timing.control_critical_after
+        {
+            self.no_sensor_critical_logged = true;
+            crate::syslog::critical(&format!(
+                "fan '{}' (pwm{}): still no sensor has ever produced a reading \
+                 ({}s); check its [[fans.sensors]] selectors; fan held at max_pwm",
+                self.profile.name,
+                self.profile.pwm_index,
+                self.started.elapsed().as_secs()
             ));
         }
         self.kick_until = None;
         let max = self.profile.max_pwm;
         if self.ensure_manual_mode(hwmon).is_err() || self.write_pwm(hwmon, max).is_err() {
             self.hwmon = None;
+            self.note_control_lost(&format!("writing pwm{} failed", self.profile.pwm_index));
             return;
         }
+        self.mark_control_ok();
         self.last_pwm = Some(max);
+    }
+
+    /// This enabled fan can't be driven right now (its pwm chip isn't
+    /// there, or a write failed). Normal for a while at boot, so silent
+    /// until `control_warn_after`; then one WARNING, and one CRITICAL after
+    /// `control_critical_after` -- the fan is in whatever mode the BIOS
+    /// left it in, which may be stopped. Health follows the same clock.
+    fn note_control_lost(&mut self, why: &str) {
+        let fan = format!(
+            "fan '{}' (pwm{})",
+            self.profile.name, self.profile.pwm_index
+        );
+        let (warn_after, critical_after) = (
+            self.timing.control_warn_after,
+            self.timing.control_critical_after,
+        );
+        let loss = self.control_loss.get_or_insert_with(|| ControlLoss {
+            since: Instant::now(),
+            why: String::new(),
+            warned: false,
+            critical: false,
+        });
+        loss.why = why.to_string();
+        let age = loss.since.elapsed();
+        if age >= critical_after && !loss.critical {
+            loss.critical = true;
+            loss.warned = true;
+            crate::syslog::critical(&format!(
+                "{fan}: still not under control after {}s: {why}; BIOS/driver automatic \
+                 mode may have the fan stopped",
+                age.as_secs()
+            ));
+        } else if age >= warn_after && !loss.warned {
+            loss.warned = true;
+            crate::syslog::warning(&format!(
+                "{fan}: not under control after {}s: {why}; BIOS/driver automatic mode may \
+                 leave the fan stopped",
+                age.as_secs()
+            ));
+        }
+    }
+
+    /// A write just succeeded: the fan is under control. Logs the
+    /// recovery if the loss had been reported.
+    fn mark_control_ok(&mut self) {
+        if let Some(loss) = self.control_loss.take()
+            && loss.warned
+        {
+            crate::syslog::notice(&format!(
+                "fan '{}' (pwm{}): under control again after {}s ({})",
+                self.profile.name,
+                self.profile.pwm_index,
+                loss.since.elapsed().as_secs(),
+                loss.why
+            ));
+        }
     }
 
     /// Leaves the fan safe on exit (clean shutdown, or unwinding from a
@@ -1318,6 +1480,7 @@ mod tests {
         c.timing = Timing {
             sensor_loss_grace: Duration::ZERO,
             sensor_recovery_hold: Duration::from_millis(80),
+            ..Timing::default()
         };
         c
     }
@@ -1468,6 +1631,161 @@ mod tests {
         assert_eq!(
             feed.max_age,
             Duration::from_secs(MAX_SENSOR_INTERVAL_SECS * 3)
+        );
+    }
+
+    /// Timing that makes "never took over" and "no sensor ever" react at
+    /// once, with CRITICAL a moment later.
+    fn impatient() -> Timing {
+        Timing {
+            control_warn_after: Duration::ZERO,
+            control_critical_after: Duration::from_millis(80),
+            sensor_takeover_after: Duration::ZERO,
+            ..Timing::default()
+        }
+    }
+
+    fn it8625_tree(tag: &str) -> crate::hal::HwmonTree {
+        let tree = crate::hal::HwmonTree::new(tag);
+        tree.chip("hwmon0", "it8625", &[("pwm1", "120"), ("pwm1_enable", "2")]);
+        tree
+    }
+
+    fn coretemp_fan() -> FanProfile {
+        FanProfile {
+            fan_index: None,
+            sensors: vec![SensorSelector {
+                chip: "coretemp".into(),
+                ..SensorSelector::default()
+            }],
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn a_pwm_chip_that_never_resolves_raises_warn_then_critical() {
+        let empty = crate::hal::HwmonTree::new("no-chip");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = empty.0.clone();
+        c.timing = Timing {
+            control_warn_after: Duration::from_millis(40),
+            ..impatient()
+        };
+        // Within the boot grace: quiet.
+        c.update();
+        assert_eq!(c.health_level(), Level::Info);
+        std::thread::sleep(Duration::from_millis(50));
+        c.update();
+        assert_eq!(c.health_level(), Level::Warn);
+        assert!(c.control_loss.as_ref().is_some_and(|l| l.warned));
+        std::thread::sleep(Duration::from_millis(50));
+        c.update();
+        assert_eq!(c.health_level(), Level::Critical);
+        assert!(c.control_loss.as_ref().is_some_and(|l| l.critical));
+    }
+
+    #[test]
+    fn health_recovers_once_a_late_chip_is_taken_over() {
+        let tree = crate::hal::HwmonTree::new("late-chip");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        c.timing = impatient();
+        c.update();
+        assert_eq!(c.health_level(), Level::Warn);
+        // The platform driver loads: chip appears, a sensor reads.
+        let hw = tree.chip("hwmon0", "it8625", &[("pwm1", "120"), ("pwm1_enable", "2")]);
+        c.set_samples(&[Some(60.0)]);
+        c.last_tick = None;
+        c.update();
+        assert!(c.control_loss.is_none());
+        assert_eq!(c.health_level(), Level::Info);
+        assert_eq!(
+            std::fs::read_to_string(format!("{hw}/pwm1_enable")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn failing_pwm_writes_count_as_not_under_control() {
+        let tree = it8625_tree("write-fail");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        c.timing = impatient();
+        c.set_samples(&[Some(60.0)]);
+        // pwm1_enable is a directory: every write to it fails.
+        let enable = tree.0.join("hwmon0/pwm1_enable");
+        std::fs::remove_file(&enable).unwrap();
+        std::fs::create_dir(&enable).unwrap();
+        c.update();
+        assert!(c.hwmon.is_none());
+        assert_eq!(c.health_level(), Level::Warn);
+    }
+
+    #[test]
+    fn no_sensor_ever_reading_takes_the_fan_over_at_max_pwm_after_the_grace() {
+        let tree = it8625_tree("never-sensor");
+        let hw = tree.0.join("hwmon0");
+        let mut c = new_controller(coretemp_fan());
+        c.hwmon_root = tree.0.clone();
+        // Inside the grace: BIOS mode is left alone (normal at boot).
+        c.timing = Timing {
+            sensor_takeover_after: Duration::from_secs(60),
+            control_warn_after: Duration::from_secs(60),
+            ..impatient()
+        };
+        c.update();
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "120");
+        assert_eq!(c.health_level(), Level::Info);
+        // Past it: manual mode at full speed, health Warn...
+        c.timing.sensor_takeover_after = Duration::ZERO;
+        c.timing.control_warn_after = Duration::ZERO;
+        c.update();
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+        assert_eq!(
+            std::fs::read_to_string(hw.join("pwm1_enable")).unwrap(),
+            "1"
+        );
+        assert!(c.sensors_lost);
+        assert_eq!(c.health_level(), Level::Warn);
+        // ...and Critical when it persists.
+        std::thread::sleep(Duration::from_millis(100));
+        c.update();
+        assert_eq!(c.health_level(), Level::Critical);
+        assert!(c.no_sensor_critical_logged);
+        // A sensor finally reads: the curve takes over and health clears.
+        c.set_samples(&[Some(40.0)]);
+        c.update();
+        assert!(!c.sensors_lost);
+        assert_eq!(c.health_level(), Level::Info);
+    }
+
+    #[test]
+    fn a_fan_disabled_by_config_is_flagged_not_silent() {
+        let (cfg, diagnostics) = crate::config::Config::parse(
+            "[[fans]]\nname = \"bad\"\npwm_chip = \"it8625\"\nmin_temp_c = 90.0\nmax_temp_c = 45.0\n",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains("may stop it")),
+            "{diagnostics:?}"
+        );
+        let c = FanController::new(cfg.fans[0].clone(), &cfg.temperature);
+        assert_eq!(c.health_level(), Level::Warn);
+        let line = c.status_line();
+        assert!(line.contains("disabled by config"), "{line}");
+        assert!(line.contains("[Warn]"), "{line}");
+    }
+
+    #[test]
+    fn a_fan_disabled_on_purpose_is_just_disabled() {
+        let c = new_controller(FanProfile {
+            enabled: false,
+            ..cfg()
+        });
+        assert_eq!(c.health_level(), Level::Info);
+        assert!(
+            c.status_line().contains("disabled [Info]"),
+            "{}",
+            c.status_line()
         );
     }
 }

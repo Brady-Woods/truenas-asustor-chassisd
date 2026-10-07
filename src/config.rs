@@ -771,6 +771,13 @@ pub struct FanProfile {
     /// max RPM at pwm=255 is a reasonable starting point (e.g. ~60-70% of
     /// it) if you want to set one.
     pub min_expected_rpm: Option<u32>,
+    /// Set by `Config::validate` (never read from the file) when this
+    /// profile was disabled for being inconsistent, as opposed to
+    /// `enabled = false` by choice. fan.rs reports it as "disabled by
+    /// config" with a warning health, since the fan is then left in
+    /// BIOS/driver mode.
+    #[serde(skip)]
+    pub disabled_by_config: bool,
 }
 
 impl Default for FanProfile {
@@ -799,6 +806,7 @@ impl Default for FanProfile {
             max_pwm: 255,
             sensors: Vec::new(),
             min_expected_rpm: None,
+            disabled_by_config: false,
         }
     }
 }
@@ -983,7 +991,8 @@ impl Config {
     /// - a bad template falls back to that screen's default;
     /// - an unparseable `[sleep]` time disables night mode;
     /// - a fan profile with an inconsistent curve is disabled, leaving
-    ///   that fan in its BIOS/driver mode rather than driving it from a
+    ///   that fan in its BIOS/driver mode (which may stop it -- the
+    ///   diagnostic and `STATUS` say so) rather than driving it from a
     ///   curve that makes no sense;
     /// - an unparseable `[wol] mode` leaves WOL untouched;
     /// - an `[led]` brightness over 100 is clamped to 100;
@@ -1016,11 +1025,14 @@ impl Config {
             let problems = fan.problems();
             if !problems.is_empty() {
                 errors.push(format!(
-                    "[[fans]] '{}': {}; fan control disabled for it",
+                    "[[fans]] '{}': {}; fan control disabled for it -- the fan stays in \
+                     BIOS/driver automatic mode, which may stop it (on this board's it8625 it \
+                     does); fix the config",
                     fan.name,
                     problems.join(", ")
                 ));
                 fan.enabled = false;
+                fan.disabled_by_config = true;
             }
         }
 
