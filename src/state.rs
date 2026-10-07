@@ -66,6 +66,18 @@ impl ChassisLocate {
     }
 }
 
+/// `secs` from now as an `Instant`. `Instant + Duration` panics on
+/// overflow and the config's durations are user input (also clamped in
+/// `Config::validate`), so an unrepresentable deadline becomes ten years
+/// out, which no uptime reaches, instead.
+fn deadline_after(secs: u64) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+    let now = Instant::now();
+    now.checked_add(Duration::from_secs(secs))
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
+}
+
 /// Whole seconds until `t`, rounded up so a countdown never shows 0s
 /// while it's still running.
 fn secs_left(t: Instant) -> u64 {
@@ -1005,8 +1017,7 @@ impl AppState {
             // though the schedule still wants it asleep, so a groggy 2am
             // glance doesn't get plunged back into darkness mid-read.
             //
-            self.awake_override_until =
-                Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
+            self.awake_override_until = Some(deadline_after(self.cfg.rotation.resume_after_secs));
             self.wake();
             return self.render();
         }
@@ -1044,8 +1055,7 @@ impl AppState {
                     let action = options[*selection];
                     self.mode = Mode::Confirm {
                         action,
-                        deadline: Instant::now()
-                            + Duration::from_secs(self.cfg.menu.confirm_timeout_secs),
+                        deadline: deadline_after(self.cfg.menu.confirm_timeout_secs),
                     };
                     Effect::None
                 }
@@ -1081,7 +1091,7 @@ impl AppState {
                 self.apply_pending_override();
                 self.show_override(Override {
                     level: Level::Info,
-                    expires_at: Some(Instant::now() + Duration::from_secs(5)),
+                    expires_at: Some(deadline_after(5)),
                     bay: None,
                     line0,
                     line1: "CANCELLED".into(),
@@ -1112,7 +1122,7 @@ impl AppState {
         }
         self.mode = Mode::Countdown {
             action,
-            deadline: Instant::now() + Duration::from_secs(secs),
+            deadline: deadline_after(secs),
             label: label.to_string(),
         };
         self.reset_scroll();
@@ -1147,8 +1157,7 @@ impl AppState {
             (self.index + len - 1) % len
         };
         self.auto_rotate = false;
-        self.resume_at =
-            Some(Instant::now() + Duration::from_secs(self.cfg.rotation.resume_after_secs));
+        self.resume_at = Some(deadline_after(self.cfg.rotation.resume_after_secs));
         self.last_dwell = Instant::now();
         self.reset_scroll();
     }
@@ -1489,7 +1498,7 @@ impl AppState {
             scroll.last_step = Some(now);
             // Loop with a gap of spaces between the end and restart.
             let gap = cfg.scroll_gap;
-            if scroll.offset > chars.len() + gap {
+            if scroll.offset > chars.len().saturating_add(gap) {
                 scroll.offset = 0;
                 scroll.started = Some(now); // pause again at the loop point
                 scroll.completed_a_pass = true;
@@ -1497,7 +1506,7 @@ impl AppState {
         }
 
         let mut window = String::with_capacity(16);
-        let padded_len = chars.len() + cfg.scroll_gap;
+        let padded_len = chars.len().saturating_add(cfg.scroll_gap);
         for i in 0..16 {
             let pos = (scroll.offset + i) % padded_len;
             window.push(if pos < chars.len() { chars[pos] } else { ' ' });
@@ -1553,6 +1562,62 @@ mod tests {
 
     fn active(state: &AppState) -> Option<(Level, &str)> {
         state.over.as_ref().map(|o| (o.level, o.line0.as_str()))
+    }
+
+    #[test]
+    fn deadline_after_survives_unrepresentable_durations() {
+        let far = deadline_after(u64::MAX);
+        assert!(far > Instant::now() + Duration::from_secs(365 * 24 * 3600));
+        assert!(deadline_after(5) < Instant::now() + Duration::from_secs(60));
+    }
+
+    /// A config at the extreme end of what TOML can express parses,
+    /// validates and then drives every timer in `AppState` without
+    /// panicking (`Instant + Duration` overflows panic).
+    #[test]
+    fn extreme_config_values_never_panic_the_state_machine() {
+        let max = i64::MAX;
+        let (cfg, errors) = Config::parse(&format!(
+            "[rotation]\ndwell_secs = {max}\nresume_after_secs = {max}\n\
+             [menu]\nconfirm_timeout_secs = {max}\n\
+             [refresh]\nnetwork_min_secs = {max}\npools_min_secs = {max}\n\
+             hdd_min_secs = {max}\ntemperature_min_secs = {max}\ndocker_min_secs = {max}\n"
+        ));
+        assert!(!errors.is_empty());
+        drive_timers(AppState::new(cfg));
+    }
+
+    /// Same with the values un-clamped, as if validation were bypassed.
+    #[test]
+    fn unvalidated_extreme_durations_never_panic_the_state_machine() {
+        let mut cfg = Config::default();
+        cfg.rotation.dwell_secs = u64::MAX;
+        cfg.rotation.resume_after_secs = u64::MAX;
+        cfg.menu.confirm_timeout_secs = u64::MAX;
+        cfg.display.scroll_gap = usize::MAX;
+        drive_timers(AppState::new(cfg));
+    }
+
+    fn drive_timers(mut s: AppState) {
+        s.sleeping = true;
+        s.handle_key(Key::Up); // wakes: awake_override_until
+        s.handle_key(Key::Down); // manual page: resume_at
+        s.handle_key(Key::Enter); // action menu
+        s.handle_key(Key::Enter); // confirm screen: confirm deadline
+        s.handle_key(Key::Back);
+        s.start_countdown(Action::Restart, u64::MAX, "test");
+        s.tick();
+        assert!(s.countdown_summary().is_some());
+        s.handle_key(Key::Back); // cancels: 5s notice
+        s.apply_socket_command(SocketCommand::Show {
+            level: Level::Info,
+            ttl_secs: 0,
+            bay: None,
+            line0: "a line that is long enough to scroll across the panel".to_string(),
+            line1: String::new(),
+        });
+        s.tick();
+        s.tick();
     }
 
     #[test]
