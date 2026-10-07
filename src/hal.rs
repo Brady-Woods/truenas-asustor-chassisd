@@ -1227,9 +1227,9 @@ mod tests {
         t.chip("hwmon0", "it8625e", &[]);
         t.chip("hwmon1", "coretemp", &[]);
         assert_eq!(glob_hwmon_in(&t.0, "it86").unwrap().len(), 1);
-        assert!(glob_hwmon_in(&t.0, "nvme").unwrap().is_empty());
+        assert_eq!(glob_hwmon_in(&t.0, "nvme").unwrap(), Vec::<String>::new());
         // An empty name matches nothing rather than everything.
-        assert!(glob_hwmon_in(&t.0, "").unwrap().is_empty());
+        assert_eq!(glob_hwmon_in(&t.0, "").unwrap(), Vec::<String>::new());
         // Unlistable root is None, not empty.
         assert!(glob_hwmon_in(&t.0.join("nope"), "it8625").is_none());
     }
@@ -1326,6 +1326,9 @@ mod tests {
         it.sort_by(f32::total_cmp);
         assert_eq!(it, vec![44.0]);
         assert_eq!(resolve_selector_in(&t.0, &sel("drivetemp")), vec![38.0]);
-        assert!(resolve_selector_in(&t.0, &sel("coretemp")).is_empty());
+        assert_eq!(
+            resolve_selector_in(&t.0, &sel("coretemp")),
+            Vec::<f32>::new()
+        );
     }
 }

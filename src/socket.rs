@@ -460,12 +460,20 @@ struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
     fn acquire(active: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
-        active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Slot(Arc::clone(active)))
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (Rust 1.95+, above
+        // this crate's minimum).
+        let mut seen = active.load(Ordering::Acquire);
+        loop {
+            if seen >= max {
+                return None;
+            }
+            match active.compare_exchange_weak(seen, seen + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Slot(Arc::clone(active))),
+                Err(now) => seen = now,
+            }
+        }
     }
 }
 

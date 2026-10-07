@@ -1586,7 +1586,7 @@ mod tests {
              [refresh]\nnetwork_min_secs = {max}\npools_min_secs = {max}\n\
              hdd_min_secs = {max}\ntemperature_min_secs = {max}\ndocker_min_secs = {max}\n"
         ));
-        assert!(!errors.is_empty());
+        assert_ne!(errors, Vec::<String>::new());
         drive_timers(AppState::new(cfg));
     }
 
