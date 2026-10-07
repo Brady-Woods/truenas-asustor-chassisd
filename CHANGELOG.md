@@ -9,12 +9,21 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-06
+
 ### Added
 - AQC113 10GbE temperature (hwmon `enp9s0`, PHY/MAC): warn 80C / critical
   100C (ADM's LAN-chip curve) and a default fan sensor ramping 70C to full
   speed at 100C.
 - A critical temperature on any of a fan's sensors pegs it at `max_pwm`
   until all are below warning, in curve mode as well as fixed.
+- Each GitHub release, from this one on, carries a prebuilt static
+  `x86_64-unknown-linux-musl` binary (tarball and SHA-256), built by a
+  release workflow. `deploy.sh` still builds from source.
+- `CONTRIBUTING.md`, issue forms and a pull request template; CI runs
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` and `sh -n deploy.sh` on every push and pull request. This
+  changelog now follows Keep a Changelog 1.1.0.
 
 ### Changed
 - The most critical active alarm (health checks and pushed error/critical
@@ -193,7 +202,8 @@ Upgrading from 1.4.0:
 - Initial release: portable ASUSTOR LCM/LED driver for TrueNAS SCALE, fan
   control, deploy script.
 
-[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Brady-Woods/truenas-asustor-chassisd/compare/v1.2.0...v1.3.0
