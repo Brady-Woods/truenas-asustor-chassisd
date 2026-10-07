@@ -31,6 +31,7 @@ pub struct Config {
     pub led: LedConfig,
     pub network: NetworkConfig,
     pub wol: WolConfig,
+    pub cpu_power: CpuPowerConfig,
     pub buzzer: BuzzerConfig,
     pub templates: TemplatesConfig,
     /// One entry per physical fan to control -- see `FanProfile`. Defaults
@@ -62,6 +63,7 @@ impl Default for Config {
             led: LedConfig::default(),
             network: NetworkConfig::default(),
             wol: WolConfig::default(),
+            cpu_power: CpuPowerConfig::default(),
             buzzer: BuzzerConfig::default(),
             templates: TemplatesConfig::default(),
             fans: default_fans(),
@@ -156,6 +158,102 @@ impl Default for WolConfig {
             nics: Vec::new(),
             mode: "g".to_string(),
         }
+    }
+}
+
+/// CPU package power limits (Intel RAPL), kept applied by
+/// `cpu_power::CpuPowerService` and dropped back to `stock_*` while any
+/// temperature sensor is critical. Whole watts and seconds: the kernel
+/// takes microwatts/microseconds and this avoids float-to-int casts.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CpuPowerConfig {
+    /// Off by default: the daemon never touches the CPU's power limits
+    /// unless asked.
+    pub enabled: bool,
+    /// PL1, the sustained limit, in watts.
+    pub pl1_w: u32,
+    /// PL2, the burst limit, in watts. At least `pl1_w`.
+    pub pl2_w: u32,
+    /// How long, in seconds, PL1 averages power over (the burst window).
+    pub tau_secs: u32,
+    /// What PL1/PL2/tau are put back to while a sensor is critical. The
+    /// defaults are this board's (Celeron N5105) firmware values.
+    pub stock_pl1_w: u32,
+    pub stock_pl2_w: u32,
+    pub stock_tau_secs: u32,
+    /// Seconds every sensor must stay under its *warning* threshold
+    /// before the configured limits come back after a critical.
+    pub rearm_secs: u64,
+    /// Seconds between temperature sweeps.
+    pub check_secs: u64,
+}
+
+impl Default for CpuPowerConfig {
+    fn default() -> Self {
+        CpuPowerConfig {
+            enabled: false,
+            pl1_w: 12,
+            pl2_w: 14,
+            tau_secs: 120,
+            stock_pl1_w: 10,
+            stock_pl2_w: 25,
+            stock_tau_secs: 28,
+            rearm_secs: 60,
+            check_secs: 5,
+        }
+    }
+}
+
+/// Highest power limit accepted, in watts: well above anything a NAS
+/// `SoC` takes, low enough to catch a milliwatt/microwatt slip.
+pub const MAX_CPU_POWER_W: u32 = 100;
+/// Longest accepted PL1 window, in seconds.
+pub const MAX_CPU_TAU_SECS: u32 = 3600;
+/// Accepted range for `[cpu_power] check_secs`.
+pub const CPU_POWER_CHECK_SECS: std::ops::RangeInclusive<u64> = 1..=60;
+
+impl CpuPowerConfig {
+    /// Everything wrong with this section, one message each.
+    fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, pl1, pl2, tau) in [
+            ("", self.pl1_w, self.pl2_w, self.tau_secs),
+            (
+                "stock_",
+                self.stock_pl1_w,
+                self.stock_pl2_w,
+                self.stock_tau_secs,
+            ),
+        ] {
+            if !(1..=MAX_CPU_POWER_W).contains(&pl1) || !(1..=MAX_CPU_POWER_W).contains(&pl2) {
+                out.push(format!(
+                    "{name}pl1_w/{name}pl2_w must be 1..={MAX_CPU_POWER_W} (got {pl1}/{pl2})"
+                ));
+            } else if pl2 < pl1 {
+                out.push(format!("{name}pl2_w ({pl2}) is below {name}pl1_w ({pl1})"));
+            }
+            if !(1..=MAX_CPU_TAU_SECS).contains(&tau) {
+                out.push(format!(
+                    "{name}tau_secs must be 1..={MAX_CPU_TAU_SECS} (got {tau})"
+                ));
+            }
+        }
+        if !CPU_POWER_CHECK_SECS.contains(&self.check_secs) {
+            out.push(format!(
+                "check_secs must be {}..={} (got {})",
+                CPU_POWER_CHECK_SECS.start(),
+                CPU_POWER_CHECK_SECS.end(),
+                self.check_secs
+            ));
+        }
+        if self.rearm_secs > MAX_SECS {
+            out.push(format!(
+                "rearm_secs = {} is over {MAX_SECS}",
+                self.rearm_secs
+            ));
+        }
+        out
     }
 }
 
@@ -1036,6 +1134,17 @@ impl Config {
             }
         }
 
+        if self.cpu_power.enabled {
+            let problems = self.cpu_power.problems();
+            if !problems.is_empty() {
+                errors.push(format!(
+                    "[cpu_power]: {}; CPU power limits are left alone",
+                    problems.join("; ")
+                ));
+                self.cpu_power.enabled = false;
+            }
+        }
+
         self.sanitize_fan_temps(&mut errors);
 
         for fan in self.fans.iter_mut().filter(|f| f.enabled) {
@@ -1376,6 +1485,45 @@ mod tests {
         assert_eq!(cfg.refresh.docker_min_secs, MAX_SECS);
         assert_eq!(cfg.display.scroll_max_chars, MAX_SCROLL_CHARS);
         assert_eq!(cfg.display.scroll_gap, MAX_SCROLL_GAP);
+    }
+
+    #[test]
+    fn cpu_power_is_off_unless_enabled_and_parses_whole_units() {
+        let (cfg, errors) = Config::parse("");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!cfg.cpu_power.enabled);
+        let (cfg, errors) =
+            Config::parse("[cpu_power]\nenabled = true\npl1_w = 12\npl2_w = 14\ntau_secs = 120\n");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(cfg.cpu_power.enabled);
+        assert_eq!(
+            (cfg.cpu_power.pl1_w, cfg.cpu_power.stock_pl2_w),
+            (12, 25),
+            "stock defaults to this board's firmware values"
+        );
+    }
+
+    #[test]
+    fn bad_cpu_power_settings_disable_it_rather_than_guess() {
+        for bad in [
+            "pl1_w = 0",
+            "pl1_w = 20\npl2_w = 14",
+            "pl2_w = 100000",
+            "tau_secs = 0",
+            "stock_pl1_w = 30",
+            "check_secs = 0",
+            "check_secs = 61",
+        ] {
+            let (cfg, errors) = Config::parse(&format!("[cpu_power]\nenabled = true\n{bad}\n"));
+            assert!(!cfg.cpu_power.enabled, "{bad}");
+            assert!(
+                errors.iter().any(|e| e.contains("[cpu_power]")),
+                "{bad}: {errors:?}"
+            );
+        }
+        // A problem in a section that is off isn't reported.
+        let (_, errors) = Config::parse("[cpu_power]\npl1_w = 0\n");
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod alarm;
 mod buzzer;
 mod config;
+mod cpu_power;
 mod driver_watch;
 mod fan;
 mod fan_calibrate;
@@ -225,7 +226,17 @@ fn main() -> ExitCode {
             // Open syslog so its lines carry the program name in the journal.
             syslog::init();
             let cfg = Config::load(&path);
+            let mut ok = true;
+            // Raised CPU power limits go back to stock too: nothing is
+            // watching temperatures any more.
+            if let Err(e) = cpu_power::restore_stock(&cfg.cpu_power) {
+                syslog::critical(&format!("could not restore stock CPU power limits: {e}"));
+                ok = false;
+            }
             if !fan::force_full_speed_all(cfg.fans).all_present_fans_set() {
+                ok = false;
+            }
+            if !ok {
                 return ExitCode::FAILURE;
             }
         }
@@ -389,6 +400,7 @@ fn run_daemon(cfg_path: &Path) {
     let progress = sd_notify::Progress::new();
     let watchdog_stop = Arc::new(AtomicBool::new(false));
     start_watchdog_feeder(&fans, &progress, &watchdog_stop);
+    let cpu_power = start_cpu_power(&cfg);
     let mut state = AppState::new(cfg.clone());
     progress.bump();
     state.refresh_all();
@@ -417,13 +429,24 @@ fn run_daemon(cfg_path: &Path) {
     // and systemd restarts it.
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         event_loop(
-            &mut state, &mut lcm, &cfg, &fans, &mut wol, &mut power, &rx, &progress,
+            &mut state,
+            &mut lcm,
+            &cfg,
+            &fans,
+            cpu_power.as_ref(),
+            &mut wol,
+            &mut power,
+            &rx,
+            &progress,
         )
     }));
     watchdog_stop.store(true, Ordering::Relaxed);
     // No new clients from here on; the file goes even if the loop failed.
     drop(socket_guard);
     fans.shutdown();
+    if let Some(cpu_power) = cpu_power {
+        cpu_power.shutdown();
+    }
     // The OS stopping this service as part of a shutdown/reboot is the
     // one power action the daemon doesn't start itself.
     if shutdown::requested() && system_is_stopping() {
@@ -447,6 +470,18 @@ fn run_daemon(cfg_path: &Path) {
     }
 }
 
+/// Starts the CPU power limit threads if `[cpu_power]` is enabled.
+fn start_cpu_power(cfg: &Config) -> Option<cpu_power::CpuPowerService> {
+    cfg.cpu_power.enabled.then(|| {
+        cpu_power::CpuPowerService::spawn(&cfg.cpu_power, &cfg.temperature).unwrap_or_else(|e| {
+            // Same reasoning as the fan thread: don't run with raised
+            // limits and no guard.
+            eprintln!("failed to start CPU power limit thread: {e}");
+            std::process::exit(1);
+        })
+    })
+}
+
 /// Starts the thread that feeds systemd's watchdog (see `sd_notify`).
 fn start_watchdog_feeder(
     fans: &fan::FanService,
@@ -468,6 +503,34 @@ fn start_watchdog_feeder(
     }
 }
 
+/// Fails if a thread that protects the hardware died or stopped making
+/// progress; the caller exits so systemd restarts the daemon and
+/// `fan-failsafe` (`ExecStopPost`) hands the hardware back safely.
+fn check_guards(
+    fans: &fan::FanService,
+    cpu_power: Option<&cpu_power::CpuPowerService>,
+) -> Result<(), &'static str> {
+    if fans.has_died() {
+        return Err("fan control thread died");
+    }
+    // A fan thread that is alive but stuck (a hung sysfs write) is just
+    // as bad: nothing is watching temperatures.
+    if fans.is_stalled() {
+        return Err("fan control thread stopped responding");
+    }
+    // Likewise the thread guarding raised CPU power limits: without it
+    // nothing would drop them when a sensor goes critical.
+    if let Some(cpu_power) = cpu_power {
+        if cpu_power.has_died() {
+            return Err("CPU power limit thread died");
+        }
+        if cpu_power.is_stalled() {
+            return Err("CPU power limit thread stopped responding");
+        }
+    }
+    Ok(())
+}
+
 /// Runs until SIGTERM/SIGINT (`Ok`) or until fan control can no longer be
 /// trusted (`Err`).
 #[expect(
@@ -479,6 +542,7 @@ fn event_loop(
     lcm: &mut Lcm,
     cfg: &Config,
     fans: &fan::FanService,
+    cpu_power: Option<&cpu_power::CpuPowerService>,
     wol: &mut wol::WolKeeper,
     power: &mut power::Scheduler,
     rx: &mpsc::Receiver<socket::SocketCommand>,
@@ -499,9 +563,11 @@ fn event_loop(
         // `state`, not inside it.
         for cmd in socket::drain(rx) {
             if let socket::SocketCommand::StatusRequest(resp_tx) = cmd {
+                let cpu_line = cpu_power.map(cpu_power::CpuPowerService::status_line);
                 let _ = resp_tx.send(report::build(
                     state,
                     &fans.status(),
+                    cpu_line.as_deref(),
                     power,
                     &lcm.stats(),
                     cfg,
@@ -532,15 +598,7 @@ fn event_loop(
             state.start_countdown(due.action, due.countdown_secs, &due.label);
         }
 
-        if fans.has_died() {
-            return Err("fan control thread died");
-        }
-        // A fan thread that is alive but stuck (a hung sysfs write) is just
-        // as bad: nothing is watching temperatures. Fail the same way, so
-        // the fans are handed back at full speed and systemd restarts us.
-        if fans.is_stalled() {
-            return Err("fan control thread stopped responding");
-        }
+        check_guards(fans, cpu_power)?;
         state.set_fan_health(fans.status().health);
         wol.maybe_enforce();
 

@@ -139,7 +139,7 @@ struct ControlLoss {
     critical: bool,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -295,14 +295,14 @@ pub struct FanLiveness {
 }
 
 impl FanLiveness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         FanLiveness {
             heartbeat_ms: Arc::new(AtomicU64::new(0)),
             epoch: Instant::now(),
         }
     }
 
-    fn beat(&self) {
+    pub(crate) fn beat(&self) {
         self.heartbeat_ms
             .store(millis_since(self.epoch), Ordering::Relaxed);
     }

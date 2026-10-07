@@ -168,6 +168,26 @@ chip = "enp9s0"              # AQC113 10GbE PHY/MAC (hwmon is named after the in
 warn_threshold = 80.0
 critical_threshold = 100.0
 
+[cpu_power]
+# CPU package power limits (Intel RAPL, /sys/class/powercap/intel-rapl:0),
+# applied at startup and rechecked every 60s. They reset on reboot, so
+# this replaces a boot-time script. Off by default: set enabled = true.
+# While ANY temperature sensor is at/above its critical_threshold (see
+# [temperature] above), or no sensor reads at all, the limits drop to the
+# stock_* values below; the configured ones return once every sensor has
+# been under its *warning* threshold for rearm_secs. The stock limits are
+# also restored whenever the daemon stops, however it stops. Whole watts
+# and seconds. Defaults: Celeron N5105's firmware values and a 12/14W cap.
+enabled = false
+pl1_w = 12             # sustained limit (PL1)
+pl2_w = 14             # burst limit (PL2), at least pl1_w
+tau_secs = 120         # how long PL1 averages power over
+stock_pl1_w = 10       # what a critical temperature puts back
+stock_pl2_w = 25
+stock_tau_secs = 28
+rearm_secs = 60
+check_secs = 5         # seconds between temperature sweeps (1-60)
+
 [docker]
 ignore = []                # container names to exclude from health checks
 

@@ -655,6 +655,55 @@ up to the board:
 - The magic packet has to reach that port: sent to *that NIC's* MAC, on
   its broadcast domain, with a cable connected at the time of shutdown.
 
+## CPU power limits
+
+```toml
+[cpu_power]
+enabled = true      # default false: the daemon never touches the limits unless asked
+pl1_w = 12          # sustained limit
+pl2_w = 14          # burst limit
+tau_secs = 120      # PL1's averaging window
+# stock_pl1_w = 10, stock_pl2_w = 25, stock_tau_secs = 28 -- what a critical puts back
+# rearm_secs = 60, check_secs = 5
+```
+
+`cpu_power.rs` sets the CPU package's Intel RAPL limits through the
+`intel-rapl:0` powercap zone, the thing a boot-time `echo > .../constraint_0_power_limit_uw`
+script would do. The limits live in the CPU and reset on reboot, so the
+daemon applies them at startup and rechecks them every 60s (rewriting, with
+a WARNING, if something changed them). It refuses a zone whose constraints
+aren't named `long_term`/`short_term`, and writes PL2 before PL1 when
+raising and after it when lowering so PL1 never exceeds PL2 in between.
+
+It fails toward cooling:
+
+- **Any critical sensor drops the limits to the `stock_*` values.** Every
+  connected hwmon sensor counts (the same set the health monitor watches),
+  each against its own chip's `critical_threshold` from `[temperature]` --
+  so a CPU at its 100C critical, a drive at 60C or the NIC at 100C all do
+  it. The configured limits come back only after *every* sensor has been
+  under its *warning* threshold for `rearm_secs`, so a sensor hovering at
+  critical can't make the limits flap. Both transitions are logged (CRITICAL
+  / NOTICE).
+- **No fresh readings count as critical.** Sensors are swept on their own
+  thread every `check_secs`; a sweep that finds nothing, or a wedged read
+  that stops producing samples, leaves the limits at stock.
+- **A failed write is retried every second** and logged once.
+- **Stock comes back whenever the daemon stops**, clean or not:
+  `lcm-status fan-failsafe` (the unit's `ExecStopPost`) restores it next to
+  forcing the fans to full speed. The main loop also restarts the daemon if
+  the control thread dies or stops responding.
+
+The stock values default to this board's firmware settings (Celeron N5105:
+PL1 10W, PL2 25W, tau ~28s). Note that stock PL2 is *higher* than a
+14W burst cap: dropping to stock lowers sustained power (12W to 10W) but
+allows a short burst up to 25W. The CPU's own thermal throttling at TjMax
+(105C) is unaffected; the daemon's trip point is the `coretemp` critical
+threshold (100C by default). Set the `stock_*` keys to whatever "safe" means
+for your box. Invalid values (zero, PL2 below PL1, over 100W) disable the
+feature with a diagnostic rather than guessing. `status` shows the current
+limits and, after a trip, why.
+
 ## Health monitoring (syslog)
 
 `monitor.rs` logs to syslog (`syslog.rs`, real `syslog(3)` calls with

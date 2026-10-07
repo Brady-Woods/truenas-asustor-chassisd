@@ -9,6 +9,16 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+### Added
+
+- **CPU power limits (`[cpu_power]`).** Applies Intel RAPL PL1/PL2/tau
+  through `intel-rapl:0` at startup and keeps them applied, replacing a
+  boot-time script. Off by default. Any critical temperature sensor (each
+  against its own chip's threshold), or no readings at all, drops them to
+  the `stock_*` values until every sensor has been under its warning
+  threshold for `rearm_secs`. `lcm-status fan-failsafe` also restores stock
+  whenever the daemon stops, and `STATUS` has a "CPU power limits" section.
+
 ## [3.1.0] - 2026-10-06
 
 ### Added

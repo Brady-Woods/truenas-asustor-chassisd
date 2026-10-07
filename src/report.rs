@@ -20,6 +20,7 @@ use std::fmt::Write;
 pub fn build(
     state: &AppState,
     fans: &FanStatus,
+    cpu_power: Option<&str>,
     power: &Scheduler,
     lcd: &LinkStats,
     cfg: &Config,
@@ -36,6 +37,13 @@ pub fn build(
         let _ = writeln!(out, "  {line}");
     }
     out.push('\n');
+
+    out.push_str("-- CPU power limits --\n");
+    let _ = writeln!(
+        out,
+        "  {}\n",
+        cpu_power.unwrap_or("not managed ([cpu_power] enabled = false)")
+    );
 
     temperatures_section(&mut out, cfg);
 
