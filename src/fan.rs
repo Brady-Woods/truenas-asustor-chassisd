@@ -75,8 +75,8 @@ use crate::config::{
 };
 use crate::hal::{glob_hwmon_in, is_over_range, read_sysfs_raw_f32, resolve_selector_in};
 use crate::socket::Level;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -238,14 +238,39 @@ pub struct FanStatus {
     pub lines: Vec<String>,
 }
 
+/// The fan thread publishes a heartbeat every loop (well under a second);
+/// one older than this means it is wedged (a hung sysfs write, say), and
+/// the main loop treats that like the thread dying.
+pub const FAN_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `shutdown` waits for the fan thread to exit before giving up
+/// on it and forcing the fans to full speed itself.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// ...and how long that forced write may take before shutdown moves on.
+const FAILSAFE_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_HWMON_ROOT: &str = "/sys/class/hwmon";
+
 /// Fan control, running on its own thread so nothing the main loop does
 /// (a slow `smartctl`, a hung `zpool`, a stuck socket client) can stall
 /// it. The controllers are owned by that thread; the main loop only sees
-/// the published `FanStatus`.
+/// the published `FanStatus` and the thread's heartbeat.
 pub struct FanService {
     status: Arc<Mutex<FanStatus>>,
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    /// Milliseconds since `epoch` of the fan thread's last loop. An atomic
+    /// rather than a field of `FanStatus` so reading it can never wait on
+    /// a lock the (possibly wedged) thread holds.
+    heartbeat_ms: Arc<AtomicU64>,
+    epoch: Instant,
+    /// Kept so `shutdown` can force full speed if the thread is wedged and
+    /// so can't run its controllers' own restore-on-drop.
+    profiles: Vec<FanProfile>,
+    hwmon_root: PathBuf,
+    join_timeout: Duration,
+}
+
+fn millis_since(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl FanService {
@@ -257,21 +282,37 @@ impl FanService {
         profiles: Vec<FanProfile>,
         temperature: &TemperatureConfig,
     ) -> std::io::Result<Self> {
+        Self::spawn_in(PathBuf::from(DEFAULT_HWMON_ROOT), profiles, temperature)
+    }
+
+    fn spawn_in(
+        hwmon_root: PathBuf,
+        profiles: Vec<FanProfile>,
+        temperature: &TemperatureConfig,
+    ) -> std::io::Result<Self> {
         let status = Arc::new(Mutex::new(FanStatus {
             health: Level::Info,
             lines: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Instant::now();
+        let heartbeat_ms = Arc::new(AtomicU64::new(0));
         let temperature = temperature.clone();
         let handle = thread::Builder::new().name("fans".into()).spawn({
             let status = Arc::clone(&status);
             let stop = Arc::clone(&stop);
+            let heartbeat_ms = Arc::clone(&heartbeat_ms);
+            let (profiles, hwmon_root) = (profiles.clone(), hwmon_root.clone());
             move || {
                 let mut fans: Vec<FanController> = profiles
                     .into_iter()
-                    .map(|p| FanController::new(p, &temperature))
+                    .map(|p| {
+                        let mut c = FanController::new(p, &temperature);
+                        c.hwmon_root.clone_from(&hwmon_root);
+                        c
+                    })
                     .collect();
-                for f in &mut fans {
+                for f in &fans {
                     f.start_readers(&stop);
                 }
                 while !stop.load(Ordering::Relaxed) {
@@ -283,6 +324,7 @@ impl FanService {
                         lines: fans.iter().map(FanController::status_line).collect(),
                     };
                     *lock(&status) = snapshot;
+                    heartbeat_ms.store(millis_since(epoch), Ordering::Relaxed);
                     thread::sleep(FAN_THREAD_INTERVAL);
                 }
             }
@@ -291,6 +333,11 @@ impl FanService {
             status,
             stop,
             handle,
+            heartbeat_ms,
+            epoch,
+            profiles,
+            hwmon_root,
+            join_timeout: SHUTDOWN_JOIN_TIMEOUT,
         })
     }
 
@@ -303,11 +350,88 @@ impl FanService {
         self.handle.is_finished()
     }
 
-    /// Stops the fan thread and waits for it to exit.
+    /// How long since the fan thread last completed a loop.
+    pub fn heartbeat_age(&self) -> Duration {
+        self.epoch.elapsed().saturating_sub(Duration::from_millis(
+            self.heartbeat_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// True if the fan thread is alive but has stopped making progress
+    /// (`FAN_HEARTBEAT_TIMEOUT`): wedged, so nothing is watching
+    /// temperatures. The caller should treat this like `has_died`.
+    pub fn is_stalled(&self) -> bool {
+        self.heartbeat_age() > FAN_HEARTBEAT_TIMEOUT
+    }
+
+    /// Stops the fan thread and waits for it to exit -- but not forever. A
+    /// thread that is wedged inside a sysfs call never reaches its
+    /// controllers' restore-on-drop, so after `SHUTDOWN_JOIN_TIMEOUT` this
+    /// forces every enabled fan to full speed itself (on a helper thread,
+    /// itself time-limited) and abandons the stuck thread; the process is
+    /// about to exit anyway.
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.handle.join();
+        let deadline = Instant::now() + self.join_timeout;
+        while !self.handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if self.handle.is_finished() {
+            if self.handle.join().is_err() {
+                crate::syslog::critical("fan control thread had panicked");
+            }
+            return;
+        }
+        crate::syslog::critical(&format!(
+            "fan control thread did not stop within {}s; forcing fans to full speed",
+            self.join_timeout.as_secs()
+        ));
+        force_full_speed(self.hwmon_root, self.profiles);
     }
+}
+
+/// Last-resort fail-safe for a wedged fan thread: manual mode at full
+/// speed on every enabled fan, written from a helper thread so a sysfs
+/// write that hangs too can't hang the caller beyond `FAILSAFE_TIMEOUT`.
+fn force_full_speed(root: PathBuf, profiles: Vec<FanProfile>) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("fan-failsafe".into())
+        .spawn(move || {
+            for p in profiles.iter().filter(|p| p.enabled) {
+                if let Err(e) = write_full_speed(&root, p) {
+                    crate::syslog::critical(&format!(
+                        "fan '{}' (pwm{}): could not force full speed: {e}",
+                        p.name, p.pwm_index
+                    ));
+                }
+            }
+            // The receiver may have given up already; nothing to do then.
+            done_tx.send(()).ok();
+        });
+    match spawned {
+        Ok(_) => {
+            if done_rx.recv_timeout(FAILSAFE_TIMEOUT).is_err() {
+                crate::syslog::critical("forcing fans to full speed timed out");
+            }
+        }
+        Err(e) => crate::syslog::critical(&format!("could not start the fan fail-safe: {e}")),
+    }
+}
+
+/// Manual mode, full speed, for one profile's pwm output under `root`.
+fn write_full_speed(root: &Path, profile: &FanProfile) -> std::io::Result<()> {
+    let hwmon = glob_hwmon_in(root, &profile.pwm_chip)
+        .and_then(|v| v.into_iter().next())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("pwm chip '{}' not found", profile.pwm_chip),
+            )
+        })?;
+    let n = profile.pwm_index;
+    std::fs::write(format!("{hwmon}/pwm{n}_enable"), "1")?;
+    std::fs::write(format!("{hwmon}/pwm{n}"), u8::MAX.to_string())
 }
 
 fn worst_health(fans: &[FanController]) -> Level {
@@ -1787,5 +1911,109 @@ mod tests {
             "{}",
             c.status_line()
         );
+    }
+
+    /// A `FanService` around a thread that never returns, as a fan thread
+    /// wedged in a sysfs call would be, with a heartbeat last seen `age` ago.
+    fn wedged_service(
+        root: PathBuf,
+        profiles: Vec<FanProfile>,
+        age: Duration,
+    ) -> (FanService, std::sync::mpsc::Sender<()>) {
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = wedge.recv();
+        });
+        let epoch = Instant::now().checked_sub(age).unwrap();
+        (
+            FanService {
+                status: Arc::new(Mutex::new(FanStatus {
+                    health: Level::Info,
+                    lines: Vec::new(),
+                })),
+                stop: Arc::new(AtomicBool::new(false)),
+                handle,
+                heartbeat_ms: Arc::new(AtomicU64::new(0)),
+                epoch,
+                profiles,
+                hwmon_root: root,
+                join_timeout: Duration::from_millis(100),
+            },
+            release,
+        )
+    }
+
+    #[test]
+    fn a_stale_heartbeat_is_a_stalled_fan_thread() {
+        let (svc, _release) = wedged_service(
+            PathBuf::from("/nonexistent"),
+            Vec::new(),
+            Duration::from_secs(20),
+        );
+        assert!(!svc.has_died(), "the thread is alive, just stuck");
+        assert!(svc.is_stalled());
+        assert!(svc.heartbeat_age() >= Duration::from_secs(20));
+        let (fresh, _release) = wedged_service(
+            PathBuf::from("/nonexistent"),
+            Vec::new(),
+            Duration::from_secs(1),
+        );
+        assert!(!fresh.is_stalled());
+    }
+
+    #[test]
+    fn a_running_fan_service_keeps_its_heartbeat_fresh() {
+        let tree = it8625_tree("heartbeat");
+        let svc = FanService::spawn_in(tree.0.clone(), Vec::new(), &TemperatureConfig::default())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            svc.heartbeat_age() < Duration::from_secs(1),
+            "{:?}",
+            svc.heartbeat_age()
+        );
+        assert!(!svc.is_stalled());
+        let started = Instant::now();
+        svc.shutdown();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_wedged_thread_and_forces_full_speed() {
+        let tree = it8625_tree("failsafe");
+        let hw = tree.0.join("hwmon0");
+        let profiles = vec![
+            coretemp_fan(),
+            // Disabled fans are left alone.
+            FanProfile {
+                pwm_index: 2,
+                enabled: false,
+                ..coretemp_fan()
+            },
+        ];
+        std::fs::write(hw.join("pwm2"), "77").unwrap();
+        std::fs::write(hw.join("pwm2_enable"), "2").unwrap();
+        let (svc, release) = wedged_service(tree.0.clone(), profiles, Duration::from_secs(20));
+        let started = Instant::now();
+        svc.shutdown(); // must return despite the stuck thread
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(hw.join("pwm1")).unwrap(), "255");
+        assert_eq!(
+            std::fs::read_to_string(hw.join("pwm1_enable")).unwrap(),
+            "1"
+        );
+        assert_eq!(std::fs::read_to_string(hw.join("pwm2")).unwrap(), "77");
+        drop(release);
+    }
+
+    #[test]
+    fn forcing_full_speed_reports_a_missing_chip() {
+        let empty = crate::hal::HwmonTree::new("failsafe-none");
+        let err = write_full_speed(&empty.0, &coretemp_fan()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

@@ -11,6 +11,7 @@ mod platform;
 mod power;
 mod protocol;
 mod report;
+mod sd_notify;
 mod shutdown;
 mod socket;
 mod state;
@@ -335,6 +336,10 @@ fn run_daemon(cfg_path: &Path) {
         std::process::exit(1);
     });
 
+    // The first refresh runs subprocesses (each capped at 10s) and may take
+    // a while on a sick box; tell systemd's watchdog we are alive first so
+    // startup isn't counted against it.
+    sd_notify::Watchdog::from_env().ping();
     let mut state = AppState::new(cfg.clone());
     state.refresh_all();
     state.init_leds();
@@ -400,6 +405,7 @@ fn event_loop(
     let serial_fd = lcm.as_raw_fd();
     let mut last_redraw = Instant::now();
     let mut last_alert_beep: Option<Instant> = None;
+    let mut watchdog = sd_notify::Watchdog::from_env();
 
     while !shutdown::requested() {
         // Drain any socket commands that arrived since the last wakeup.
@@ -460,6 +466,16 @@ fn event_loop(
         if fans.has_died() {
             return Err("fan control thread died");
         }
+        // A fan thread that is alive but stuck (a hung sysfs write) is just
+        // as bad: nothing is watching temperatures. Fail the same way, so
+        // the fans are handed back at full speed and systemd restarts us.
+        if fans.is_stalled() {
+            return Err("fan control thread stopped responding");
+        }
+        // Only reached while the fan thread is demonstrably alive: a stuck
+        // fan thread (or a stuck loop) stops the pings and systemd's
+        // `WatchdogSec=` restarts the daemon.
+        watchdog.ping();
         state.set_fan_health(fans.status().health);
         wol.maybe_enforce();
 
