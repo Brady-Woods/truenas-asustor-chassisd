@@ -59,7 +59,7 @@ jobs:
         run: |
           name="lcm-status-$GITHUB_REF_NAME-$TARGET"
           mkdir -p "dist/$name"
-          cp "target/$TARGET/release/lcm-status" README.md CHANGELOG.md \
+          cp "target/$TARGET/release/lcm-status" README.md CHANGELOG.md LICENSE \
             lcm-status.example.toml lcm-status.service "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

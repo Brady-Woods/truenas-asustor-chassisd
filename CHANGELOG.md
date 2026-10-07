@@ -9,6 +9,14 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+### Added
+
+- MIT license (`LICENSE`, also in the release tarball).
+
+### Changed
+
+- Docs and comments no longer point at the private deployment repository.
+
 ## [2.1.0] - 2026-10-06
 
 ### Added

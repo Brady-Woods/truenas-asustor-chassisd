@@ -1060,9 +1060,9 @@ the binary to `/usr/local/sbin` and worked fine across same-kernel
 reboots, because those all reused the one boot environment that had been
 hand-patched `readonly=off` months before this project existed. The first
 *real* TrueNAS update it went through landed on a genuinely fresh boot
-environment and failed with `Read-only file system` -- see
-`truenas-asustor-deploy`'s `docs/RUNBOOK.md` for the full story, which hit
-the identical issue in the platform driver at the same time.)
+environment and failed with `Read-only file system`. The platform driver's
+deployment hit the identical issue at the same time, which is why it loads
+its modules straight from its checkout too.)
 
 ## Manual testing / probing
 
@@ -1088,3 +1088,7 @@ An unrecognized subcommand is an error (exit status 2), not a config
 path. Only `daemon` (or a bare argument that looks like a path, the
 form older unit files used) starts the daemon, and the daemon refuses to
 start if another instance is already listening on the socket.
+
+## License
+
+[MIT](LICENSE).
