@@ -533,16 +533,20 @@ same under "Buzzer"):
 Both are re-checked before every beep, so fixing either takes effect
 without restarting the daemon (logged when the buzzer becomes ready).
 
-## Rear reset button (not used)
+## Rear reset button (non-goal)
 
 The pinhole button on the back is a plain GPIO input, not a hardware
-reset; ADM restores settings after it's held for ~5 s. With the platform
-driver fork (v0.3 or later) it shows up as `KEY_VENDOR` (code 360) on the
-`asustor-keys` input device, next to the USB Copy button
-(`sudo evtest`, pick "asustor-keys"). `lcm-status` doesn't read it and
-nothing else on the system acts on it -- deliberately not `KEY_RESTART`,
-which systemd-logind would turn into an instant reboot. Pressing it is
-harmless; it's there if a "hold for N seconds" action is ever wanted.
+reset. ADM restores its settings after a ~5 s hold, but TrueNAS has no
+equivalent: there is no "reset to factory defaults" action to hang on a
+button, and a reboot or shutdown is already on the LCD menu. So
+`lcm-status` deliberately doesn't read it and nothing acts on it;
+pressing it is harmless.
+
+With the platform driver fork (v0.3 or later) it is exposed as
+`KEY_VENDOR` (code 360) on the `asustor-keys` input device, next to the
+USB Copy button (`sudo evtest`, pick "asustor-keys"), in case you want to
+bind your own action. It is deliberately not `KEY_RESTART`, which
+systemd-logind would turn into an instant reboot.
 
 ## Wake-on-LAN
 

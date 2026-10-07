@@ -15,6 +15,8 @@ were reconstructed from git history.
 
 ### Changed
 
+- The rear reset button is documented as a deliberate non-goal: TrueNAS has
+  nothing to bind it to.
 - Docs and comments no longer point at the private deployment repository.
 
 ## [2.1.0] - 2026-10-06
