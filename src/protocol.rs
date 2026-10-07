@@ -346,7 +346,10 @@ impl Lcm {
                     if left.is_zero() || !poll_fd(self.port.as_raw_fd(), libc::POLLOUT, left) {
                         // Whatever was already accepted (the bytes before
                         // `rest`) is on its way; the MCU resyncs on the
-                        // next frame's opcode and `set_text` retries.
+                        // next frame's opcode. The error propagates to the
+                        // caller (no retry here); `set_text` leaves its
+                        // cache untouched, so the text is sent again on
+                        // the next call.
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "serial port not accepting data",
