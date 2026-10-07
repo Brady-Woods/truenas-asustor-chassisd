@@ -9,6 +9,17 @@ were reconstructed from git history.
 
 ## [Unreleased]
 
+### Changed
+
+- **Startup log lists the effective temperature settings.** The `starting:`
+  line used to print only the global `[temperature]` fallback, which
+  applies to no sensor that has a `[[temperature.thresholds]]` override
+  (CPU, drives, NVMe) and so looked like the limits in force. It now lists
+  every per-chip pair and labels the fallback "other chips". Two new info
+  lines follow: one per fan with its wiring, curve (or fixed pwm) and each
+  sensor's own ramp range, and one with every connected temperature sensor,
+  its current reading and the warn/critical pair it is judged against.
+
 ## [3.2.0] - 2026-10-06
 
 ### Added

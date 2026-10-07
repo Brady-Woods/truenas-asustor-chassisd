@@ -324,17 +324,29 @@ fn socket_request(socket_path: &str, request: &str) -> String {
     response
 }
 
+/// What temperature handling is actually configured and what it sees right
+/// now, so a journal from a hot day shows the limits that were in force.
+fn log_temperature_setup(cfg: &Config) {
+    for fan in &cfg.fans {
+        syslog::info(&config::describe_fan(fan));
+    }
+    syslog::info(&config::describe_sensors(
+        &cfg.temperature,
+        &hal::all_connected_temps(),
+    ));
+}
+
 fn run_daemon(cfg_path: &Path) {
     syslog::init();
     shutdown::install();
 
     let cfg = Config::load(cfg_path);
     syslog::info(&format!(
-        "starting: {} fan(s) configured, temperature warn/critical at {:.0}C/{:.0}C",
+        "starting: {} fan(s) configured; temperature warn/critical: {}",
         cfg.fans.iter().filter(|f| f.enabled).count(),
-        cfg.temperature.warn_threshold,
-        cfg.temperature.critical_threshold,
+        config::describe_thresholds(&cfg.temperature),
     ));
+    log_temperature_setup(&cfg);
 
     // First, before touching the serial port or fans: if another daemon
     // is already running, this is a second instance and must not start.

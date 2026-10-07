@@ -3,6 +3,7 @@
 //! the daemon runs fine with no config file at all.
 
 use serde::{Deserialize, Deserializer};
+use std::fmt::Write as _;
 use std::path::Path;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/lcm-status.toml";
@@ -784,6 +785,117 @@ pub fn resolve_temp_threshold(cfg: &TemperatureConfig, chip: &str) -> (f32, f32)
         })
 }
 
+/// A temperature as the startup summary prints it: `90`, `82.5`.
+fn fmt_c(v: f32) -> String {
+    format!("{v}C")
+}
+
+/// The effective warn/critical pairs for the startup log: each chip
+/// override, then the fallback that every other chip gets (labelled so it
+/// isn't read as applying to the overridden ones).
+pub fn describe_thresholds(cfg: &TemperatureConfig) -> String {
+    let mut parts: Vec<String> = cfg
+        .thresholds
+        .iter()
+        .map(|t| {
+            format!(
+                "{} {}/{}",
+                t.chip,
+                fmt_c(t.warn_threshold),
+                fmt_c(t.critical_threshold)
+            )
+        })
+        .collect();
+    parts.push(format!(
+        "other chips {}/{}",
+        fmt_c(cfg.warn_threshold),
+        fmt_c(cfg.critical_threshold)
+    ));
+    parts.join(", ")
+}
+
+/// Every connected temperature sensor with its reading and the thresholds
+/// it is actually judged against, for one startup log line.
+pub fn describe_sensors(cfg: &TemperatureConfig, temps: &[(String, String, f32)]) -> String {
+    if temps.is_empty() {
+        return "sensors: none detected".to_string();
+    }
+    let items: Vec<String> = temps
+        .iter()
+        .map(|(chip, desc, t)| {
+            let (warn, crit) = resolve_temp_threshold(cfg, chip);
+            format!(
+                "{desc} {t:.0}C (warn {}, crit {})",
+                fmt_c(warn),
+                fmt_c(crit)
+            )
+        })
+        .collect();
+    format!("sensors: {}", items.join("; "))
+}
+
+/// One fan's control settings for the startup log: where it is wired, how
+/// its pwm is chosen, and the curve each of its sensors feeds.
+pub fn describe_fan(f: &FanProfile) -> String {
+    let tach = f
+        .fan_index
+        .map_or_else(|| "no tach".to_string(), |i| format!("tach fan{i}"));
+    let head = format!(
+        "fan '{}' ({} pwm{}, {tach})",
+        f.name, f.pwm_chip, f.pwm_index
+    );
+    if !f.enabled {
+        return format!("{head}: disabled");
+    }
+    if f.disabled_by_config {
+        return format!("{head}: disabled by config, left in BIOS/driver mode");
+    }
+    let sensors = f
+        .sensors
+        .iter()
+        .map(|s| {
+            let mut name = s.chip.clone();
+            if let Some(input) = &s.input {
+                name.push(' ');
+                name.push_str(input);
+            }
+            if let Some(label) = &s.label {
+                let _ = write!(name, " \"{label}\"");
+            }
+            let lo = s.min_temp_c.unwrap_or(f.min_temp_c);
+            let hi = s.max_temp_c.unwrap_or(f.max_temp_c);
+            format!("{name} {lo}-{hi}C")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sensors = if sensors.is_empty() {
+        "none".to_string()
+    } else {
+        sensors
+    };
+    let how = match f.mode {
+        FanMode::Fixed => match f.fixed_pwm {
+            Some(p) => format!(
+                "fixed pwm {p}, pwm {} while any sensor is critical",
+                f.max_pwm
+            ),
+            None => "fixed mode without fixed_pwm".to_string(),
+        },
+        FanMode::Curve => format!(
+            "curve: pwm {} at/below {}, ramp {}..{} up to {}, pwm {} at/above it \
+             (a stopped fan is kicked at pwm {})",
+            f.min_pwm,
+            fmt_c(f.min_temp_c),
+            f.min_stop_pwm,
+            f.max_pwm,
+            fmt_c(f.max_temp_c),
+            f.max_pwm,
+            f.min_start_pwm,
+        ),
+    };
+    format!("{head}: {how}; sensors (ramp start-full speed): {sensors}")
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TempUnits {
@@ -1465,6 +1577,74 @@ mod tests {
 
     fn parse(text: &str) -> (Config, Vec<String>) {
         Config::parse(text)
+    }
+
+    #[test]
+    fn startup_thresholds_list_overrides_and_label_the_fallback() {
+        let (cfg, errors) = parse(
+            "[temperature]\nwarn_threshold = 75.0\ncritical_threshold = 85.0\n\
+             [[temperature.thresholds]]\nchip = \"coretemp\"\nwarn_threshold = 90.0\n\
+             critical_threshold = 100.0\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            describe_thresholds(&cfg.temperature),
+            "coretemp 90C/100C, other chips 75C/85C"
+        );
+    }
+
+    #[test]
+    fn startup_sensors_show_the_thresholds_each_one_is_judged_against() {
+        let (cfg, _) = parse(
+            "[[temperature.thresholds]]\nchip = \"coretemp\"\nwarn_threshold = 90.0\n\
+             critical_threshold = 100.0\n",
+        );
+        let temps = vec![
+            (
+                "coretemp".to_string(),
+                "coretemp temp1 \"Package id 0\"".to_string(),
+                58.4,
+            ),
+            ("it8625".to_string(), "it8625 temp2".to_string(), 41.0),
+        ];
+        assert_eq!(
+            describe_sensors(&cfg.temperature, &temps),
+            "sensors: coretemp temp1 \"Package id 0\" 58C (warn 90C, crit 100C); \
+             it8625 temp2 41C (warn 75C, crit 85C)"
+        );
+        assert_eq!(
+            describe_sensors(&cfg.temperature, &[]),
+            "sensors: none detected"
+        );
+    }
+
+    #[test]
+    fn startup_fan_line_gives_the_curve_and_each_sensors_own_range() {
+        let fan = &default_fans()[0];
+        assert_eq!(
+            describe_fan(fan),
+            "fan 'chassis' (it8625 pwm1, tach fan1): curve: pwm 50 at/below 45C, \
+             ramp 55..255 up to 90C, pwm 255 at/above it (a stopped fan is kicked at pwm 60); \
+             sensors (ramp start-full speed): coretemp \"Package\" 45-90C, \
+             drivetemp 50-60C, nvme 60-70C, enp9s0 70-100C"
+        );
+    }
+
+    #[test]
+    fn startup_fan_line_covers_fixed_and_disabled_fans() {
+        let mut fan = default_fans()[0].clone();
+        fan.mode = FanMode::Fixed;
+        fan.fixed_pwm = Some(120);
+        assert!(
+            describe_fan(&fan).contains("fixed pwm 120, pwm 255 while any sensor is critical"),
+            "{}",
+            describe_fan(&fan)
+        );
+        fan.enabled = false;
+        assert_eq!(
+            describe_fan(&fan),
+            "fan 'chassis' (it8625 pwm1, tach fan1): disabled"
+        );
     }
 
     #[test]
