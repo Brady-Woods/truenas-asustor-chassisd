@@ -144,11 +144,7 @@ impl HealthMonitor {
     pub fn worst_temp(&self) -> Option<(Level, &str, f32)> {
         self.temps
             .values()
-            .max_by(|a, b| {
-                a.level
-                    .cmp(&b.level)
-                    .then(a.temp_c.total_cmp(&b.temp_c))
-            })
+            .max_by(|a, b| a.level.cmp(&b.level).then(a.temp_c.total_cmp(&b.temp_c)))
             .map(|t| (t.level, t.chip.as_str(), t.temp_c))
     }
 

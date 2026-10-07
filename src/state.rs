@@ -783,8 +783,8 @@ impl AppState {
             ));
         }
 
-        let pattern = alarm::most_critical(alarms.iter().cloned())
-            .map_or(StatusPattern::Ok, |a| a.pattern);
+        let pattern =
+            alarm::most_critical(alarms.iter().cloned()).map_or(StatusPattern::Ok, |a| a.pattern);
 
         HealthSummary {
             pool_healths,

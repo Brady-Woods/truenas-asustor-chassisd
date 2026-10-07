@@ -1006,8 +1006,7 @@ mod tests {
         let cfg = crate::config::Config::default();
         let temperature = &cfg.temperature;
         let mut c = FanController::new(cfg.fans[0].clone(), temperature);
-        let nic = cfg
-            .fans[0]
+        let nic = cfg.fans[0]
             .sensors
             .iter()
             .position(|s| s.chip == "enp9s0")
