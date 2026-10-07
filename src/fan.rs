@@ -58,7 +58,7 @@
 //! than this module guessing.
 
 use crate::config::{FanMode, FanProfile, TemperatureConfig, resolve_temp_threshold};
-use crate::hal::{glob_hwmon, read_sysfs_raw_f32, resolve_selector};
+use crate::hal::{glob_hwmon, is_over_range, read_sysfs_raw_f32, resolve_selector};
 use crate::socket::Level;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -455,10 +455,12 @@ impl FanController {
     /// that hot, it should be properly cooled, not just nudged back under
     /// the line. Logged on both transitions. Returns whether it's active.
     fn update_critical_override(&mut self, readings: &[(usize, f32)]) -> bool {
+        // An over-range reading (see `hal::is_over_range`) is hot whatever
+        // the configured thresholds say.
         let hot = readings
             .iter()
             .copied()
-            .find(|&(i, t)| t >= self.thresholds[i].1);
+            .find(|&(i, t)| t >= self.thresholds[i].1 || is_over_range(t));
         if let Some((i, temp_c)) = hot {
             if !self.critical_override {
                 self.critical_override = true;
@@ -467,15 +469,23 @@ impl FanController {
                     FanMode::Fixed => "fixed pwm",
                 };
                 crate::syslog::warning(&format!(
-                    "fan '{}' (pwm{}): {} at {temp_c:.1}C, at/above its critical {:.1}C -- \
+                    "fan '{}' (pwm{}): {} at {temp_c:.1}C{}, at/above its critical {:.1}C -- \
                      overriding {what} to max_pwm until everything is below warning",
                     self.profile.name,
                     self.profile.pwm_index,
                     self.profile.sensors[i].chip,
+                    if is_over_range(temp_c) {
+                        " (over-range: failed sensor or real emergency)"
+                    } else {
+                        ""
+                    },
                     self.thresholds[i].1
                 ));
             }
-        } else if self.critical_override && readings.iter().all(|&(i, t)| t < self.thresholds[i].0)
+        } else if self.critical_override
+            && readings
+                .iter()
+                .all(|&(i, t)| t < self.thresholds[i].0 && !is_over_range(t))
         {
             self.critical_override = false;
             crate::syslog::notice(&format!(
@@ -998,6 +1008,33 @@ mod tests {
         let after = curve_with(&mut c, Some(49.0), Some(40.0)).unwrap();
         assert!(after < 255, "got {after}");
         assert!(!c.status_line().contains("override"));
+    }
+
+    #[test]
+    fn an_over_range_reading_pegs_the_fan_even_above_misconfigured_thresholds() {
+        // Thresholds nobody could reach (warn/critical above the plausible
+        // range) must not hide a 130C reading.
+        let temperature = TemperatureConfig {
+            warn_threshold: 500.0,
+            critical_threshold: 600.0,
+            ..TemperatureConfig::default()
+        };
+        let mut c = FanController::new(
+            FanProfile {
+                sensors: vec![SensorSelector {
+                    chip: "coretemp".into(),
+                    ..SensorSelector::default()
+                }],
+                ..cfg()
+            },
+            &temperature,
+        );
+        c.sensor_cache = vec![(Some(Instant::now()), Some(130.0))];
+        assert_eq!(c.curve_target(), Some(255));
+        assert!(c.status_line().contains("critical-temp override"));
+        // Back in range: released (the huge warning threshold is cleared).
+        c.sensor_cache = vec![(Some(Instant::now()), Some(60.0))];
+        assert!(c.curve_target().unwrap() < 255);
     }
 
     #[test]

@@ -539,11 +539,15 @@ fn nvme_temp_for(dev_name: &str) -> Option<f32> {
     read_sysfs_f32(&format!("{hwmon}/temp1_input"))
 }
 
+/// Reads a millidegree sysfs value as degrees. Non-finite text ("nan",
+/// "inf", which `f32::parse` happily accepts) is never turned into a
+/// temperature: it reads as `None`, like any other unreadable value.
 pub fn read_sysfs_f32(path: &str) -> Option<f32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .map(|milli_c| milli_c / 1000.0)
+        .filter(|c| c.is_finite())
 }
 
 /// Every `tempN` input a hwmon instance exposes (base names only, e.g.
@@ -567,30 +571,50 @@ pub fn temp_inputs(hwmon: &str) -> Vec<String> {
     names
 }
 
-/// Reads one `tempN_input`, treating it as "not connected" (`None`) rather
-/// than a real value if either:
-/// - the kernel itself says so (`tempN_fault` == "1", a real signal some
-///   chips expose for an open/disconnected thermal diode), or
-/// - the reading is outside any plausible temperature for hardware that's
-///   actually there (deliberately generous bounds -- this is a last-resort
-///   sanity net, not a warning threshold).
+/// Readings below this are not a temperature a real, wired-up sensor
+/// gives: they are what an unconnected input reads (this board's `it8625`
+/// `temp1`-`temp3` sit at a constant -128C, see `asustor-platform-driver`'s
+/// CLAUDE.md). Excluded as "not connected".
+pub const PLAUSIBLE_MIN_C: f32 = -20.0;
+/// Readings above this are over-range: a sensor that really is that hot,
+/// or one that has failed high. Either way the safe response is cooling,
+/// so they are *kept* (and fans treat them as critical, see
+/// `is_over_range`), never dropped.
+pub const PLAUSIBLE_MAX_C: f32 = 125.0;
+
+/// True for a reading above `PLAUSIBLE_MAX_C`: reported by the sensor, but
+/// too hot to be anything but an emergency or a fault. Consumers treat it
+/// as critical (fans go to `max_pwm`) whatever the configured thresholds.
+pub fn is_over_range(celsius: f32) -> bool {
+    celsius > PLAUSIBLE_MAX_C
+}
+
+/// Reads one `tempN_input` in degrees C. The exact rule:
+/// - `tempN_fault` == "1" (a real kernel signal for an open/disconnected
+///   thermal diode): `None`, not connected.
+/// - unreadable, or not a finite number ("nan"/"inf"): `None`.
+/// - below `PLAUSIBLE_MIN_C` (-20C): `None`, garbage from an unwired input.
+/// - above `PLAUSIBLE_MAX_C` (125C): `Some`, kept -- over-range is treated
+///   as HOT by fan control and the health monitor, not as a missing
+///   sensor, because dropping it would let a failed-high sensor *remove*
+///   cooling.
+/// - otherwise `Some`.
 ///
-/// Exists because this board's `it8625` onboard `temp1`-`temp3` have no
-/// diode wired to them at all and read a constant, wildly-out-of-range
-/// value forever (see `asustor-platform-driver`'s CLAUDE.md) -- with
-/// nothing filtering that out, a naive "read every temp this chip has"
-/// sensor selector would let a permanently-disconnected input drag a fan
-/// curve's `max()` up to full speed forever.
+/// The lower bound exists because this board's `it8625` onboard
+/// `temp1`-`temp3` have no diode wired to them at all and read a constant
+/// -128C forever -- with nothing filtering that out, a naive "read every
+/// temp this chip has" sensor selector would let a permanently
+/// disconnected input stand in for a real reading. A board whose unwired
+/// input reads a constant *high* garbage value would instead pin its fan
+/// at full speed with a critical alarm; narrow the selector with `input`
+/// or `label` to the sensors that are real.
 pub fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
-    const PLAUSIBLE_MIN_C: f32 = -20.0;
-    const PLAUSIBLE_MAX_C: f32 = 125.0;
     if let Ok(s) = std::fs::read_to_string(format!("{hwmon}/{input}_fault"))
         && s.trim() == "1"
     {
         return None;
     }
-    read_sysfs_f32(&format!("{hwmon}/{input}_input"))
-        .filter(|&t| (PLAUSIBLE_MIN_C..=PLAUSIBLE_MAX_C).contains(&t))
+    read_sysfs_f32(&format!("{hwmon}/{input}_input")).filter(|&t| t >= PLAUSIBLE_MIN_C)
 }
 
 /// All temp readings matching a `SensorSelector` (config.rs) across every
@@ -600,8 +624,14 @@ pub fn read_temp_input(hwmon: &str, input: &str) -> Option<f32> {
 /// contribute nothing, same as an empty drive bay having no hwmon instance
 /// at all.
 pub fn resolve_selector(sel: &crate::config::SensorSelector) -> Vec<f32> {
+    resolve_selector_in(Path::new(HWMON_ROOT), sel)
+}
+
+/// `resolve_selector` against a hwmon tree rooted at `root` (a fixture, in
+/// tests).
+pub fn resolve_selector_in(root: &Path, sel: &crate::config::SensorSelector) -> Vec<f32> {
     let mut out = Vec::new();
-    let Some(hwmons) = glob_hwmon(&sel.chip) else {
+    let Some(hwmons) = glob_hwmon_in(root, &sel.chip) else {
         return out;
     };
     for hwmon in hwmons {
@@ -753,21 +783,99 @@ fn fan1_rpm() -> Option<f32> {
     None
 }
 
+/// Reads a plain sysfs number (an RPM, say); non-finite text is `None`.
 pub fn read_sysfs_raw_f32(path: &str) -> Option<f32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
 }
 
-pub fn glob_hwmon(name_prefix: &str) -> Option<Vec<String>> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+const HWMON_ROOT: &str = "/sys/class/hwmon";
+
+/// The hwmon instances of the chip named `chip`, as sysfs paths in a
+/// stable order (`hwmon2` before `hwmon10`). `None` if the hwmon class
+/// can't be listed at all; `Some(vec![])` if nothing matches.
+///
+/// Matching: an instance whose `name` is exactly `chip` wins, and when any
+/// exist only those are returned. Only when none match exactly does it
+/// fall back to instances whose name merely *starts with* `chip` (so a
+/// config written as "nvme" still finds "nvme", and a family prefix keeps
+/// working where no exact chip exists). A prefix never adds to an exact
+/// match -- "it87" asking for a pwm chip must not quietly pick up a second
+/// "it8625" next to the "it87" it meant. For a fan's `pwm_chip`, name the
+/// chip exactly.
+pub fn glob_hwmon(chip: &str) -> Option<Vec<String>> {
+    glob_hwmon_in(Path::new(HWMON_ROOT), chip)
+}
+
+/// `glob_hwmon` against a hwmon tree rooted at `root`.
+pub fn glob_hwmon_in(root: &Path, chip: &str) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(root).ok()?;
+    if chip.is_empty() {
+        return Some(Vec::new());
+    }
+    let (mut exact, mut prefixed) = (Vec::new(), Vec::new());
+    for entry in entries.flatten() {
         let path = entry.path();
-        if let Ok(name) = std::fs::read_to_string(path.join("name"))
-            && name.trim().starts_with(name_prefix)
-        {
-            found.push(path.to_string_lossy().to_string());
+        let Ok(name) = std::fs::read_to_string(path.join("name")) else {
+            continue;
+        };
+        let name = name.trim();
+        if name == chip {
+            exact.push(path);
+        } else if name.starts_with(chip) {
+            prefixed.push(path);
         }
     }
-    Some(found)
+    let mut found = if exact.is_empty() { prefixed } else { exact };
+    // Shorter file name first, so hwmon9 sorts before hwmon10.
+    found.sort_by_key(|p| {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+        (name.as_ref().map(String::len), name)
+    });
+    Some(
+        found
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// A scratch `/sys/class/hwmon` stand-in for tests, removed on drop.
+#[cfg(test)]
+pub(crate) struct HwmonTree(pub std::path::PathBuf);
+
+#[cfg(test)]
+impl HwmonTree {
+    pub fn new(tag: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("lcm-status-hwmon-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        HwmonTree(dir)
+    }
+
+    /// Adds `<root>/<dir>/name` (and each `(file, content)` beside it);
+    /// returns the instance's path.
+    pub fn chip(&self, dir: &str, name: &str, files: &[(&str, &str)]) -> String {
+        let path = self.0.join(dir);
+        std::fs::create_dir_all(&path).expect("create hwmon dir");
+        std::fs::write(path.join("name"), format!("{name}\n")).expect("write name");
+        for (file, content) in files {
+            std::fs::write(path.join(file), content).expect("write attr");
+        }
+        path.to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
+impl Drop for HwmonTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Docker: any container not "healthy" or plain "Up" (running, no healthcheck).
@@ -896,5 +1004,130 @@ mod tests {
             "took {:?}",
             start.elapsed()
         );
+    }
+
+    fn sel(chip: &str) -> crate::config::SensorSelector {
+        crate::config::SensorSelector {
+            chip: chip.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn glob_hwmon_exact_name_wins_over_prefix_matches() {
+        let t = HwmonTree::new("glob-exact");
+        t.chip("hwmon0", "it8625", &[]);
+        t.chip("hwmon1", "it8625e", &[]);
+        t.chip("hwmon2", "coretemp", &[]);
+        let got = glob_hwmon_in(&t.0, "it8625").unwrap();
+        assert_eq!(got, vec![t.0.join("hwmon0").to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn glob_hwmon_falls_back_to_prefix_only_without_an_exact_match() {
+        let t = HwmonTree::new("glob-prefix");
+        t.chip("hwmon0", "it8625e", &[]);
+        t.chip("hwmon1", "coretemp", &[]);
+        assert_eq!(glob_hwmon_in(&t.0, "it86").unwrap().len(), 1);
+        assert!(glob_hwmon_in(&t.0, "nvme").unwrap().is_empty());
+        // An empty name matches nothing rather than everything.
+        assert!(glob_hwmon_in(&t.0, "").unwrap().is_empty());
+        // Unlistable root is None, not empty.
+        assert!(glob_hwmon_in(&t.0.join("nope"), "it8625").is_none());
+    }
+
+    #[test]
+    fn glob_hwmon_is_sorted_numerically_and_keeps_existing_chip_names() {
+        let t = HwmonTree::new("glob-sort");
+        for (dir, name) in [
+            ("hwmon10", "drivetemp"),
+            ("hwmon2", "drivetemp"),
+            ("hwmon9", "drivetemp"),
+            ("hwmon3", "nvme"),
+            ("hwmon4", "coretemp"),
+        ] {
+            t.chip(dir, name, &[]);
+        }
+        let dirs = |chip: &str| -> Vec<String> {
+            glob_hwmon_in(&t.0, chip)
+                .unwrap()
+                .iter()
+                .map(|p| p.rsplit('/').next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(dirs("drivetemp"), ["hwmon2", "hwmon9", "hwmon10"]);
+        assert_eq!(dirs("nvme"), ["hwmon3"]);
+        assert_eq!(dirs("coretemp"), ["hwmon4"]);
+    }
+
+    fn read_one(tag: &str, value: &str, fault: Option<&str>) -> Option<f32> {
+        let t = HwmonTree::new(tag);
+        let mut extra = Vec::new();
+        if let Some(f) = fault {
+            extra.push(("temp1_fault", f));
+        }
+        let hwmon = t.chip("hwmon0", "chip", &extra);
+        std::fs::write(format!("{hwmon}/temp1_input"), value).unwrap();
+        read_temp_input(&hwmon, "temp1")
+    }
+
+    #[test]
+    fn plausible_readings_pass_through() {
+        assert_eq!(read_one("rt-ok", "45000\n", None), Some(45.0));
+        assert_eq!(read_one("rt-edge", "125000", None), Some(125.0));
+        assert_eq!(read_one("rt-cold", "-20000", None), Some(-20.0));
+    }
+
+    #[test]
+    fn the_it8625_constant_garbage_is_not_a_reading() {
+        // -128C, per the platform driver's CLAUDE.md.
+        assert_eq!(read_one("rt-garbage", "-128000", None), None);
+    }
+
+    #[test]
+    fn over_range_is_kept_and_flagged_hot_not_dropped() {
+        let t = read_one("rt-hot", "130000", None).expect("kept");
+        assert!(is_over_range(t));
+        assert!(!is_over_range(125.0));
+        assert_eq!(read_one("rt-huge", "900000", None), Some(900.0));
+    }
+
+    #[test]
+    fn fault_flag_means_disconnected_even_when_the_value_is_hot() {
+        assert_eq!(read_one("rt-fault", "200000", Some("1\n")), None);
+        assert_eq!(read_one("rt-nofault", "200000", Some("0\n")), Some(200.0));
+    }
+
+    #[test]
+    fn non_finite_text_is_never_a_temperature() {
+        for bad in ["nan", "NaN", "inf", "-inf", "infinity", "", "garbage"] {
+            assert_eq!(read_one("rt-nan", bad, None), None, "{bad:?}");
+        }
+        // Finite in text but overflowing f32 -> infinite after parsing.
+        assert_eq!(read_one("rt-overflow", "1e999", None), None);
+        let t = HwmonTree::new("raw-nan");
+        let hwmon = t.chip("hwmon0", "it8625", &[("fan1_input", "nan")]);
+        assert_eq!(read_sysfs_raw_f32(&format!("{hwmon}/fan1_input")), None);
+        std::fs::write(format!("{hwmon}/fan1_input"), "1800\n").unwrap();
+        assert_eq!(
+            read_sysfs_raw_f32(&format!("{hwmon}/fan1_input")),
+            Some(1800.0)
+        );
+    }
+
+    #[test]
+    fn resolve_selector_reads_every_matching_input_and_skips_unwired_ones() {
+        let t = HwmonTree::new("resolve");
+        t.chip(
+            "hwmon0",
+            "it8625",
+            &[("temp1_input", "-128000"), ("temp2_input", "44000")],
+        );
+        t.chip("hwmon1", "drivetemp", &[("temp1_input", "38000")]);
+        let mut it = resolve_selector_in(&t.0, &sel("it8625"));
+        it.sort_by(f32::total_cmp);
+        assert_eq!(it, vec![44.0]);
+        assert_eq!(resolve_selector_in(&t.0, &sel("drivetemp")), vec![38.0]);
+        assert!(resolve_selector_in(&t.0, &sel("coretemp")).is_empty());
     }
 }
