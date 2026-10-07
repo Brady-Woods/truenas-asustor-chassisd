@@ -474,10 +474,12 @@ frozen with nothing watching temperatures:
 - The fan thread publishes a heartbeat; if it stops making progress for
   15s (a hung sysfs write) the daemon exits, hands the fans back at full
   speed and systemd restarts it. `lcm-status.service` also sets
-  `WatchdogSec=30`: the daemon pings systemd's watchdog (a minimal
-  `sd_notify`, no dependency) from its main loop only while the fan thread
-  is alive, so a stuck daemon is restarted too. Without `NOTIFY_SOCKET`
-  (run by hand) this does nothing.
+  `WatchdogSec=60`: a dedicated thread pings systemd's watchdog (a minimal
+  `sd_notify`, no dependency) only while the fan thread's heartbeat is
+  under 15s old and the main loop has made progress within the last 300s,
+  so a wedged fan thread or main loop is restarted, while a slow
+  `zpool`/`smartctl`/`docker` refresh is not mistaken for one. Without
+  `NOTIFY_SOCKET` (run by hand) this does nothing.
 - `pwmN_enable` is set to manual before *every* write. In automatic mode
   the it87 driver rejects pwm writes, and on this board automatic mode
   stops the fan entirely (0 RPM).
@@ -1110,7 +1112,11 @@ config, so you can preview edits before restarting the daemon.
   LEDs, the buzzer and the locate blinks, and ask for the `STATUS` report
   (live health details). It cannot run commands or change the
   config through the socket, but it can hide a real alarm behind its own
-  message for as long as it keeps sending. Only add accounts and services
+  message for as long as it keeps sending. What it cannot do is starve the
+  daemon: the command queue (64), concurrent connections (16), request time
+  (5 s) and chassis-locate beeps (one per 30 s) are bounded, malformed
+  requests get an `ERR` reply, and the socket is created `0660` with its
+  group before it appears (and removed on clean shutdown). Only add accounts and services
   you'd trust with the front panel; anything that can reach the socket
   (a bind-mounted `/run`, for example) has the same power.
 - **Root runs a binary straight from the checkout** (`target/release/lcm-status`;

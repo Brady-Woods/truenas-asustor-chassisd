@@ -29,9 +29,12 @@ were reconstructed from git history.
   then forces manual mode at full speed on every enabled fan from a
   time-limited helper thread.
 - **systemd watchdog.** A minimal `sd_notify` in safe std (`WATCHDOG=1`
-  over `$NOTIFY_SOCKET`, path or abstract), sent from the main loop only
-  while the fan heartbeat is fresh; the unit gets `WatchdogSec=30` and
-  `NotifyAccess=main`. A no-op without `NOTIFY_SOCKET`.
+  over `$NOTIFY_SOCKET`, path or abstract), sent by a dedicated thread only
+  while the fan heartbeat is under 15s old and the main loop has made
+  progress within 300s (so a slow `zpool`/`smartctl`/`docker` refresh does
+  not get the daemon killed, but a wedged fan thread or main loop does); the
+  unit gets `WatchdogSec=60` and `NotifyAccess=main`. A no-op without
+  `NOTIFY_SOCKET`.
 - **Service sandboxing.** `NoNewPrivileges`, `RestrictSUIDSGID`,
   `LockPersonality`, `PrivateTmp`, `ProtectHome`, `RestrictAddressFamilies`
   and a fixed `PATH`. `ProtectSystem`, `ProtectKernel*`, `PrivateDevices`
@@ -114,6 +117,11 @@ were reconstructed from git history.
 
 ### Fixed
 
+- The fan is taken over within about 500ms of start instead of one
+  `update_secs` later (the first control pass waits briefly for the first
+  sensor samples), and `[[fans]] update_secs` is clamped to 1..=60 with a
+  diagnostic. Sensor reader threads are named by index, so a NUL byte in a
+  `[[fans.sensors]]` chip name can no longer panic the fan thread.
 - A config value such as `dwell_secs = 9223372036854775807` panicked the
   daemon on its first tick (`Instant + Duration` overflow). Every user
   duration feeding an `Instant` (rotation, menu, refresh) is clamped to a
