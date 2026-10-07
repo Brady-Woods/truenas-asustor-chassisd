@@ -701,7 +701,9 @@ allows a short burst up to 25W. The CPU's own thermal throttling at TjMax
 (105C) is unaffected; the daemon's trip point is the `coretemp` critical
 threshold (100C by default). Set the `stock_*` keys to whatever "safe" means
 for your box. Invalid values (zero, PL2 below PL1, over 100W) disable the
-feature with a diagnostic rather than guessing. `status` shows the current
+feature with a diagnostic rather than guessing. Turning `enabled` off again
+doesn't touch the zone: limits already applied stay until the next reboot
+(or `echo` the stock values back). `status` shows the current
 limits and, after a trip, why.
 
 ## Health monitoring (syslog)
