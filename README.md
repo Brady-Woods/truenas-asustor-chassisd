@@ -13,6 +13,9 @@ hardware directly instead of trying to run ADM's binary.
 (Fan control isn't really "front-panel" hardware, but lives in this same
 daemon anyway -- see "Fan control" below for why.)
 
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). Bug reports
+and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Requirements
 
 - **The [asustor-platform-driver fork](https://github.com/Brady-Woods/asustor-platform-driver), `main`, v0.3 or later**
