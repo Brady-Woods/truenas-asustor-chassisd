@@ -1361,6 +1361,18 @@ broken:x:notanumber:
     }
 
     #[test]
+    fn the_default_group_name_is_found_in_a_truenas_style_group_file() {
+        let truenas = "root:x:0:\nbuiltin_administrators:x:544:alice\nbuiltin_users:x:545:\n";
+        assert_eq!(
+            parse_group_gid(truenas, crate::config::DEFAULT_SOCKET_GROUP),
+            Some(544)
+        );
+        assert_eq!(parse_group_gid(truenas, "builtin_users"), Some(545));
+        // The old purpose-made group is simply absent there.
+        assert_eq!(parse_group_gid(truenas, "lcm-status"), None);
+    }
+
+    #[test]
     fn the_socket_is_chowned_to_the_configured_group() {
         let dir = scratch_dir("chown");
         let file = dir.join("target");
@@ -1406,6 +1418,26 @@ broken:x:notanumber:
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, ["lcm.sock"], "left over: {names:?}");
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_group_leaves_the_socket_with_its_creators_group() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch_dir("rootonly");
+        let group_file = dir.join("group");
+        std::fs::write(&group_file, "root:x:0:\nbuiltin_users:x:545:\n").unwrap();
+        let path = dir.join("lcm.sock");
+        let (tx, _rx) = command_channel();
+        let guard = spawn_with(&path, "builtin_administrators", &group_file, tx, FAST).unwrap();
+        // Nothing was chowned: the socket keeps the group of the process
+        // that made it (root:root for the daemon), not some other group.
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.gid(), std::fs::metadata(&plain).unwrap().gid());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
         drop(guard);
         std::fs::remove_dir_all(dir).unwrap();
     }

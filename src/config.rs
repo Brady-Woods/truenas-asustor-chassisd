@@ -357,12 +357,19 @@ impl Default for LedConfig {
     }
 }
 
+/// TrueNAS SCALE's middleware always provides this group (gid 544) and
+/// regenerates `/etc/group` from it at boot, so no purpose-made group is
+/// needed.
+pub const DEFAULT_SOCKET_GROUP: &str = "builtin_administrators";
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct SocketConfig {
     pub path: String,
     /// Group allowed to connect (e.g. so another daemon like an LED
-    /// controller can push text without running as root).
+    /// controller can push text without running as root). Defaults to
+    /// TrueNAS's always-present `builtin_administrators`; if the named
+    /// group doesn't exist the socket stays root-only.
     pub group: String,
 }
 
@@ -370,7 +377,7 @@ impl Default for SocketConfig {
     fn default() -> Self {
         SocketConfig {
             path: "/run/lcm-status.sock".to_string(),
-            group: "lcm-status".to_string(),
+            group: DEFAULT_SOCKET_GROUP.to_string(),
         }
     }
 }
@@ -1596,6 +1603,28 @@ mod tests {
         assert!(!cfg.power_schedule[1].enabled);
         // The rest of the file still applies.
         assert_eq!(cfg.sleep.start, "21:00");
+    }
+
+    #[test]
+    fn the_default_socket_group_is_a_builtin_truenas_group() {
+        assert_eq!(Config::default().socket.group, "builtin_administrators");
+        let (cfg, diagnostics) = parse("");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(cfg.socket.group, "builtin_administrators");
+    }
+
+    #[test]
+    fn a_config_naming_the_old_socket_group_still_parses() {
+        let (cfg, diagnostics) = parse("[socket]\ngroup = \"lcm-status\"\n");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(cfg.socket.group, "lcm-status");
+        assert_eq!(cfg.socket.path, "/run/lcm-status.sock");
+    }
+
+    #[test]
+    fn example_config_uses_the_default_socket_group() {
+        let (cfg, _) = parse(include_str!("../lcm-status.example.toml"));
+        assert_eq!(cfg.socket.group, DEFAULT_SOCKET_GROUP);
     }
 
     #[test]

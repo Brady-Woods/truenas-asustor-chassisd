@@ -66,7 +66,7 @@ lcd_off = true            # display fully off at night (backlight too); buttons 
 
 [socket]
 path = "/run/lcm-status.sock"
-group = "lcm-status"
+group = "builtin_administrators"
 
 [screens]
 network = true

@@ -28,7 +28,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_PATH="$SCRIPT_DIR/target/release/lcm-status"
 CONFIG_PATH=/etc/lcm-status.toml
 UNIT_PATH=/etc/systemd/system/lcm-status.service
-GROUP=lcm-status
 
 log() { echo "==> $*"; }
 fail() { echo "FAILED: $*" >&2; exit 1; }
@@ -191,31 +190,29 @@ check_not_in_home "$SCRIPT_DIR"
 physical_dir="$(cd "$SCRIPT_DIR" && pwd -P 2>/dev/null)" || physical_dir=""
 [ "$physical_dir" = "$SCRIPT_DIR" ] || check_not_in_home "$physical_dir"
 
-# --- 3. Group for socket access --------------------------------------------
+# --- 3. Socket group check ---------------------------------------------------
 #
-# TrueNAS regenerates /etc/group from its config database at boot, so a
-# group added with groupadd is gone after a reboot (and the daemon's chgrp of
-# its socket fails: "invalid group"). Create it through the middleware so
-# it's in that database; plain groupadd only where there's no middleware.
-ensure_group() {
-    if command -v midclt >/dev/null 2>&1; then
-        json_group="$(json_escape "$GROUP")"
-        existing="$(midclt call group.query "[[\"group\", \"=\", \"$json_group\"]]" 2>/dev/null || echo error)"
-        if [ "$existing" = "[]" ]; then
-            if midclt call group.create "{\"name\": \"$json_group\", \"smb\": false}" >/dev/null 2>&1; then
-                log "Created group '$GROUP' in the TrueNAS config database (persists across reboots)."
-            else
-                log "WARNING: creating group '$GROUP' through the TrueNAS middleware failed; adding it to /etc/group only (lost at the next reboot)."
-            fi
-        elif [ "$existing" = error ]; then
-            log "WARNING: couldn't query the TrueNAS middleware for group '$GROUP'."
-        fi
+# The daemon's socket belongs to the group named by `[socket] group` in the
+# installed config, which defaults to TrueNAS's built-in
+# `builtin_administrators` (always present, regenerated from the middleware
+# at boot), so there is nothing to create. This only warns, and never fails:
+# a missing group just leaves the socket root-only. An existing
+# `lcm-status` group from an older install is left alone.
+check_socket_group() {
+    sock_group=builtin_administrators
+    if [ -r "$CONFIG_PATH" ]; then
+        # First `group = "..."` line inside the [socket] table, if any.
+        configured="$(sed -n '/^[[:space:]]*\[socket\][[:space:]]*$/,/^[[:space:]]*\[/{
+            s/^[[:space:]]*group[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p
+        }' "$CONFIG_PATH" 2>/dev/null | head -n 1)" || configured=""
+        [ -z "$configured" ] || sock_group="$configured"
     fi
-    getent group "$GROUP" >/dev/null 2>&1 || groupadd -f "$GROUP"
-    log "Group '$GROUP' present."
+    if getent group "$sock_group" >/dev/null 2>&1; then
+        log "Socket group '$sock_group' exists."
+    else
+        log "WARNING: socket group '$sock_group' (from $CONFIG_PATH [socket] group) is not in the group database; the control socket will stay root-only until it exists or the config names another group."
+    fi
 }
-log "Ensuring group '$GROUP' exists..."
-ensure_group
 
 # --- 4. Binary needs no install step -- it runs straight from the build
 # output in this checkout ($BIN_PATH); see the note above on why.
@@ -227,6 +224,9 @@ if [ ! -f "$CONFIG_PATH" ]; then
 else
     log "Config already exists at $CONFIG_PATH, leaving it alone."
 fi
+
+log "Checking the control socket's group..."
+check_socket_group
 
 # --- 6. systemd unit -------------------------------------------------------
 # Substitute the real binary path (this checkout, see $BIN_PATH above) in
