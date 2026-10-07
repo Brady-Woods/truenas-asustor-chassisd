@@ -9,6 +9,9 @@ publish = false
 
 [profile.release]
 opt-level = 2
+# A wrapped counter or time delta would silently misbehave; a panic is
+# restarts the daemon (Restart=on-failure) instead.
+overflow-checks = true
 
 [dependencies]
 libc = "0.2"

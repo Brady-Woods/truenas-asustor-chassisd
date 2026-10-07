@@ -82,7 +82,8 @@ fn deadline_after(secs: u64) -> Instant {
 /// while it's still running.
 fn secs_left(t: Instant) -> u64 {
     let left = t.saturating_duration_since(Instant::now());
-    left.as_secs() + u64::from(left.subsec_nanos() > 0)
+    left.as_secs()
+        .saturating_add(u64::from(left.subsec_nanos() > 0))
 }
 
 #[derive(Debug)]
@@ -1533,7 +1534,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// still time: "0:42", or whole minutes ("15m") from 10 minutes up, so
 /// "SHUTDOWN IN ..." always fits on one 16-char line without scrolling.
 fn countdown_text(left: Duration) -> String {
-    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    let secs = left
+        .as_secs()
+        .saturating_add(u64::from(left.subsec_nanos() > 0));
     if secs >= 600 {
         format!("{}m", secs.div_ceil(60))
     } else {
