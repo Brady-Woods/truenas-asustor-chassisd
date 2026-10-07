@@ -834,9 +834,15 @@ check-config`.
 
 ## The socket protocol
 
-`/run/lcm-status.sock` (configurable), a Unix socket owned `root:lcm-status`
-(`0660`) so a non-root LED/status daemon can be added to that group instead
-of needing to run as root. Newline-delimited; each connection sends one
+`/run/lcm-status.sock` (configurable), a Unix socket owned
+`root:builtin_administrators` (`0660`) by default, so TrueNAS administrators
+(and a non-root LED/status daemon added to that group) can use it without
+being root. That is TrueNAS SCALE's built-in administrators group (gid 544),
+which the middleware always provides and regenerates at boot, so nothing has
+to be created. Set `group` under `[socket]` in `/etc/lcm-status.toml` to use
+a different one (for example `builtin_users`, or a group of your own; a
+config that still says `group = "lcm-status"` keeps working as long as that
+group exists). Newline-delimited; each connection sends one
 message, optionally a header line plus up to two content lines, then
 closes.
 
@@ -844,7 +850,8 @@ The socket is created with its final mode and group already in place (it is
 bound in a private `0700` directory next to it and renamed into position),
 and removed again when the daemon stops cleanly. The group is looked up in
 `/etc/group`; if it isn't there (or the `chown` fails) the daemon logs a
-warning and the socket stays `root:root`, usable by root only. A socket path
+warning and the socket stays `root:root`, usable by root only -- it never
+falls back to anything wider. A socket path
 too long to stage this way is bound in place and fixed up right afterwards.
 
 ```
@@ -999,9 +1006,10 @@ sudo lcm-status status [config-path]
 The one request/response exception to the fire-and-forget protocol above:
 sends `STATUS`, and the running daemon writes back a full terminal-
 readable report (`report.rs`) instead of just accepting a display
-command. Needs root or membership in the socket's group (same
-`root:lcm-status`, `0660` as everything else here) -- there's nothing
-being written to the display, but the report itself covers privileged
+command. Needs root or membership in the socket's group (by default
+`builtin_administrators`; the same `0660` as everything else here), and the
+same goes for `lcm-status locate`; run as anyone else they can't connect.
+Nothing is written to the display, but the report itself covers privileged
 reads (SMART, pool health).
 
 Talks to whatever's *actually running*, not a fresh recomputation --
@@ -1106,8 +1114,10 @@ config, so you can preview edits before restarting the daemon.
 - **The daemon runs as root**, on purpose: it drives `/dev/ttyS1`, writes
   sysfs/hwmon/LED/RTC attributes, loads modules and calls
   `systemctl poweroff`/`reboot`.
-- **Members of the `lcm-status` socket group are trusted.** The socket
-  (`0660`, `root:lcm-status`) has no authentication beyond that. A member
+- **Members of the socket's group are trusted** -- by default
+  `builtin_administrators`, i.e. the people who can already administer the
+  box (change the group with `[socket] group`). The socket (`0660`,
+  `root:builtin_administrators`) has no authentication beyond that. A member
   can put arbitrary text and alerts on the LCD, drive the status/bay
   LEDs, the buzzer and the locate blinks, and ask for the `STATUS` report
   (live health details). It cannot run commands or change the
@@ -1117,7 +1127,7 @@ config, so you can preview edits before restarting the daemon.
   (5 s) and chassis-locate beeps (one per 30 s) are bounded, malformed
   requests get an `ERR` reply, and the socket is created `0660` with its
   group before it appears (and removed on clean shutdown). Only add accounts and services
-  you'd trust with the front panel; anything that can reach the socket
+  to that group if you'd trust them with the front panel; anything that can reach the socket
   (a bind-mounted `/run`, for example) has the same power.
 - **Root runs a binary straight from the checkout** (`target/release/lcm-status`;
   `deploy.sh` also runs from there at every boot). Whoever can write to the
@@ -1148,9 +1158,9 @@ is the whole build+install pipeline: checks the driver dependency first
 and refuses to continue without it, builds in a throwaway container
 (nothing installed on the host toolchain-wise) -- only when the source
 changed since the last build, so the boot-time run doesn't need Docker,
-which isn't up yet when Post Init scripts run -- creates the `lcm-status`
-socket group through the TrueNAS middleware (so it's in the config
-database and survives reboots), installs the config only
+which isn't up yet when Post Init scripts run -- checks (warning, never failing) that the socket's
+group from the config exists -- by default TrueNAS's built-in
+`builtin_administrators`, so no group is created -- installs the config only
 if one doesn't already exist (never clobbers edits), installs and enables
 the systemd unit, and registers itself as a TrueNAS **POSTINIT
 Init/Shutdown Script** (`midclt call initshutdownscript.query`) so the
@@ -1166,7 +1176,7 @@ straight out of this checkout (the systemd unit's `ExecStart` points at
 carried forward from update to update -- which is fine, since `deploy.sh`
 reinstalls both every run rather than treating first-install as special.
 What's actually durable is TrueNAS's own config database, which is where
-Init/Shutdown Scripts live (and the `lcm-status` group). So even a fresh
+Init/Shutdown Scripts live. So even a fresh
 boot environment missing the systemd unit and everything else under `/etc`
 will self-heal on its very first boot, with no manual re-deploy step.
 
