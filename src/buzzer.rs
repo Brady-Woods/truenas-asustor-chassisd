@@ -18,16 +18,30 @@
 //! a restart (and logged).
 //!
 //! Beeps play on a worker thread so the event loop never waits out an
-//! 800 ms tone; patterns requested while one is playing queue behind it.
+//! 800 ms tone; patterns requested while one is playing queue behind it,
+//! up to `BEEP_QUEUE_DEPTH` (a full queue drops the beep: never blocks the
+//! caller, never builds up minutes of backlog).
 
 use crate::config::BuzzerConfig;
 use crate::syslog;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, mpsc};
+use std::sync::mpsc::{self, TrySendError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Beeps that may wait behind the one playing; later ones are dropped.
+const BEEP_QUEUE_DEPTH: usize = 8;
+
+/// The longest `flush` waits, in all, for the queue to empty.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum gap between chassis-`LOCATE` beeps (alert beeps are limited
+/// by their caller, to 60 s), so a script repeating `LOCATE` can't keep
+/// the chassis beeping.
+const FIND_ME_INTERVAL: Duration = Duration::from_secs(30);
 
 /// ADM's pitch.
 const TONE_HZ: i32 = 2000;
@@ -81,15 +95,13 @@ pub fn boot_finished() {
     play_if(|c| c.boot, Beep::Long);
 }
 
-/// Blocks until every queued beep has finished. Call before exiting: the
-/// process can then exit (and the machine power off) without cutting one
-/// short or leaving a tone playing.
+/// Waits until every queued beep has finished, but at most
+/// `FLUSH_TIMEOUT`. Call before exiting: the process can then exit (and
+/// the machine power off) without cutting one short or leaving a tone
+/// playing, and a wedged speaker device can't hold the exit up.
 pub fn flush() {
-    if let Some((Buzzer { tx: Some(tx) }, _)) = GLOBAL.get() {
-        let (done, wait) = mpsc::channel();
-        if tx.send(Msg::Flush(done)).is_ok() {
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-        }
+    if let Some((buzzer, _)) = GLOBAL.get() {
+        buzzer.flush(FLUSH_TIMEOUT);
     }
 }
 
@@ -98,9 +110,14 @@ pub fn powering_down() {
     play_if(|c| c.power, Beep::Short);
 }
 
-/// A chassis `LOCATE` started.
+/// A chassis `LOCATE` started. Beeps at most once per `FIND_ME_INTERVAL`.
 pub fn find_me() {
-    play_if(|c| c.find_me, Beep::Short);
+    if let Some((buzzer, cfg)) = GLOBAL.get()
+        && cfg.find_me
+        && buzzer.find_me_allowed(Instant::now())
+    {
+        buzzer.beep(Beep::Short);
+    }
 }
 
 /// A warning/error/critical alert was raised. The caller rate-limits.
@@ -132,28 +149,77 @@ enum Msg {
 
 /// Handle to the beeper thread. Silent (and free) when disabled.
 struct Buzzer {
-    tx: Option<mpsc::Sender<Msg>>,
+    tx: Option<mpsc::SyncSender<Msg>>,
+    /// When the last `find_me` beep was let through.
+    find_me_last: Mutex<Option<Instant>>,
 }
 
 impl Buzzer {
     fn new(enabled: bool) -> Self {
         if !enabled {
-            return Buzzer { tx: None };
+            return Buzzer::with_sender(None);
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(BEEP_QUEUE_DEPTH);
         let spawned = thread::Builder::new()
             .name("buzzer".into())
             .spawn(move || worker(&rx));
         if let Err(e) = spawned {
             syslog::warning(&format!("buzzer: could not start thread: {e}"));
-            return Buzzer { tx: None };
+            return Buzzer::with_sender(None);
         }
-        Buzzer { tx: Some(tx) }
+        Buzzer::with_sender(Some(tx))
     }
 
+    fn with_sender(tx: Option<mpsc::SyncSender<Msg>>) -> Self {
+        Buzzer {
+            tx,
+            find_me_last: Mutex::new(None),
+        }
+    }
+
+    /// Queues a beep, or drops it if the queue is full. Never waits.
     fn beep(&self, beep: Beep) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Msg::Beep(beep));
+            // Full: plenty already waiting to be heard. Disconnected: the
+            // worker is gone, nothing left to do about it here.
+            let _ = tx.try_send(Msg::Beep(beep));
+        }
+    }
+
+    /// Waits for the beeps queued so far to finish playing, giving up
+    /// `timeout` after the call whether that was spent getting the marker
+    /// into a full queue or waiting for the worker to reach it.
+    fn flush(&self, timeout: Duration) {
+        let Some(tx) = &self.tx else { return };
+        let deadline = Instant::now() + timeout;
+        let (done, wait) = mpsc::channel();
+        let mut msg = Msg::Flush(done);
+        loop {
+            match tx.try_send(msg) {
+                Ok(()) => break,
+                Err(TrySendError::Full(back)) if Instant::now() < deadline => {
+                    msg = back;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+        // Timing out is the point: stop waiting, not an error.
+        let _ = wait.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+
+    /// True (and remembers `now`) if the last `find_me` beep was at least
+    /// `FIND_ME_INTERVAL` before `now`, or there hasn't been one.
+    fn find_me_allowed(&self, now: Instant) -> bool {
+        let mut last = self
+            .find_me_last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.is_none_or(|t| now.saturating_duration_since(t) >= FIND_ME_INTERVAL) {
+            *last = Some(now);
+            true
+        } else {
+            false
         }
     }
 }
@@ -390,7 +456,123 @@ mod tests {
 
     #[test]
     fn disabled_buzzer_ignores_beeps() {
-        Buzzer::new(false).beep(Beep::Short);
+        let buzzer = Buzzer::new(false);
+        buzzer.beep(Beep::Short);
+        buzzer.flush(Duration::from_secs(5));
+    }
+
+    /// A buzzer whose queue nobody drains, like one stuck on a wedged device.
+    fn stalled_buzzer(depth: usize) -> (Buzzer, mpsc::Receiver<Msg>) {
+        let (tx, rx) = mpsc::sync_channel(depth);
+        (Buzzer::with_sender(Some(tx)), rx)
+    }
+
+    #[test]
+    fn a_full_beep_queue_drops_beeps_without_blocking() {
+        let (buzzer, rx) = stalled_buzzer(BEEP_QUEUE_DEPTH);
+        let started = Instant::now();
+        for _ in 0..BEEP_QUEUE_DEPTH * 10 {
+            buzzer.beep(Beep::Short);
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(rx.try_iter().count(), BEEP_QUEUE_DEPTH);
+        // Room again: queued once more.
+        buzzer.beep(Beep::Long);
+        assert!(matches!(rx.try_recv(), Ok(Msg::Beep(Beep::Long))));
+    }
+
+    #[test]
+    fn beeping_after_the_worker_is_gone_does_not_panic_or_block() {
+        let (buzzer, rx) = stalled_buzzer(1);
+        drop(rx);
+        buzzer.beep(Beep::Short);
+        buzzer.flush(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn flush_gives_up_when_the_queue_never_drains() {
+        let (buzzer, rx) = stalled_buzzer(2);
+        buzzer.beep(Beep::Short);
+        buzzer.beep(Beep::Short);
+        // Queue full and never read: the marker can't even be queued.
+        let started = Instant::now();
+        buzzer.flush(Duration::from_millis(200));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        drop(rx);
+    }
+
+    #[test]
+    fn flush_gives_up_when_the_worker_never_reaches_the_marker() {
+        let (buzzer, rx) = stalled_buzzer(2);
+        let started = Instant::now();
+        buzzer.flush(Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(rx.try_recv(), Ok(Msg::Flush(_))));
+    }
+
+    #[test]
+    fn flush_returns_as_soon_as_the_worker_answers() {
+        let (buzzer, rx) = stalled_buzzer(2);
+        let worker = thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                if let Msg::Flush(done) = msg {
+                    done.send(()).unwrap();
+                    break;
+                }
+            }
+        });
+        buzzer.beep(Beep::Short);
+        let started = Instant::now();
+        buzzer.flush(Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn flush_waits_for_room_then_queues_its_marker() {
+        let (buzzer, rx) = stalled_buzzer(1);
+        buzzer.beep(Beep::Short);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            // Drains the beep, making room for the marker, then answers it.
+            while let Ok(msg) = rx.recv() {
+                if let Msg::Flush(done) = msg {
+                    done.send(()).unwrap();
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        buzzer.flush(Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn find_me_beeps_are_rate_limited() {
+        let buzzer = Buzzer::with_sender(None);
+        let t0 = Instant::now();
+        assert!(buzzer.find_me_allowed(t0));
+        assert!(!buzzer.find_me_allowed(t0));
+        assert!(!buzzer.find_me_allowed(t0 + Duration::from_secs(1)));
+        assert!(!buzzer.find_me_allowed(t0 + FIND_ME_INTERVAL / 2));
+        assert!(buzzer.find_me_allowed(t0 + FIND_ME_INTERVAL));
+        // The window restarts from the beep that got through, not from
+        // the ones refused.
+        assert!(!buzzer.find_me_allowed(t0 + FIND_ME_INTERVAL + Duration::from_secs(1)));
+        assert!(buzzer.find_me_allowed(t0 + FIND_ME_INTERVAL * 2));
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_does_not_wedge_the_find_me_limit() {
+        let buzzer = Buzzer::with_sender(None);
+        let t0 = Instant::now() + Duration::from_secs(3600);
+        assert!(buzzer.find_me_allowed(t0));
+        // `now` earlier than the remembered beep: saturates to zero, so refused.
+        assert!(!buzzer.find_me_allowed(t0.checked_sub(Duration::from_secs(10)).unwrap()));
+        assert!(buzzer.find_me_allowed(t0 + FIND_ME_INTERVAL));
     }
 
     /// A fresh scratch directory per test.

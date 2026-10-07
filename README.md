@@ -499,7 +499,7 @@ enabled = false   # master switch; off by default
 boot = true       # long beep when the daemon starts during boot
 power = true      # short beep before a shutdown/restart (also when the OS reboots)
 alerts = true     # short beep on warn/error/critical alerts (max 1/min; only critical while asleep)
-find_me = true    # short beep when a chassis LOCATE starts
+find_me = true    # short beep when a chassis LOCATE starts (at most one per 30 s)
 ```
 
 Same sounds as ADM, a ~2 kHz tone: one long beep (800 ms) when the daemon
