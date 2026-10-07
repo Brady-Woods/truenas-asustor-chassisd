@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Driver problem (LED class devices, GPIO, it87, buzzer device, power settings)
+    url: https://github.com/Brady-Woods/asustor-platform-driver/issues
+    about: Report problems with the kernel modules themselves in the asustor-platform-driver fork.
+  - name: Deployment of the whole stack (Post Init scripts, verify-all.sh, docs)
+    url: https://github.com/Brady-Woods/truenas-asustor-deploy/issues
+    about: Cross-component deployment and the stack's docs live in truenas-asustor-deploy.

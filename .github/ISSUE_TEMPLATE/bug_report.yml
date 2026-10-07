@@ -1,0 +1,69 @@
+name: Bug report
+description: lcm-status or deploy.sh misbehaves (LCD, LEDs, buzzer, fans, health alarms, power schedule)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Kernel driver problems belong in the
+        asustor-platform-driver fork (see the links on the "new issue" page).
+        Remove anything private (host names, pool names) before posting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: truenas
+    attributes:
+      label: TrueNAS SCALE version
+      placeholder: "25.10.3.1"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel (`uname -r`)
+      placeholder: "6.12.33-production+truenas"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: NAS model
+      placeholder: "AS6704T"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Tag or commit of each checkout (`git -C <repo> describe --tags --always`).
+      value: |
+        truenas-asustor-chassisd (lcm-status):
+        asustor-platform-driver:
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: lcm-status status
+      description: Output of `lcm-status status`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: journal
+    attributes:
+      label: Journal
+      description: The relevant part of `journalctl -u lcm-status` (e.g. `journalctl -u lcm-status -b`).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: The relevant parts of `/etc/lcm-status.toml`, deploy.sh output, dmesg excerpts, etc.
