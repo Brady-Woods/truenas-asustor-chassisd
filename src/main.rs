@@ -216,10 +216,14 @@ fn main() -> ExitCode {
         Cli::Probe(cmd) => run_probe_command(&cmd, &args),
         Cli::FanProfile { config, assume_yes } => fan_calibrate::run(&config, assume_yes),
         Cli::Status(path) => {
-            print!(
-                "{}",
-                socket_request(&Config::load(&path).socket.path, "STATUS")
-            );
+            let reply = socket_request(&Config::load(&path).socket.path, "STATUS");
+            match classify_reply(&reply) {
+                Ok(text) => print!("{text}"),
+                Err(err) => {
+                    eprintln!("lcm-status: daemon replied: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         Cli::Locate {
             config,
@@ -228,12 +232,34 @@ fn main() -> ExitCode {
             off,
         } => {
             let request = socket::locate_request(bay, ttl_secs, off);
-            socket_request(&Config::load(&config).socket.path, &request);
+            let reply = socket_request(&Config::load(&config).socket.path, &request);
+            if let Err(err) = classify_reply(&reply) {
+                eprintln!("lcm-status: daemon replied: {err}");
+                return ExitCode::FAILURE;
+            }
             println!("sent: {request}");
         }
         Cli::Daemon(path) => run_daemon(&path),
     }
     ExitCode::SUCCESS
+}
+
+/// Splits a daemon reply into success text or its `ERR <reason>` line
+/// (trimmed). Valid fire-and-forget requests get no reply at all.
+fn classify_reply(reply: &str) -> Result<&str, &str> {
+    let line = reply.trim_end();
+    if line == "ERR" || line.starts_with("ERR ") {
+        Err(line)
+    } else {
+        Ok(reply)
+    }
+}
+
+/// `now + secs`, or an error naming the limit when that overflows
+/// `Instant` (a huge `listen` argument used to panic).
+fn listen_deadline(now: Instant, secs: u64) -> Result<Instant, String> {
+    now.checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| format!("listen duration {secs}s is too large"))
 }
 
 /// Client side of the socket protocol, for `status` and `locate`: connect
@@ -705,7 +731,13 @@ fn run_probe_command(cmd: &str, args: &[String]) {
         "listen" => {
             let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
             println!("listening for {secs}s (press panel buttons now)...");
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let deadline = match listen_deadline(Instant::now(), secs) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("lcm-status: {e}");
+                    std::process::exit(2);
+                }
+            };
             while Instant::now() < deadline {
                 if let Some(f) = lcm.read_frame(Duration::from_millis(500)) {
                     print!(
@@ -745,6 +777,28 @@ mod tests {
 
     fn default_path() -> PathBuf {
         PathBuf::from(config::DEFAULT_CONFIG_PATH)
+    }
+
+    #[test]
+    fn replies_starting_with_err_are_errors() {
+        assert_eq!(classify_reply("ERR busy\n"), Err("ERR busy"));
+        assert_eq!(
+            classify_reply("ERR bad level: x\n"),
+            Err("ERR bad level: x")
+        );
+        assert_eq!(classify_reply("ERR"), Err("ERR"));
+        assert_eq!(classify_reply(""), Ok(""));
+        assert_eq!(classify_reply("health: ok\n"), Ok("health: ok\n"));
+        // Only a leading ERR token counts.
+        assert_eq!(classify_reply("ERRATA\n"), Ok("ERRATA\n"));
+        assert_eq!(classify_reply("pool ERR x\n"), Ok("pool ERR x\n"));
+    }
+
+    #[test]
+    fn listen_deadline_rejects_overflow_instead_of_panicking() {
+        let now = Instant::now();
+        assert!(listen_deadline(now, u64::MAX).is_err());
+        assert_eq!(listen_deadline(now, 5), Ok(now + Duration::from_secs(5)));
     }
 
     #[test]

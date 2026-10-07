@@ -9,7 +9,7 @@ publish = false
 
 [profile.release]
 opt-level = 2
-# A wrapped counter or time delta would silently misbehave; a panic is
+# A wrapped counter or time delta would silently misbehave; a panic
 # restarts the daemon (Restart=on-failure) instead.
 overflow-checks = true
 

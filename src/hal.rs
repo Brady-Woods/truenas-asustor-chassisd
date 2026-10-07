@@ -48,9 +48,25 @@ const OUTPUT_MAX: usize = 1 << 20;
 /// Children that were killed on timeout but haven't exited yet (a process
 /// in uninterruptible I/O ignores SIGKILL until the I/O completes).
 /// Kept so `run_with_timeout` can reap them later without a thread per
-/// wedged child; past `UNREAPED_MAX` no new commands are started.
+/// wedged child. Past `UNREAPED_MAX` commands still run (refusing them
+/// would blind every screen and health check until reboot, for a problem
+/// that may be one bad disk); the pile-up is only warned about, at most
+/// once per `STUCK_WARN_EVERY`.
 static UNREAPED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 const UNREAPED_MAX: usize = 16;
+static STUCK_WARNED: Mutex<Option<Instant>> = Mutex::new(None);
+const STUCK_WARN_EVERY: Duration = Duration::from_secs(300);
+/// How long a just-killed child is given to exit before it is parked.
+const KILL_REAP_WAIT: Duration = Duration::from_millis(250);
+
+/// True (and records `now`) if a rate-limited warning is due.
+fn warn_due(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
+    if last.is_some_and(|t| now.saturating_duration_since(t) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
 
 /// Drops every child in `children` that has exited (reaping it).
 fn reap(children: &mut Vec<Child>) {
@@ -59,23 +75,43 @@ fn reap(children: &mut Vec<Child>) {
 
 /// Runs `cmd`, returning its trimmed stdout if it exits successfully
 /// within `timeout`. On timeout the child is killed and reaped later
-/// (see `UNREAPED`) rather than waited on here: a process stuck in
-/// uninterruptible I/O ignores SIGKILL until the I/O completes, so
-/// waiting for it would just move the hang.
+/// (see `UNREAPED`) rather than waited on for long here: a process stuck
+/// in uninterruptible I/O ignores SIGKILL until the I/O completes, so
+/// waiting for it would just move the hang. Only a short bounded wait
+/// follows the kill, which reaps the normal case immediately.
 ///
 /// Runs without helper threads: stdout is drained from this thread by
 /// polling the pipe, so a wedged child (or a grandchild holding the pipe
 /// open) can never strand a blocked reader.
 fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    run_tracked(&UNREAPED, UNREAPED_MAX, cmd, args, timeout)
+}
+
+/// `run_with_timeout` against an explicit stuck-children list and cap, so
+/// the cap path is testable. Fails open: over the cap the command still
+/// runs, with a rate-limited warning.
+fn run_tracked(
+    unreaped: &Mutex<Vec<Child>>,
+    max: usize,
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
     {
-        let mut unreaped = UNREAPED.lock().unwrap_or_else(PoisonError::into_inner);
-        reap(&mut unreaped);
-        if unreaped.len() >= UNREAPED_MAX {
-            crate::syslog::warning(&format!(
-                "not running `{cmd}`: {} earlier commands are stuck and unkillable",
-                unreaped.len()
-            ));
-            return None;
+        let mut list = unreaped.lock().unwrap_or_else(PoisonError::into_inner);
+        reap(&mut list);
+        if list.len() >= max {
+            let due = warn_due(
+                &mut STUCK_WARNED.lock().unwrap_or_else(PoisonError::into_inner),
+                Instant::now(),
+                STUCK_WARN_EVERY,
+            );
+            if due {
+                crate::syslog::warning(&format!(
+                    "{} earlier commands are stuck and unkillable (a drive or pool in uninterruptible I/O?); still running `{cmd}`",
+                    list.len()
+                ));
+            }
         }
     }
 
@@ -134,12 +170,20 @@ fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Strin
     if let Err(e) = child.kill() {
         crate::syslog::notice(&format!("{}: kill: {e}", describe()));
     }
-    if !matches!(child.try_wait(), Ok(Some(_))) {
-        UNREAPED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(child);
+    let reap_deadline = Instant::now() + KILL_REAP_WAIT;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return None;
+        }
+        if Instant::now() >= reap_deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
+    unreaped
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(child);
     None
 }
 
@@ -1105,6 +1149,45 @@ mod tests {
             c.kill().unwrap();
             c.wait().unwrap();
         }
+    }
+
+    #[test]
+    fn warn_due_rate_limits() {
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        let mut last = None;
+        assert!(warn_due(&mut last, t0, every));
+        assert!(!warn_due(&mut last, t0 + Duration::from_secs(30), every));
+        assert!(warn_due(&mut last, t0 + Duration::from_secs(61), every));
+    }
+
+    #[test]
+    fn run_still_runs_commands_over_the_stuck_child_cap() {
+        // Two live children against a cap of 2: the cap path is taken, and
+        // the command must still run (fail open) and leave the list alone.
+        let list = Mutex::new(vec![
+            Command::new("sleep").arg("30").spawn().unwrap(),
+            Command::new("sleep").arg("30").spawn().unwrap(),
+        ]);
+        assert_eq!(
+            run_tracked(&list, 2, "echo", &["hi"], Duration::from_secs(5)).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(list.lock().unwrap().len(), 2);
+        for mut c in list.into_inner().unwrap() {
+            c.kill().unwrap();
+            c.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_killed_command_is_reaped_promptly_not_parked() {
+        let list = Mutex::new(Vec::new());
+        assert_eq!(
+            run_tracked(&list, 16, "sleep", &["30"], Duration::from_millis(100)),
+            None
+        );
+        assert!(list.lock().unwrap().is_empty());
     }
 
     #[test]

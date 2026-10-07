@@ -397,13 +397,20 @@ Three ways this goes further than upstream fancontrol:
   isn't a finite number, and anything below -20C (that board's constant is
   -128C) as "not connected", rather than letting a phantom sensor stand in
   for a real one. A reading *above* 125C is the opposite case: it is kept
-  and treated as hot (the fan goes to `max_pwm` as for a critical
-  temperature, and the health monitor alarms), because a sensor that failed
-  high must never remove cooling. A `chip = "..."` selector with no `input`
-  set matches *every* temp input that chip has, relying on this filtering
-  rather than needing you to already know which specific inputs are real;
-  if an unwired input on another board reads a constant high value, narrow
-  the selector with `input`/`label`.
+  and treated as hot, because a sensor that failed high must never remove
+  cooling. Fan control pegs `max_pwm` for it regardless of the configured
+  thresholds; the health monitor raises an alarm for it only when the
+  configured thresholds are below 125C (the defaults are). A
+  `chip = "..."` selector with no `input` set matches *every* temp input
+  that chip has, relying on this filtering rather than needing you to
+  already know which specific inputs are real; if an unwired input on
+  another board reads a constant high value, narrow the selector with
+  `input`/`label`. The same applies to the default `nvme` selector: an
+  NVMe sensor slot that reads garbage-high (not merely absent) would peg
+  the fan at `max_pwm` until it is fixed. If you see that, narrow the
+  selector with `input = "temp1"` (the composite temperature), and check
+  `lcm-status status` on the first deploy to confirm each sensor reads
+  what you expect. (Not yet verified on hardware.)
 - **Chip names match exactly.** `pwm_chip` and sensor `chip` match the
   hwmon `name` exactly; a name prefix is only a fallback when no chip has
   that exact name (so `"nvme"` and `"it8625"` keep working). Name a
@@ -1192,6 +1199,13 @@ lcm-status check-config [path]     # parse and print a config file, and
                                     # when its power schedule next fires
 lcm-status --help                  # usage
 ```
+
+`settext`, `init` and `listen` open `/dev/ttyS1` exclusively, so while the
+daemon is running they fail with an "in use" error (otherwise their frames
+would interleave with the daemon's); stop the service first
+(`systemctl stop lcm-status`). `status`, `locate`, `hal-test` and
+`check-config` don't touch the port and work any time; `status` and
+`locate` print a daemon `ERR ...` reply to stderr and exit non-zero.
 
 An unrecognized subcommand is an error (exit status 2), not a config
 path. Only `daemon` (or a bare argument that looks like a path, the

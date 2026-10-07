@@ -12,12 +12,137 @@ were reconstructed from git history.
 ### Added
 
 - MIT license (`LICENSE`, also in the release tarball).
+- **Fan failsafes.** A fan that is enabled but never taken over no longer
+  fails silently (BIOS automatic mode stops the it8625 fan): if the pwm chip
+  never resolves or its writes fail, a warning and fan health Warn follow
+  after 30s and a critical after 180s; if the chip resolves but no sensor
+  ever reads, the fan is taken over at `max_pwm` after 30s. A fan disabled by
+  `Config::validate` is still left alone, but the diagnostic says BIOS mode
+  may stop it and `STATUS` shows "disabled by config" with health Warn.
+- **Partial sensor loss.** If one selector that used to read (a drive, the
+  NIC) goes silent while others still read, the fan is held at `max_pwm`
+  after a 10s grace (warning once, health Warn) and released only after that
+  selector has read continuously for 30s; recovery logs a notice.
+- **Fan thread hang detection.** The fan thread publishes a heartbeat; the
+  main loop treats one older than 15s like a death (the daemon exits and
+  systemd restarts it). Shutdown is bounded: it waits 5s for the fan thread,
+  then forces manual mode at full speed on every enabled fan from a
+  time-limited helper thread.
+- **systemd watchdog.** A minimal `sd_notify` in safe std (`WATCHDOG=1`
+  over `$NOTIFY_SOCKET`, path or abstract), sent from the main loop only
+  while the fan heartbeat is fresh; the unit gets `WatchdogSec=30` and
+  `NotifyAccess=main`. A no-op without `NOTIFY_SOCKET`.
+- **Service sandboxing.** `NoNewPrivileges`, `RestrictSUIDSGID`,
+  `LockPersonality`, `PrivateTmp`, `ProtectHome`, `RestrictAddressFamilies`
+  and a fixed `PATH`. `ProtectSystem`, `ProtectKernel*`, `PrivateDevices`
+  and capability bounding are deliberately left out (the daemon writes
+  sysfs, loads modules and talks to serial/input devices). Needs a NAS test.
+- README "Security model" section: what socket group members can do and why
+  the checkout must be root-owned and not shared.
+- `deploy.sh` warns (never fails) when the checkout, `target/`, the binary
+  or a parent directory is not root-owned or is group/world-writable, and
+  when the checkout is under `/home` or `/root` (the unit's `ProtectHome=yes`
+  would make it fail with 203/EXEC).
+- CI: a `cargo-deny` advisories job (`deny.toml`), every third-party action
+  pinned to a full commit SHA, and Dependabot for cargo and github-actions.
 
 ### Changed
 
 - The rear reset button is documented as a deliberate non-goal: TrueNAS has
   nothing to bind it to.
 - Docs and comments no longer point at the private deployment repository.
+- **BREAKING: socket protocol.** Requests the daemon used to accept loosely
+  (an unknown level, extra or misspelled arguments such as a typo'd `bay=`
+  on `SHOW`/`CLEAR`/`LOCATE`, `STATUS` with arguments, invalid UTF-8) are now
+  answered with a one-line `ERR <reason>` and ignored; `Level::parse`
+  rejects unknown levels instead of mapping them to Info. Valid
+  fire-and-forget requests stay silent, so well-formed clients are
+  unaffected. Check scripts that send sloppy requests.
+- `lcm-status locate` and `status` now treat an `ERR ...` reply as an error:
+  it is printed to stderr and the exit status is non-zero (`locate` used to
+  print "sent" and exit 0 regardless).
+- **MSRV is now Rust 1.89** (was 1.88; needed for `File::try_lock`).
+- **The LCM serial port (`/dev/ttyS1`) is opened exclusively.** `settext`,
+  `init` and `listen` can no longer interleave frames with the running
+  daemon; while it runs they fail with an "in use" error. Stop the service
+  to use them.
+- `lcm-status listen <secs>` with a huge duration is a clear error (exit 2)
+  rather than a panic.
+- **Over-range temperatures are hot.** A reading above 125C used to be
+  dropped as "not connected", so a sensor that failed high removed its fan's
+  cooling. It is now kept and fan control pegs `max_pwm` for it regardless of
+  thresholds. The health monitor alarms only when the configured thresholds
+  are below 125C (the defaults are). Readings below -20C (this board's
+  unwired it8625 inputs read -128C) and `_fault` inputs are still excluded;
+  non-finite text ("nan", "inf") is never parsed into a temperature or RPM.
+  A garbage-high NVMe slot would peg the fan; narrow the selector with
+  `input = "temp1"` and check `lcm-status status` on first deploy.
+- **hwmon chip matching is exact first, then prefix.** An exact `name` match
+  wins and a prefix is only a fallback when nothing matches exactly; results
+  are sorted numerically (`hwmon2` before `hwmon10`) and an empty name matches
+  nothing. Existing names (`it8625`, `coretemp`, `drivetemp`, `nvme`)
+  resolve as before.
+- Sensors are read by a thread per selector, off the fan control path: one
+  wedged `drivetemp` read can no longer freeze every fan's curve. A sample
+  older than three intervals (at least 10s) counts as no reading; the
+  resample interval is clamped to 1..=300s.
+- **Bounded queues and connections.** Socket commands go through a bounded
+  queue (64; a full queue answers `ERR busy`) and the main loop takes at most
+  16 per pass, so shutdown and fan/LCD work always run. At most 16
+  connections at once (extra ones get `ERR busy: too many connections`),
+  each request must arrive within 5s overall, and the reply write has its
+  own deadline. The beep queue holds 8 (extra beeps are dropped), chassis
+  `LOCATE` beeps are limited to one per 30s, and `flush()` gives up after 5s.
+- The accept loop spawns with `thread::Builder` and logs and drops the
+  connection on failure; accept errors (EMFILE, ...) are logged once per run
+  and backed off from instead of spinning.
+- The socket is bound in a private 0700 staging directory, given mode 0660
+  and its group there, and renamed into place; `chgrp(1)` is replaced by
+  `std::os::unix::fs::chown` with the gid read from `/etc/group`, and a
+  failure is a syslog warning. The socket file is removed on clean shutdown.
+- `run_with_timeout` no longer spawns reader threads: stdout is drained by
+  polling from the calling thread, output over 1 MiB abandons the command,
+  and a killed child gets a short bounded wait before being parked for later
+  reaping. It fails open: with 16 or more stuck (unkillable) children,
+  commands still run, with a rate-limited warning.
+- The serial write waits out `WouldBlock` (polling `POLLOUT` up to a
+  deadline, continuing partial writes) instead of failing or leaving half a
+  frame on the wire.
+- Release builds enable `overflow-checks`; the power scheduler's clock
+  deltas, minute boundaries, RTC recheck and countdown text use
+  saturating/`abs_diff` arithmetic.
+
+### Fixed
+
+- A config value such as `dwell_secs = 9223372036854775807` panicked the
+  daemon on its first tick (`Instant + Duration` overflow). Every user
+  duration feeding an `Instant` (rotation, menu, refresh) is clamped to a
+  day, `scroll_max_chars`/`scroll_gap` to sane sizes, each with a diagnostic,
+  and all deadlines in `state.rs` use `checked_add` with a far-future
+  fallback.
+- NaN/inf temperature thresholds and fan curve values were accepted (and
+  never alerted); they now revert to defaults or are dropped, with a
+  diagnostic.
+- `localtime_r` returning NULL silently read as midnight (matters for
+  `[sleep]`); it is checked, falls back to UTC with a one-time warning, and
+  `now_hhmm` shares the same code.
+- `LCM_STATUS_TRACE` is opened with `O_NOFOLLOW` and refused unless it is a
+  regular file (the daemon runs as root); a refusal is logged.
+- A repeating `LOCATE` could build minutes of beep backlog and block shutdown
+  (see the bounded queues above).
+- `deploy.sh` now escapes the unit's `ExecStart` path for `sed` and the
+  `midclt` JSON arguments, so paths or group names containing `|`, `&`,
+  backslash or a quote no longer corrupt the unit or the request.
+
+### Security
+
+- Socket group members can no longer flood the daemon (bounded queue,
+  connection cap, per-request deadlines) or leave it spinning on accept
+  errors; the socket is never created with the umask's mode.
+- Exclusive serial port, `O_NOFOLLOW` trace file, systemd sandboxing and the
+  `deploy.sh` ownership/permission warnings (above) reduce what a
+  misbehaving local client or a writable checkout can do to a root daemon.
+- CI audits dependencies (`cargo-deny`) and pins actions by SHA.
 
 ## [2.1.0] - 2026-10-06
 
