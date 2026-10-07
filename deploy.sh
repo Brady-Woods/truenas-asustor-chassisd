@@ -88,17 +88,73 @@ for m in ledtrig-timer ledtrig-netdev; do
 done
 
 # --- 2. Build, in a throwaway container -- nothing installed on the host -
-log "Building (containerized rust:alpine, musl target)..."
-docker run --rm \
-    -v "$SCRIPT_DIR":/work -w /work \
-    -e CARGO_HOME=/work/.cargo-home \
-    rust:alpine \
-    sh -c "apk add --no-cache musl-dev >/dev/null 2>&1 && cargo build --release"
-[ -x "$SCRIPT_DIR/target/release/lcm-status" ] || fail "build did not produce target/release/lcm-status"
+#
+# Only when the source changed since the last build (stamp next to the
+# binary; target/ isn't synced over, so it stays on the NAS). At boot this
+# runs as a Post Init script, before the Docker daemon is up (found live,
+# 2026-10-06: "Cannot connect to the Docker daemon"), so with an unchanged
+# checkout it mustn't need Docker at all; when a build is needed, wait for
+# Docker a while, and if it never comes up keep the existing binary
+# instead of failing the whole script (the group/unit/restart steps below
+# still have to run).
+STAMP_PATH="$SCRIPT_DIR/target/.build-stamp"
+source_hash() {
+    (cd "$SCRIPT_DIR" && find Cargo.toml Cargo.lock src -type f | LC_ALL=C sort |
+        xargs sha256sum | sha256sum | cut -d' ' -f1)
+}
+want_stamp="$(source_hash)"
+if [ -x "$BIN_PATH" ] && [ -f "$STAMP_PATH" ] && [ "$(cat "$STAMP_PATH")" = "$want_stamp" ]; then
+    log "Binary already built from this source; skipping the build."
+else
+    docker_wait="${DOCKER_WAIT_SECS:-60}"
+    waited=0
+    until docker info >/dev/null 2>&1; do
+        [ "$waited" -ge "$docker_wait" ] && break
+        sleep 2
+        waited=$((waited + 2))
+    done
+    if docker info >/dev/null 2>&1; then
+        log "Building (containerized rust:alpine, musl target)..."
+        # HOME: the docker CLI reads its config from there, and TrueNAS
+        # runs Post Init scripts without it.
+        HOME="${HOME:-/root}" docker run --rm \
+            -v "$SCRIPT_DIR":/work -w /work \
+            -e CARGO_HOME=/work/.cargo-home \
+            rust:alpine \
+            sh -c "apk add --no-cache musl-dev >/dev/null 2>&1 && cargo build --release"
+        [ -x "$BIN_PATH" ] || fail "build did not produce target/release/lcm-status"
+        echo "$want_stamp" > "$STAMP_PATH"
+    elif [ -x "$BIN_PATH" ]; then
+        log "WARNING: the source changed since the last build, but Docker isn't available (waited ${docker_wait}s) -- keeping the existing binary. Re-run deploy.sh once Docker is up to rebuild."
+    else
+        fail "no binary at $BIN_PATH and Docker isn't available (waited ${docker_wait}s) to build one"
+    fi
+fi
 
-# --- 3. Group for socket access (idempotent: -f skips if it exists) ------
+# --- 3. Group for socket access --------------------------------------------
+#
+# TrueNAS regenerates /etc/group from its config database at boot, so a
+# group added with groupadd is gone after a reboot (and the daemon's chgrp of
+# its socket fails: "invalid group"). Create it through the middleware so
+# it's in that database; plain groupadd only where there's no middleware.
+ensure_group() {
+    if command -v midclt >/dev/null 2>&1; then
+        existing="$(midclt call group.query "[[\"group\", \"=\", \"$GROUP\"]]" 2>/dev/null || echo error)"
+        if [ "$existing" = "[]" ]; then
+            if midclt call group.create "{\"name\": \"$GROUP\", \"smb\": false}" >/dev/null 2>&1; then
+                log "Created group '$GROUP' in the TrueNAS config database (persists across reboots)."
+            else
+                log "WARNING: creating group '$GROUP' through the TrueNAS middleware failed; adding it to /etc/group only (lost at the next reboot)."
+            fi
+        elif [ "$existing" = error ]; then
+            log "WARNING: couldn't query the TrueNAS middleware for group '$GROUP'."
+        fi
+    fi
+    getent group "$GROUP" >/dev/null 2>&1 || groupadd -f "$GROUP"
+    log "Group '$GROUP' present."
+}
 log "Ensuring group '$GROUP' exists..."
-groupadd -f "$GROUP"
+ensure_group
 
 # --- 4. Binary needs no install step -- it runs straight from the build
 # output in this checkout ($BIN_PATH); see the note above on why.
@@ -130,15 +186,21 @@ EXISTING_ID=$(midclt call initshutdownscript.query \
     "[[\"script\", \"=\", \"$SCRIPT_DIR/deploy.sh\"]]" 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["id"]) if d else None' 2>/dev/null || true)
 
+# 600 s: at boot a rebuild (after the checkout changed) waits for Docker
+# and then compiles; the middleware kills a script that runs past its
+# timeout (registered with 120 s before).
+POSTINIT_TIMEOUT=600
 if [ -n "${EXISTING_ID:-}" ] && [ "$EXISTING_ID" != "None" ]; then
     log "Existing POSTINIT task found (id=$EXISTING_ID), leaving it in place."
+    midclt call initshutdownscript.update "$EXISTING_ID" "{\"timeout\": $POSTINIT_TIMEOUT}" >/dev/null 2>&1 ||
+        log "WARNING: couldn't set the POSTINIT task's timeout to ${POSTINIT_TIMEOUT}s"
 else
     midclt call initshutdownscript.create "{
         \"type\": \"SCRIPT\",
         \"script\": \"$SCRIPT_DIR/deploy.sh\",
         \"when\": \"POSTINIT\",
         \"enabled\": true,
-        \"timeout\": 120
+        \"timeout\": $POSTINIT_TIMEOUT
     }" >/dev/null
     log "POSTINIT task registered."
 fi

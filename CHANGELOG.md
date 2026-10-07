@@ -26,6 +26,14 @@ Versions follow `Cargo.toml`. Reconstructed from git history up to 1.3.0.
   daemon started -- the normal order at boot, where the driver is loaded
   by its own Post Init script -- and again after the driver is reloaded.
   Previously they stayed at the firmware defaults until a restart.
+- `deploy.sh` as the boot-time Post Init script: skips the build when the
+  binary was already built from the current source (so it no longer fails
+  every boot because Docker isn't up yet), waits for Docker when a build is
+  needed, and keeps the existing binary with a warning if Docker never comes
+  up. Its POSTINIT timeout is raised to 600 s for a boot-time rebuild.
+- The `lcm-status` group is created through the TrueNAS middleware, so it
+  survives reboots (TrueNAS regenerates `/etc/group` at boot, which made the
+  daemon's socket `chgrp` fail with "invalid group").
 
 ## 2.0.0 -- 2026-10-06
 
